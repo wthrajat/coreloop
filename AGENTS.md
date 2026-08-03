@@ -184,8 +184,8 @@ docs/                        all project/product/operations Markdown
 - `docs/011-implementation-plan.md`: selected implementation plan.
 - `docs/012-implementation-log.md`: what exists and what has been verified.
 - `docs/DESIGN.md` and `docs/PRODUCT.md`: UI and product principles.
-- `docs/theme.md`: the original theme input. It is currently empty; the UI uses
-  the restrained baseline recorded in `docs/DESIGN.md`.
+- `docs/theme.md`: the original flat, color-block theme input. The product-ready
+  adaptation and responsive rules are recorded in `docs/DESIGN.md`.
 
 When documents conflict, prefer the newest explicit decision, then the running
 implementation. Preserve historical documents unless the user asks to rewrite
