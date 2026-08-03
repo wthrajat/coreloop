@@ -70,3 +70,15 @@ export type Operations = {
   sources: number;
   blocked_jobs: { id: string; created_at: string; attempt_count: number }[];
 };
+
+export type ManualLesson = {
+  job_id: string;
+  state:
+    | "queued"
+    | "generating"
+    | "delivering"
+    | "delivered"
+    | "quota_blocked"
+    | "failed";
+  message: string;
+};

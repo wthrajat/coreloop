@@ -122,6 +122,9 @@ func (service *Service) execute(ctx context.Context, job store.Job) error {
 }
 
 func (service *Service) generateLesson(ctx context.Context, job store.Job, useOpenAI bool) error {
+	if job.AssignmentID != "" {
+		return service.enqueueLessonDelivery(ctx, job, job.AssignmentID)
+	}
 	plan, err := service.store.PlanNextLesson(ctx, job.UserID, service.now())
 	if err != nil {
 		return err
@@ -137,8 +140,7 @@ func (service *Service) generateLesson(ctx context.Context, job store.Job, useOp
 		if err != nil {
 			return err
 		}
-		_, err = service.store.EnqueueJob(ctx, job.UserID, assignmentID, "deliver_lesson", service.now(), "deliver:"+assignmentID, map[string]string{"assignment_id": assignmentID})
-		return err
+		return service.enqueueLessonDelivery(ctx, job, assignmentID)
 	}
 	started := service.now()
 	var generated content.Generated
@@ -160,7 +162,7 @@ func (service *Service) generateLesson(ctx context.Context, job store.Job, useOp
 		if errors.Is(err, providers.ErrFreeQuotaExhausted) {
 			state = "quota_exhausted"
 		}
-		_ = service.store.RecordProviderRun(ctx, job, provider, "", "", requestKind(useOpenAI), state, "generation_failed", 0, 0, started, service.now())
+		_ = service.store.RecordProviderRun(ctx, job, provider, "", "", requestKind(job, useOpenAI), state, "generation_failed", 0, 0, started, service.now())
 		return err
 	}
 	warning := generated.Warning
@@ -172,16 +174,8 @@ func (service *Service) generateLesson(ctx context.Context, job store.Job, useOp
 	if err != nil {
 		return err
 	}
-	_ = service.store.RecordProviderRun(ctx, job, generated.Provider, generated.Model, generated.RequestID, requestKind(useOpenAI), "succeeded", "", generated.InputTokens, generated.OutputTokens, started, service.now())
-	_, err = service.store.EnqueueJob(ctx, job.UserID, assignmentID, "deliver_lesson", service.now(), "deliver:"+assignmentID, map[string]string{"assignment_id": assignmentID})
-	return err
-}
-
-func requestKind(openAI bool) string {
-	if openAI {
-		return "manual_owner"
-	}
-	return "scheduled"
+	_ = service.store.RecordProviderRun(ctx, job, generated.Provider, generated.Model, generated.RequestID, requestKind(job, useOpenAI), "succeeded", "", generated.InputTokens, generated.OutputTokens, started, service.now())
+	return service.enqueueLessonDelivery(ctx, job, assignmentID)
 }
 
 func (service *Service) deliverLesson(ctx context.Context, job store.Job) error {

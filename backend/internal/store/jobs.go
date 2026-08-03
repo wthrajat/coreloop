@@ -209,6 +209,21 @@ func (store *Store) CompleteJob(ctx context.Context, jobID string, now time.Time
 	return err
 }
 
+func (store *Store) LinkJobAssignment(ctx context.Context, jobID, assignmentID string, now time.Time) error {
+	_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET assignment_id=COALESCE(assignment_id,?),updated_at=? WHERE id=?`, assignmentID, timestamp(now), jobID)
+	return err
+}
+
+func (store *Store) AssignmentDeliveryState(ctx context.Context, userID, assignmentID string) (string, string, error) {
+	var assignmentState, deliveryState string
+	err := store.database.QueryRowContext(ctx, `SELECT la.state,COALESCE((
+		SELECT jq.state FROM job_queue jq
+		WHERE jq.assignment_id=la.id AND jq.job_type='deliver_lesson'
+		ORDER BY jq.sequence DESC LIMIT 1
+	),'') FROM lesson_assignments la WHERE la.id=? AND la.user_id=?`, assignmentID, userID).Scan(&assignmentState, &deliveryState)
+	return assignmentState, deliveryState, err
+}
+
 func (store *Store) FailJob(ctx context.Context, job Job, code string, quota bool, now time.Time) error {
 	state := "queued"
 	due := now.Add(time.Duration(job.AttemptCount*job.AttemptCount) * time.Minute)

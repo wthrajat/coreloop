@@ -8,8 +8,10 @@ lessons, and sends the complete material as Telegram messages.
 It is invite-only, supports independent profiles, and is designed to run on free
 service tiers without maintaining a traditional server.
 
+#### Overview
 ![Coreloop overview](assets/images/dashboard.png)
 
+#### Onboarding and Configs
 ![Coreloop onboarding and learning configuration](assets/images/onboarding.png)
 
 ## What it does
@@ -45,7 +47,7 @@ deploy the Go API separately. Vercel builds the functions under `api/`, while
 
 ## Local development
 
-You need Node.js 24+, pnpm 11.17+, Go 1.26+, and SQLite 3.
+You need `Node.js 24+`, `pnpm 11.17+`, `Go 1.26+`, and `SQLite 3`.
 
 ```bash
 corepack enable

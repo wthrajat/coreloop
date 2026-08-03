@@ -1,21 +1,30 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { PageHeader } from "@/components/page-header";
 import { StatusPill } from "@/components/status-pill";
 import { api } from "@/lib/api-client";
-import type { Operations } from "@/lib/api-types";
+import type { ManualLesson, Operations } from "@/lib/api-types";
+
+const ACTIVE_LESSON_STATES = new Set<ManualLesson["state"]>([
+  "queued",
+  "generating",
+  "delivering",
+]);
 
 export default function OperationsPage() {
   const [operations, setOperations] = useState<Operations | null>(null);
   const [inviteURL, setInviteURL] = useState("");
   const [message, setMessage] = useState("");
   const [messageIsError, setMessageIsError] = useState(false);
+  const [lesson, setLesson] = useState<ManualLesson | null>(null);
+  const [lessonStarting, setLessonStarting] = useState(false);
+  const [lessonError, setLessonError] = useState("");
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setOperations(await api<Operations>("/operations"));
-  }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -30,6 +39,61 @@ export default function OperationsPage() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    const jobID = lesson?.job_id;
+    if (!jobID || !ACTIVE_LESSON_STATES.has(lesson.state)) return;
+    const currentJobID = jobID;
+
+    let active = true;
+    async function pollLesson() {
+      try {
+        const value = await api<ManualLesson>(
+          `/operations/lessons/${encodeURIComponent(currentJobID)}`,
+        );
+        if (!active) return;
+        setLesson(value);
+        setLessonError("");
+        if (!ACTIVE_LESSON_STATES.has(value.state)) {
+          await refresh();
+        }
+      } catch (error) {
+        if (!active) return;
+        setLessonError(
+          error instanceof Error
+            ? error.message
+            : "Lesson status could not be refreshed.",
+        );
+      }
+    }
+
+    const firstPoll = window.setTimeout(() => void pollLesson(), 800);
+    const pollInterval = window.setInterval(() => void pollLesson(), 2000);
+    return () => {
+      active = false;
+      window.clearTimeout(firstPoll);
+      window.clearInterval(pollInterval);
+    };
+  }, [lesson?.job_id, lesson?.state, refresh]);
+
+  async function sendLessonNow() {
+    setLessonStarting(true);
+    setLessonError("");
+    try {
+      const value = await api<ManualLesson>("/operations/lessons", {
+        method: "POST",
+        body: JSON.stringify({ request_id: crypto.randomUUID() }),
+      });
+      setLesson(value);
+      await refresh();
+    } catch (error) {
+      setLessonError(
+        error instanceof Error ? error.message : "Lesson creation failed.",
+      );
+    } finally {
+      setLessonStarting(false);
+    }
+  }
 
   async function createInvite() {
     try {
@@ -64,6 +128,22 @@ export default function OperationsPage() {
       setMessage(
         "The explicit OpenAI run completed and its delivery is queued.",
       );
+      if (lesson?.job_id === jobID) {
+        try {
+          setLesson(
+            await api<ManualLesson>(
+              `/operations/lessons/${encodeURIComponent(jobID)}`,
+            ),
+          );
+          setLessonError("");
+        } catch (error) {
+          setLessonError(
+            error instanceof Error
+              ? error.message
+              : "Lesson status could not be refreshed.",
+          );
+        }
+      }
       await refresh();
     } catch (error) {
       setMessageIsError(true);
@@ -85,15 +165,21 @@ export default function OperationsPage() {
     <div className="page-stack">
       <PageHeader
         title="Operations"
-        description="Owner-only queue truth, private invitations, and the explicit paid-provider boundary."
+        description="Owner-only lesson testing, queue truth, private invitations, and the explicit paid-provider boundary."
         action={
           <button
-            className="button button-primary"
+            className="button button-secondary"
             onClick={() => void createInvite()}
           >
             Create invite
           </button>
         }
+      />
+      <LessonNowPanel
+        lesson={lesson}
+        starting={lessonStarting}
+        error={lessonError}
+        onSend={() => void sendLessonNow()}
       />
       {message ? (
         <section
@@ -193,6 +279,120 @@ export default function OperationsPage() {
       </section>
     </div>
   );
+}
+
+function LessonNowPanel({
+  lesson,
+  starting,
+  error,
+  onSend,
+}: {
+  lesson: ManualLesson | null;
+  starting: boolean;
+  error: string;
+  onSend: () => void;
+}) {
+  const active = lesson ? ACTIVE_LESSON_STATES.has(lesson.state) : false;
+  const quotaBlocked = lesson?.state === "quota_blocked";
+  const state = starting ? "starting" : (lesson?.state ?? "ready");
+  const stateMessage = error || lesson?.message || lessonStateMessage(state);
+
+  return (
+    <section className="lesson-now-panel" aria-labelledby="lesson-now-title">
+      <div className="lesson-now-copy">
+        <div>
+          <h2 id="lesson-now-title">Send a lesson now</h2>
+          <p>
+            Generate the next lesson from your current profile and deliver it to
+            Telegram immediately, with Read and Skip feedback.
+          </p>
+        </div>
+        <div
+          className="lesson-now-status"
+          role={error ? "alert" : "status"}
+          aria-live={error ? "assertive" : "polite"}
+        >
+          <StatusPill tone={lessonStateTone(state, Boolean(error))}>
+            {lessonStateLabel(state, Boolean(error))}
+          </StatusPill>
+          <p>{stateMessage}</p>
+        </div>
+      </div>
+      <button
+        className="button button-primary lesson-now-action"
+        disabled={starting || active || quotaBlocked}
+        onClick={onSend}
+      >
+        {lessonActionLabel(state)}
+      </button>
+    </section>
+  );
+}
+
+type LessonDisplayState = ManualLesson["state"] | "ready" | "starting";
+
+function lessonStateLabel(state: LessonDisplayState, hasError: boolean) {
+  if (hasError) return "Needs attention";
+  switch (state) {
+    case "ready":
+      return "Ready";
+    case "starting":
+      return "Starting";
+    case "queued":
+      return "Queued";
+    case "generating":
+      return "Generating";
+    case "delivering":
+      return "Delivering";
+    case "delivered":
+      return "Delivered";
+    case "quota_blocked":
+      return "Quota blocked";
+    case "failed":
+      return "Failed";
+  }
+}
+
+function lessonStateTone(
+  state: LessonDisplayState,
+  hasError: boolean,
+): "neutral" | "ready" | "attention" | "error" {
+  if (hasError || state === "failed") return "error";
+  if (state === "delivered") return "ready";
+  if (state === "quota_blocked") return "attention";
+  return "neutral";
+}
+
+function lessonStateMessage(state: LessonDisplayState) {
+  switch (state) {
+    case "ready":
+      return "Ready to use your current topics, level, depth, and delivery settings.";
+    case "starting":
+      return "Creating a durable lesson job…";
+    default:
+      return "Lesson status is updating.";
+  }
+}
+
+function lessonActionLabel(state: LessonDisplayState) {
+  switch (state) {
+    case "starting":
+      return "Starting…";
+    case "queued":
+      return "Lesson queued";
+    case "generating":
+      return "Generating…";
+    case "delivering":
+      return "Delivering…";
+    case "delivered":
+      return "Send another lesson";
+    case "quota_blocked":
+      return "Waiting for provider";
+    case "failed":
+      return "Try again";
+    default:
+      return "Send lesson now";
+  }
 }
 
 function Metric({

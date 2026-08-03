@@ -30,8 +30,14 @@ type Config struct {
 	Runtime      config.Config
 	Store        *store.Store
 	Auth         *auth.Service
-	Jobs         *jobs.Service
+	Jobs         ApplicationJobs
 	Telegram     *telegram.Client
+}
+
+type ApplicationJobs interface {
+	RunBlockedWithOpenAI(context.Context, string) error
+	TriggerLessonNow(context.Context, string, string) (jobs.ManualLesson, error)
+	ManualLessonStatus(context.Context, string, string) (jobs.ManualLesson, error)
 }
 
 type healthResponse struct {
@@ -91,6 +97,8 @@ func NewRouter(configuration Config) http.Handler {
 		mux.Handle("DELETE /api/app/account", configuration.withSession(configuration.withCSRF(http.HandlerFunc(configuration.deleteAccount))))
 		mux.Handle("POST /api/app/invites", configuration.withSession(configuration.withCSRF(configuration.ownerOnly(http.HandlerFunc(configuration.createInvite)))))
 		mux.Handle("GET /api/app/operations", configuration.withSession(configuration.ownerOnly(http.HandlerFunc(configuration.operations))))
+		mux.Handle("POST /api/app/operations/lessons", configuration.withSession(configuration.withCSRF(configuration.ownerOnly(http.HandlerFunc(configuration.triggerLessonNow)))))
+		mux.Handle("GET /api/app/operations/lessons/{jobID}", configuration.withSession(configuration.ownerOnly(http.HandlerFunc(configuration.manualLessonStatus))))
 		mux.Handle("POST /api/app/operations/openai", configuration.withSession(configuration.withCSRF(configuration.ownerOnly(http.HandlerFunc(configuration.openAI)))))
 	}
 	return securityHeaders(routeCompatibility(mux))
@@ -316,6 +324,43 @@ func (configuration Config) createInvite(w http.ResponseWriter, r *http.Request)
 }
 func (configuration Config) operations(w http.ResponseWriter, r *http.Request) {
 	value, err := configuration.Store.Operations(r.Context())
+	if err != nil {
+		writeInternal(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, value)
+}
+
+func (configuration Config) triggerLessonNow(w http.ResponseWriter, r *http.Request) {
+	if configuration.Jobs == nil {
+		WriteProblem(w, apperror.New(apperror.CodeNotReady, "job service is not configured", http.StatusServiceUnavailable))
+		return
+	}
+	var input struct {
+		RequestID string `json:"request_id"`
+	}
+	if err := decodeJSON(r, &input); err != nil || strings.TrimSpace(input.RequestID) == "" || len(input.RequestID) > 128 {
+		WriteProblem(w, apperror.New(apperror.CodeInvalidRequest, "request_id is required", http.StatusBadRequest))
+		return
+	}
+	value, err := configuration.Jobs.TriggerLessonNow(r.Context(), sessionFrom(r).User.ID, input.RequestID)
+	if err != nil {
+		writeInternal(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusAccepted, value)
+}
+
+func (configuration Config) manualLessonStatus(w http.ResponseWriter, r *http.Request) {
+	if configuration.Jobs == nil {
+		WriteProblem(w, apperror.New(apperror.CodeNotReady, "job service is not configured", http.StatusServiceUnavailable))
+		return
+	}
+	value, err := configuration.Jobs.ManualLessonStatus(r.Context(), sessionFrom(r).User.ID, r.PathValue("jobID"))
+	if errors.Is(err, jobs.ErrManualLessonNotFound) {
+		WriteProblem(w, apperror.New(apperror.CodeNotFound, "lesson job was not found", http.StatusNotFound))
+		return
+	}
 	if err != nil {
 		writeInternal(w, err)
 		return

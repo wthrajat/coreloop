@@ -904,6 +904,51 @@ p {
   color: var(--success);
 }
 
+.lesson-now-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 20px;
+  border-radius: var(--radius-panel);
+  background: var(--primary-soft);
+}
+
+.lesson-now-copy {
+  display: grid;
+  min-width: 0;
+  gap: 14px;
+}
+
+.lesson-now-copy h2 {
+  font-size: 1.18rem;
+  font-weight: 720;
+}
+
+.lesson-now-copy > div > p {
+  max-width: 68ch;
+  margin-top: 6px;
+  color: var(--ink-muted);
+  font-size: 0.88rem;
+}
+
+.lesson-now-status {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.lesson-now-status p {
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+}
+
+.lesson-now-action {
+  width: 220px;
+  flex: 0 0 auto;
+}
+
 .next-delivery {
   margin-top: 34px;
   font-size: 1.65rem;
@@ -1534,6 +1579,7 @@ p {
   .save-bar > div,
   .notice,
   .action-panel,
+  .lesson-now-panel,
   .invite-output,
   .history-list li {
     align-items: stretch;
@@ -1545,8 +1591,15 @@ p {
   }
 
   .save-bar .button,
+  .lesson-now-action,
   .invite-output .button {
     width: 100%;
+  }
+
+  .lesson-now-status {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .history-action {
