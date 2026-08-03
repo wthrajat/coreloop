@@ -15,4 +15,4 @@ dist/
 *.tsbuildinfo
 vercel.go
 .vercel/
-AGENTS.md
+/AGENTS.md
