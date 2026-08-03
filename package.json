@@ -1,0 +1,40 @@
+{
+  "name": "coreloop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.17.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "dev:api": "go run ./cmd/api",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "test:go": "GOCACHE=$PWD/.cache/go-build GOENV=off go test ./api/... ./backend/... ./cmd/... ./migrations/...",
+    "test:schema": "sqlite3 :memory: '.read migrations/0001_initial.sql' '.read migrations/0002_production.sql' '.read migrations/0003_seed_catalog.sql' 'PRAGMA foreign_key_check;'",
+    "migrate": "go run ./backend/cmd/migrate",
+    "admin": "go run ./backend/cmd/admin",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "pnpm run lint && pnpm run typecheck && pnpm test && pnpm run test:go && pnpm run test:schema"
+  },
+  "dependencies": {
+    "next": "16.2.12",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "16.2.12",
+    "prettier": "^3.0.0",
+    "typescript": "6.0.3"
+  }
+}

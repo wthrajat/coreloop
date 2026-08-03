@@ -1,0 +1,16 @@
+.impeccable/
+.DS_Store
+.env
+.env.local
+.env.*.local
+.next/
+.cache/
+node_modules/
+coverage/
+dist/
+*.db
+*.db-shm
+*.db-wal
+*.tsbuildinfo
+vercel.go
+.vercel/

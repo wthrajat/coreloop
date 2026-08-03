@@ -1,0 +1,141 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const defaultTimeZone = "Asia/Kolkata"
+
+type Config struct {
+	Environment  string
+	AppOrigin    string
+	BuildVersion string
+
+	TursoURL   string
+	TursoToken string
+
+	TelegramClientID      string
+	TelegramClientSecret  string
+	TelegramBotToken      string
+	TelegramWebhookSecret string
+	OwnerTelegramSubject  string
+
+	QStashCurrentSigningKey string
+	QStashNextSigningKey    string
+	QStashToken             string
+
+	GroqAPIKey   string
+	GroqModel    string
+	GeminiAPIKey string
+	GeminiModel  string
+	OpenAIAPIKey string
+	OpenAIModel  string
+
+	AdminAlertEmail string
+	SessionSecret   string
+	TimeZone        string
+}
+
+func FromEnv() Config {
+	return Config{
+		Environment:             envOr("APP_ENV", "development"),
+		AppOrigin:               strings.TrimRight(envOr("APP_ORIGIN", envOr("NEXT_PUBLIC_APP_ORIGIN", "http://localhost:3000")), "/"),
+		BuildVersion:            envOr("VERCEL_GIT_COMMIT_SHA", "development"),
+		TursoURL:                os.Getenv("TURSO_DATABASE_URL"),
+		TursoToken:              os.Getenv("TURSO_AUTH_TOKEN"),
+		TelegramClientID:        os.Getenv("TELEGRAM_CLIENT_ID"),
+		TelegramClientSecret:    os.Getenv("TELEGRAM_CLIENT_SECRET"),
+		TelegramBotToken:        os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramWebhookSecret:   os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
+		OwnerTelegramSubject:    os.Getenv("OWNER_TELEGRAM_SUBJECT"),
+		QStashCurrentSigningKey: os.Getenv("QSTASH_CURRENT_SIGNING_KEY"),
+		QStashNextSigningKey:    os.Getenv("QSTASH_NEXT_SIGNING_KEY"),
+		QStashToken:             os.Getenv("QSTASH_TOKEN"),
+		GroqAPIKey:              os.Getenv("GROQ_API_KEY"),
+		GroqModel:               envOr("GROQ_MODEL", "openai/gpt-oss-20b"),
+		GeminiAPIKey:            os.Getenv("GEMINI_API_KEY"),
+		GeminiModel:             envOr("GEMINI_MODEL", "gemini-3.6-flash"),
+		OpenAIAPIKey:            os.Getenv("OPENAI_API_KEY"),
+		OpenAIModel:             envOr("OPENAI_MODEL", "gpt-5.6-terra"),
+		AdminAlertEmail:         os.Getenv("ADMIN_ALERT_EMAIL"),
+		SessionSecret:           os.Getenv("SESSION_SECRET"),
+		TimeZone:                envOr("APP_TIME_ZONE", defaultTimeZone),
+	}
+}
+
+func (config Config) ValidateProduction() error {
+	var missing []string
+	for name, value := range map[string]string{
+		"APP_ORIGIN":                 config.AppOrigin,
+		"TURSO_DATABASE_URL":         config.TursoURL,
+		"TURSO_AUTH_TOKEN":           config.TursoToken,
+		"TELEGRAM_CLIENT_ID":         config.TelegramClientID,
+		"TELEGRAM_CLIENT_SECRET":     config.TelegramClientSecret,
+		"TELEGRAM_BOT_TOKEN":         config.TelegramBotToken,
+		"TELEGRAM_WEBHOOK_SECRET":    config.TelegramWebhookSecret,
+		"OWNER_TELEGRAM_SUBJECT":     config.OwnerTelegramSubject,
+		"QSTASH_CURRENT_SIGNING_KEY": config.QStashCurrentSigningKey,
+		"QSTASH_NEXT_SIGNING_KEY":    config.QStashNextSigningKey,
+		"QSTASH_TOKEN":               config.QStashToken,
+		"SESSION_SECRET":             config.SessionSecret,
+	} {
+		if strings.TrimSpace(value) == "" {
+			missing = append(missing, name)
+		}
+	}
+	if config.GroqAPIKey == "" && config.GeminiAPIKey == "" {
+		missing = append(missing, "GROQ_API_KEY or GEMINI_API_KEY")
+	}
+	if len(config.SessionSecret) < 32 {
+		missing = append(missing, "SESSION_SECRET (at least 32 characters)")
+	}
+	if len(config.TelegramWebhookSecret) < 32 {
+		missing = append(missing, "TELEGRAM_WEBHOOK_SECRET (at least 32 characters)")
+	}
+	if _, err := strconv.ParseInt(config.OwnerTelegramSubject, 10, 64); err != nil {
+		missing = append(missing, "OWNER_TELEGRAM_SUBJECT (numeric)")
+	}
+	parsedOrigin, err := url.Parse(config.AppOrigin)
+	if err != nil || parsedOrigin.Host == "" || parsedOrigin.Scheme != "https" {
+		missing = append(missing, "APP_ORIGIN (absolute https URL)")
+	}
+	databaseURL := strings.Replace(config.TursoURL, "libsql://", "https://", 1)
+	parsedDatabase, databaseError := url.Parse(databaseURL)
+	if databaseError != nil || parsedDatabase.Host == "" || parsedDatabase.Scheme != "https" {
+		missing = append(missing, "TURSO_DATABASE_URL (libsql or https URL)")
+	}
+	if config.TimeZone != defaultTimeZone {
+		if _, err := time.LoadLocation(config.TimeZone); err != nil {
+			missing = append(missing, "APP_TIME_ZONE (valid IANA zone)")
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("invalid production configuration: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func (config Config) IsProduction() bool { return config.Environment == "production" }
+
+func (config Config) ValidateRuntime() error {
+	if config.IsProduction() {
+		return config.ValidateProduction()
+	}
+	if config.TursoURL == "" || config.TursoToken == "" {
+		return errors.New("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are required")
+	}
+	return nil
+}
+
+func envOr(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}

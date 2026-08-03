@@ -1,0 +1,55 @@
+package content
+
+import (
+	"fmt"
+	"html"
+	"strings"
+)
+
+func RenderSections(draft LessonDraft) []string {
+	var sections []string
+	sections = append(sections,
+		"<b>"+escape(draft.Title)+"</b>\n<i>Estimated reading time: "+fmt.Sprint(draft.EstimatedMinutes)+" minutes</i>",
+		section("Why this matters", draft.Motivation),
+		listSection("What existed before", draft.PriorApproaches),
+		section("What it is", draft.Definition),
+		listSection("How it works", draft.Mechanics),
+		section("Production scenario", draft.ProductionExample),
+		listSection("Trade-offs", draft.Tradeoffs),
+		listSection("Failure modes", draft.FailureModes),
+		listSection("When not to use it", draft.WhenNotToUse),
+		listSection("Alternatives", draft.Alternatives),
+		section("Security", draft.Security),
+		section("Reliability", draft.Reliability),
+		section("Performance", draft.Performance),
+		section("Cost", draft.Cost),
+		section("Where it stands today", draft.PresentMaturity),
+		section("Where it may go", draft.FutureDirection),
+		section("Career relevance", draft.CareerRelevance),
+		section("Interview answer", draft.InterviewAnswer),
+		section("Recall question", draft.RecallQuestion),
+	)
+	if len(draft.Uncertainty) > 0 {
+		sections = append(sections, listSection("Uncertainty", draft.Uncertainty))
+	}
+	if len(draft.Sources) > 0 {
+		var sources []string
+		for _, source := range draft.Sources {
+			sources = append(sources, fmt.Sprintf(`<a href="%s">%s — %s</a>`, html.EscapeString(source.CanonicalURL), escape(source.Publisher), escape(source.Title)))
+		}
+		sections = append(sections, "<b>Sources</b>\n"+strings.Join(sources, "\n"))
+	}
+	return sections
+}
+
+func section(title, body string) string { return "<b>" + escape(title) + "</b>\n" + escape(body) }
+func listSection(title string, values []string) string {
+	var items []string
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			items = append(items, "• "+escape(value))
+		}
+	}
+	return "<b>" + escape(title) + "</b>\n" + strings.Join(items, "\n")
+}
+func escape(value string) string { return html.EscapeString(strings.TrimSpace(value)) }

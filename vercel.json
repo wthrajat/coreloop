@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "functions": {
+    "api/app/index.go": { "maxDuration": 60 },
+    "api/jobs/index.go": { "maxDuration": 60 },
+    "api/telegram/index.go": { "maxDuration": 30 }
+  },
+  "rewrites": [
+    { "source": "/api/app/:path*", "destination": "/api/app?__path=:path*" },
+    { "source": "/api/jobs/:path*", "destination": "/api/jobs?__path=:path*" },
+    {
+      "source": "/api/telegram/:path*",
+      "destination": "/api/telegram?__path=:path*"
+    }
+  ]
+}

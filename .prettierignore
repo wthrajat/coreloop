@@ -1,0 +1,6 @@
+.next
+node_modules
+pnpm-lock.yaml
+*.sql
+docs/0??-*.md
+docs/theme.md
