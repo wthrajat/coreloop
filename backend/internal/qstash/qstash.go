@@ -57,7 +57,8 @@ func (receiver *Receiver) Verify(signature, expectedURL string, body []byte) err
 	}
 	digest := sha256.Sum256(body)
 	expectedBody := base64.RawURLEncoding.EncodeToString(digest[:])
-	if !hmac.Equal([]byte(expectedBody), []byte(claims.Body)) {
+	providedBody := strings.TrimRight(claims.Body, "=")
+	if !hmac.Equal([]byte(expectedBody), []byte(providedBody)) {
 		return errors.New("QStash body hash does not match the raw request body")
 	}
 	return nil
