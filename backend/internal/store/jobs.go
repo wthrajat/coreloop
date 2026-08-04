@@ -160,12 +160,21 @@ func (store *Store) EnqueueSourcePolls(ctx context.Context, now time.Time) error
 }
 
 func (store *Store) RecoverJobs(ctx context.Context, now time.Time) error {
-	_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state='queued',lease_owner=NULL,lease_expires_at=NULL,
-		updated_at=? WHERE state='leased' AND lease_expires_at<=?`, timestamp(now), timestamp(now))
+	_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state='failed',lease_owner=NULL,lease_expires_at=NULL,
+		last_error_code=COALESCE(last_error_code,'attempts_exhausted'),
+		last_error_at=COALESCE(last_error_at,?),updated_at=?
+		WHERE attempt_count>=max_attempts AND (state='queued' OR (state='leased' AND lease_expires_at<=?))`,
+		timestamp(now), timestamp(now), timestamp(now))
 	if err != nil {
 		return err
 	}
-	_, err = store.database.ExecContext(ctx, `UPDATE job_queue SET state='queued',due_at=?,updated_at=?
+	_, err = store.database.ExecContext(ctx, `UPDATE job_queue SET state='queued',lease_owner=NULL,lease_expires_at=NULL,
+		updated_at=? WHERE state='leased' AND lease_expires_at<=? AND attempt_count<max_attempts`, timestamp(now), timestamp(now))
+	if err != nil {
+		return err
+	}
+	_, err = store.database.ExecContext(ctx, `UPDATE job_queue SET state='queued',due_at=?,
+		attempt_count=MIN(attempt_count,max_attempts-1),updated_at=?
 		WHERE state='blocked_quota' AND due_at<=?`, timestamp(now), timestamp(now), timestamp(now))
 	if err != nil {
 		return err
@@ -180,7 +189,7 @@ func (store *Store) PublishableJobs(ctx context.Context, now time.Time, limit in
 		limit = 10
 	}
 	rows, err := store.database.QueryContext(ctx, `SELECT id,sequence,COALESCE(user_id,''),COALESCE(assignment_id,''),job_type,state,due_at,attempt_count,max_attempts,idempotency_key,payload_json
-		FROM job_queue WHERE state='queued' AND due_at<=? ORDER BY sequence LIMIT ?`, timestamp(now), limit)
+		FROM job_queue WHERE state='queued' AND due_at<=? AND attempt_count<max_attempts ORDER BY sequence LIMIT ?`, timestamp(now), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +203,18 @@ func (store *Store) PublishableJobs(ctx context.Context, now time.Time, limit in
 		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
+}
+
+func (store *Store) FailExhaustedJob(ctx context.Context, jobID string, now time.Time) (bool, error) {
+	result, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state='failed',lease_owner=NULL,lease_expires_at=NULL,
+		last_error_code=COALESCE(last_error_code,'attempts_exhausted'),
+		last_error_at=COALESCE(last_error_at,?),updated_at=?
+		WHERE id=? AND state='queued' AND attempt_count>=max_attempts`, timestamp(now), timestamp(now), jobID)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
 }
 
 type scanner interface{ Scan(...any) error }
@@ -253,15 +274,21 @@ func (store *Store) AssignmentDeliveryState(ctx context.Context, userID, assignm
 }
 
 func (store *Store) FailJob(ctx context.Context, job Job, code string, quota bool, now time.Time) error {
+	if quota {
+		_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state='blocked_quota',due_at=?,
+			lease_owner=NULL,lease_expires_at=NULL,attempt_count=MAX(attempt_count-1,0),
+			last_error_code=?,last_error_at=?,updated_at=? WHERE id=?`,
+			timestamp(now.Add(time.Hour)), code, timestamp(now), timestamp(now), job.ID)
+		return err
+	}
 	state := "queued"
 	due := now.Add(time.Duration(job.AttemptCount*job.AttemptCount) * time.Minute)
-	if quota {
-		state = "blocked_quota"
-		due = now.Add(time.Hour)
-	} else if job.AttemptCount >= job.MaxAttempts {
+	if job.AttemptCount >= job.MaxAttempts {
 		state = "failed"
 	}
-	_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state=?,due_at=?,lease_owner=NULL,lease_expires_at=NULL,last_error_code=?,last_error_at=?,updated_at=? WHERE id=?`, state, timestamp(due), code, timestamp(now), timestamp(now), job.ID)
+	_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state=?,due_at=?,lease_owner=NULL,lease_expires_at=NULL,
+		last_error_code=?,last_error_at=?,updated_at=? WHERE id=?`,
+		state, timestamp(due), code, timestamp(now), timestamp(now), job.ID)
 	return err
 }
 

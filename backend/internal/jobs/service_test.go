@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -50,6 +51,9 @@ func TestRunAcknowledgesAJobThatIsNotCurrentlyLeasable(t *testing.T) {
 				t.Fatalf("job in state %q must be acknowledged: %v", state, err)
 			}
 			wantRequests := 2
+			if state == "queued" {
+				wantRequests = 3
+			}
 			if state == "completed" || state == "blocked_quota" || state == "failed" {
 				wantRequests = 3
 			}
@@ -109,6 +113,60 @@ func TestCompletedDuplicateWakeResumesTheQueue(t *testing.T) {
 	}
 	if publishedDeduplicationID != "dispatch-job_next-1" {
 		t.Fatalf("published deduplication id = %q", publishedDeduplicationID)
+	}
+}
+
+func TestExhaustedQueuedWakeIsFinalizedAndResumesTheQueue(t *testing.T) {
+	databaseRequestCount := 0
+	var finalizationRequest []byte
+	databaseClient := &http.Client{Transport: jobRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		databaseRequestCount++
+		body := emptyTursoResult()
+		switch databaseRequestCount {
+		case 1:
+			body = `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
+		case 2:
+			body = `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"state"}],"rows":[[{"type":"text","value":"queued"}]],"affected_row_count":0,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
+		case 3:
+			finalizationRequest, _ = io.ReadAll(request.Body)
+		case 4:
+			body = tursoJobResult("job_next", "generate_lesson", "queued")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", databaseClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	var publishedBody string
+	publisherClient := &http.Client{Transport: jobRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(request.Body)
+		publishedBody = string(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"messageId":"msg_next","deduplicated":false}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	service := New(store.New(database), nil, nil, qstash.NewPublisher("secret", publisherClient), nil, "https://coreloop.example")
+	if err := service.Run(context.Background(), "job_exhausted", "qstash:stale"); err != nil {
+		t.Fatal(err)
+	}
+	if databaseRequestCount != 4 {
+		t.Fatalf("database request count = %d, want 4", databaseRequestCount)
+	}
+	finalizationSQL := firstTursoSQL(t, finalizationRequest)
+	if !strings.Contains(finalizationSQL, "state='failed'") || !strings.Contains(finalizationSQL, "attempt_count>=max_attempts") {
+		t.Fatalf("exhausted job was not terminalized safely: %s", finalizationSQL)
+	}
+	if publishedBody != `{"job_id":"job_next"}` {
+		t.Fatalf("published body = %q", publishedBody)
 	}
 }
 
@@ -283,6 +341,98 @@ func TestJobQueueSummaryReportsTheStageAndOldestDueTime(t *testing.T) {
 	}
 }
 
+func TestRecoveryTerminalizesExhaustedJobsAndPreservesQuotaRetries(t *testing.T) {
+	var requests [][]byte
+	client := &http.Client{Transport: jobRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(request.Body)
+		requests = append(requests, body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(emptyTursoResult())),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if err := store.New(database).RecoverJobs(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 5 {
+		t.Fatalf("recovery request count = %d, want 5", len(requests))
+	}
+	exhaustedSQL := firstTursoSQL(t, requests[0])
+	if !strings.Contains(exhaustedSQL, "state='failed'") || !strings.Contains(exhaustedSQL, "attempt_count>=max_attempts") {
+		t.Fatalf("exhausted recovery query = %s", exhaustedSQL)
+	}
+	leaseRecoverySQL := firstTursoSQL(t, requests[1])
+	if !strings.Contains(leaseRecoverySQL, "attempt_count<max_attempts") {
+		t.Fatalf("lease recovery query = %s", leaseRecoverySQL)
+	}
+	quotaRecoverySQL := firstTursoSQL(t, requests[2])
+	if !strings.Contains(quotaRecoverySQL, "MIN(attempt_count,max_attempts-1)") {
+		t.Fatalf("quota recovery query = %s", quotaRecoverySQL)
+	}
+}
+
+func TestPublishableJobsExcludeExhaustedQueuedRows(t *testing.T) {
+	var requestBody []byte
+	client := &http.Client{Transport: jobRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestBody, _ = io.ReadAll(request.Body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(emptyTursoResult())),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	jobs, err := store.New(database).PublishableJobs(context.Background(), time.Now(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("publishable jobs = %#v", jobs)
+	}
+	publishableSQL := firstTursoSQL(t, requestBody)
+	if !strings.Contains(publishableSQL, "attempt_count<max_attempts") {
+		t.Fatalf("publishable query can select exhausted rows: %s", publishableSQL)
+	}
+}
+
+func TestQuotaFailureDoesNotConsumeTheOrdinaryAttemptBudget(t *testing.T) {
+	var requestBody []byte
+	client := &http.Client{Transport: jobRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestBody, _ = io.ReadAll(request.Body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(emptyTursoResult())),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	job := store.Job{ID: "job_quota", AttemptCount: 5, MaxAttempts: 5}
+	if err := store.New(database).FailJob(context.Background(), job, "ai_quota_exhausted", true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	quotaFailureSQL := firstTursoSQL(t, requestBody)
+	if !strings.Contains(quotaFailureSQL, "state='blocked_quota'") || !strings.Contains(quotaFailureSQL, "MAX(attempt_count-1,0)") {
+		t.Fatalf("quota failure consumed the ordinary attempt budget: %s", quotaFailureSQL)
+	}
+}
+
 func TestFailedJobStateMatchesDurableRetryRules(t *testing.T) {
 	job := store.Job{AttemptCount: 2, MaxAttempts: 5}
 	if state := failedJobState(job, false); state != "queued" {
@@ -305,7 +455,7 @@ func TestCompletedJobDispatchesTheNextDueJob(t *testing.T) {
 		switch databaseRequestCount {
 		case 1:
 			body = tursoJobResult("job_current", "recover", "leased")
-		case 7:
+		case 8:
 			body = tursoJobResult("job_next", "generate_lesson", "queued")
 		}
 		return &http.Response{
@@ -334,8 +484,8 @@ func TestCompletedJobDispatchesTheNextDueJob(t *testing.T) {
 	if err := service.Run(context.Background(), "job_current", "qstash:test"); err != nil {
 		t.Fatal(err)
 	}
-	if databaseRequestCount != 7 {
-		t.Fatalf("database request count = %d, want 7", databaseRequestCount)
+	if databaseRequestCount != 8 {
+		t.Fatalf("database request count = %d, want 8", databaseRequestCount)
 	}
 	if publishedBody != `{"job_id":"job_next"}` {
 		t.Fatalf("published body = %q, want next job", publishedBody)
@@ -361,6 +511,24 @@ func TestJobExecutionDeadlinePreservesFinalizationTime(t *testing.T) {
 
 func emptyTursoResult() string {
 	return `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":1,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
+}
+
+func firstTursoSQL(t *testing.T, body []byte) string {
+	t.Helper()
+	var payload struct {
+		Requests []struct {
+			Statement *struct {
+				SQL string `json:"sql"`
+			} `json:"stmt"`
+		} `json:"requests"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode Turso request: %v", err)
+	}
+	if len(payload.Requests) == 0 || payload.Requests[0].Statement == nil {
+		t.Fatalf("Turso request has no SQL statement: %s", body)
+	}
+	return payload.Requests[0].Statement.SQL
 }
 
 func tursoJobResult(jobID, jobType, state string) string {

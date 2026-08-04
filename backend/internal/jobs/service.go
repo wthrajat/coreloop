@@ -156,6 +156,16 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 			"job_id", jobID,
 			"job_state", job.State,
 		)
+		if job.State == "queued" {
+			exhausted, finalizeError := service.store.FailExhaustedJob(ctx, jobID, service.now())
+			if finalizeError != nil {
+				return fmt.Errorf("finalize exhausted queued job: %w", finalizeError)
+			}
+			if exhausted {
+				slog.WarnContext(ctx, "exhausted queued job finalized", "job_id", jobID)
+				return service.continueQueue(ctx)
+			}
+		}
 		if job.State == "completed" || job.State == "failed" || job.State == "blocked_quota" {
 			return service.continueQueue(ctx)
 		}
