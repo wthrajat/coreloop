@@ -35,6 +35,8 @@ type Service struct {
 	now       func() time.Time
 }
 
+const publishableJobsPerTick = 1
+
 func New(dataStore *store.Store, providerRouter *providers.Router, telegramClient *telegram.Client, publisher *qstash.Publisher, alertService *alerts.Service, appOrigin string) *Service {
 	sourceClient := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(request *http.Request, via []*http.Request) error {
 		if len(via) >= 4 {
@@ -63,7 +65,7 @@ func (service *Service) Tick(ctx context.Context) error {
 	if err := service.store.EnqueueSourcePolls(ctx, now); err != nil {
 		return err
 	}
-	queued, err := service.store.PublishableJobs(ctx, now, 20)
+	queued, err := service.store.PublishableJobs(ctx, now, publishableJobsPerTick)
 	if err != nil {
 		return err
 	}

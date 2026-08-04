@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"coreloop/backend/internal/database/tursohttp"
 	"coreloop/backend/internal/store"
@@ -26,9 +27,9 @@ func TestRunAcknowledgesAJobThatIsNotCurrentlyLeasable(t *testing.T) {
 			requestCount := 0
 			client := &http.Client{Transport: jobRoundTripFunc(func(*http.Request) (*http.Response, error) {
 				requestCount++
-				body := `{"baton":"test-transaction","results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}]}`
-				if requestCount == 3 {
-					body = `{"baton":"test-transaction","results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"state"}],"rows":[[{"type":"text","value":"` + state + `"}]],"affected_row_count":0,"last_insert_rowid":null}}}]}`
+				body := `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}]}`
+				if requestCount == 2 {
+					body = `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"state"}],"rows":[[{"type":"text","value":"` + state + `"}]],"affected_row_count":0,"last_insert_rowid":null}}}]}`
 				}
 				return &http.Response{
 					StatusCode: http.StatusOK,
@@ -47,8 +48,8 @@ func TestRunAcknowledgesAJobThatIsNotCurrentlyLeasable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("job in state %q must be acknowledged: %v", state, err)
 			}
-			if requestCount != 4 {
-				t.Fatalf("request count = %d, want 4", requestCount)
+			if requestCount != 2 {
+				t.Fatalf("request count = %d, want 2", requestCount)
 			}
 		})
 	}
@@ -58,9 +59,9 @@ func TestRunReturnsAContextualErrorForAMissingJob(t *testing.T) {
 	requestCount := 0
 	client := &http.Client{Transport: jobRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		requestCount++
-		body := `{"baton":"test-transaction","results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}]}`
-		if requestCount == 3 {
-			body = `{"baton":"test-transaction","results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"state"}],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}]}`
+		body := `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}]}`
+		if requestCount == 2 {
+			body = `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"state"}],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}]}`
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -78,5 +79,68 @@ func TestRunReturnsAContextualErrorForAMissingJob(t *testing.T) {
 	err = service.Run(context.Background(), "job_missing", "qstash:retry")
 	if !errors.Is(err, sql.ErrNoRows) || !strings.Contains(err.Error(), "lease job") {
 		t.Fatalf("missing job error = %v", err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("request count = %d, want 2", requestCount)
+	}
+}
+
+func TestLeaseJobDoesNotRequireATransactionBaton(t *testing.T) {
+	requestCount := 0
+	var received []byte
+	client := &http.Client{Transport: jobRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		received, _ = io.ReadAll(request.Body)
+		body := `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[` +
+			`{"name":"id"},{"name":"sequence"},{"name":"user_id"},{"name":"assignment_id"},` +
+			`{"name":"job_type"},{"name":"state"},{"name":"due_at"},{"name":"attempt_count"},` +
+			`{"name":"max_attempts"},{"name":"idempotency_key"},{"name":"payload_json"}` +
+			`],"rows":[[` +
+			`{"type":"text","value":"job_ready"},` +
+			`{"type":"integer","value":"7"},` +
+			`{"type":"text","value":""},` +
+			`{"type":"text","value":""},` +
+			`{"type":"text","value":"recover"},` +
+			`{"type":"text","value":"leased"},` +
+			`{"type":"text","value":"2026-08-04T12:45:00Z"},` +
+			`{"type":"integer","value":"1"},` +
+			`{"type":"integer","value":"5"},` +
+			`{"type":"text","value":"recover:test"},` +
+			`{"type":"text","value":"{}"}` +
+			`]],"affected_row_count":1,"last_insert_rowid":null}}},` +
+			`{"type":"ok","response":{"type":"close"}}]}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(body)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	job, err := store.New(database).LeaseJob(context.Background(), "job_ready", "qstash:test", time.Now())
+	if err != nil {
+		t.Fatalf("lease job: %v", err)
+	}
+	if job.ID != "job_ready" || job.State != "leased" {
+		t.Fatalf("leased job = %#v", job)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1", requestCount)
+	}
+	if !bytes.Contains(received, []byte("UPDATE job_queue")) || !bytes.Contains(received, []byte("RETURNING id")) {
+		t.Fatalf("lease was not sent as one atomic UPDATE RETURNING statement: %s", received)
+	}
+	if bytes.Contains(received, []byte("BEGIN")) {
+		t.Fatalf("lease unexpectedly opened a transaction: %s", received)
+	}
+}
+
+func TestSchedulerPublishesOneChronologicalJobPerTick(t *testing.T) {
+	if publishableJobsPerTick != 1 {
+		t.Fatalf("publishable jobs per tick = %d, want 1", publishableJobsPerTick)
 	}
 }

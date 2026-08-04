@@ -178,37 +178,26 @@ func scanJob(row scanner) (Job, error) {
 }
 
 func (store *Store) LeaseJob(ctx context.Context, jobID, owner string, now time.Time) (Job, error) {
-	tx, err := store.database.BeginTx(ctx, nil)
-	if err != nil {
-		return Job{}, err
-	}
-	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE job_queue SET state='leased',lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=?
-		WHERE id=? AND state='queued' AND due_at<=? AND attempt_count<max_attempts`, owner, timestamp(now.Add(4*time.Minute)), timestamp(now), jobID, timestamp(now))
-	if err != nil {
-		return Job{}, err
-	}
-	changed, _ := result.RowsAffected()
-	if changed != 1 {
-		var state string
-		err := tx.QueryRowContext(ctx, "SELECT state FROM job_queue WHERE id=?", jobID).Scan(&state)
-		if err != nil {
-			return Job{}, err
-		}
-		if err := tx.Commit(); err != nil {
-			return Job{}, err
-		}
-		return Job{ID: jobID, State: state}, ErrJobNotLeasable
-	}
-	row := tx.QueryRowContext(ctx, `SELECT id,sequence,COALESCE(user_id,''),COALESCE(assignment_id,''),job_type,state,due_at,attempt_count,max_attempts,idempotency_key,payload_json FROM job_queue WHERE id=?`, jobID)
+	row := store.database.QueryRowContext(ctx, `UPDATE job_queue
+		SET state='leased',lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=?
+		WHERE id=? AND state='queued' AND due_at<=? AND attempt_count<max_attempts
+		RETURNING id,sequence,COALESCE(user_id,''),COALESCE(assignment_id,''),job_type,state,due_at,
+			attempt_count,max_attempts,idempotency_key,payload_json`,
+		owner, timestamp(now.Add(4*time.Minute)), timestamp(now), jobID, timestamp(now))
 	job, err := scanJob(row)
+	if err == nil {
+		return job, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Job{}, fmt.Errorf("acquire job lease: %w", err)
+	}
+
+	var state string
+	err = store.database.QueryRowContext(ctx, "SELECT state FROM job_queue WHERE id=?", jobID).Scan(&state)
 	if err != nil {
 		return Job{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return Job{}, err
-	}
-	return job, nil
+	return Job{ID: jobID, State: state}, ErrJobNotLeasable
 }
 
 func (store *Store) CompleteJob(ctx context.Context, jobID string, now time.Time) error {
