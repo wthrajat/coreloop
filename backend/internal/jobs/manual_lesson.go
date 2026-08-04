@@ -187,7 +187,7 @@ func publishJob(ctx context.Context, publisher manualLessonPublisher, appOrigin,
 		return errors.New("QStash publisher is not configured")
 	}
 	destination := strings.TrimRight(appOrigin, "/") + "/api/jobs/run"
-	return publisher.Publish(ctx, destination, "dispatch:"+jobID, map[string]string{"job_id": jobID})
+	return publisher.Publish(ctx, destination, dispatchDeduplicationID(jobID), map[string]string{"job_id": jobID})
 }
 
 func manualLessonKey(userID, requestID string) string {

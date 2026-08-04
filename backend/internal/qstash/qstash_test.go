@@ -64,7 +64,7 @@ func TestPublisherPreservesDestinationURLInPublishPath(t *testing.T) {
 	publisher := NewPublisher("qstash-token", client)
 	publisher.baseURL = "https://qstash.upstash.io"
 	destination := "https://coreloop1.vercel.app/api/jobs/run"
-	if err := publisher.Publish(context.Background(), destination, "dispatch:job_1", map[string]string{"job_id": "job_1"}); err != nil {
+	if err := publisher.Publish(context.Background(), destination, "dispatch-job_1", map[string]string{"job_id": "job_1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -74,7 +74,7 @@ func TestPublisherPreservesDestinationURLInPublishPath(t *testing.T) {
 	if captured.authorization != "Bearer qstash-token" {
 		t.Fatalf("unexpected authorization header: %q", captured.authorization)
 	}
-	if captured.deduplicationID != "dispatch:job_1" {
+	if captured.deduplicationID != "dispatch-job_1" {
 		t.Fatalf("unexpected deduplication ID: %q", captured.deduplicationID)
 	}
 	if captured.body != `{"job_id":"job_1"}` {

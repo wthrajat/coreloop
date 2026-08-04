@@ -68,11 +68,15 @@ func (service *Service) Tick(ctx context.Context) error {
 	}
 	for _, job := range queued {
 		destination := service.appOrigin + "/api/jobs/run"
-		if err := service.publisher.Publish(ctx, destination, "dispatch:"+job.ID, map[string]string{"job_id": job.ID}); err != nil {
+		if err := service.publisher.Publish(ctx, destination, dispatchDeduplicationID(job.ID), map[string]string{"job_id": job.ID}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func dispatchDeduplicationID(jobID string) string {
+	return "dispatch-" + jobID
 }
 
 func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
