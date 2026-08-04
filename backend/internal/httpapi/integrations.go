@@ -72,6 +72,7 @@ func verifyQStash(w http.ResponseWriter, r *http.Request, configuration JobsConf
 	}
 	expected := strings.TrimRight(configuration.AppOrigin, "/") + r.URL.Path
 	if err := configuration.Receiver.Verify(r.Header.Get("Upstash-Signature"), expected, body); err != nil {
+		slog.WarnContext(r.Context(), "QStash signature rejected", "path", r.URL.Path, "expected_url", expected, "reason", err.Error())
 		WriteProblem(w, apperror.New(apperror.CodeForbidden, "QStash signature is invalid", http.StatusForbidden))
 		return nil, false
 	}

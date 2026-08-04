@@ -22,7 +22,7 @@ type Receiver struct {
 }
 
 func NewReceiver(current, next string) *Receiver {
-	return &Receiver{current: current, next: next, now: time.Now}
+	return &Receiver{current: strings.TrimSpace(current), next: strings.TrimSpace(next), now: time.Now}
 }
 
 func (receiver *Receiver) Verify(signature, expectedURL string, body []byte) error {
@@ -49,16 +49,16 @@ func (receiver *Receiver) Verify(signature, expectedURL string, body []byte) err
 	}
 	valid := verifySignature(parts, receiver.current) || verifySignature(parts, receiver.next)
 	if !valid {
-		return errors.New("QStash signature does not match")
+		return errors.New("QStash signature does not match configured signing keys")
 	}
 	now := receiver.now().Unix()
 	if claims.Issuer != "Upstash" || claims.Subject != expectedURL || claims.Expires < now || claims.NotBefore > now+30 {
-		return errors.New("QStash claims are invalid")
+		return errors.New("QStash claims do not match the receiver endpoint or clock")
 	}
 	digest := sha256.Sum256(body)
 	expectedBody := base64.RawURLEncoding.EncodeToString(digest[:])
 	if !hmac.Equal([]byte(expectedBody), []byte(claims.Body)) {
-		return errors.New("QStash body hash is invalid")
+		return errors.New("QStash body hash does not match the raw request body")
 	}
 	return nil
 }
