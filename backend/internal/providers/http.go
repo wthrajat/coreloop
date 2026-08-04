@@ -19,6 +19,8 @@ type OpenAICompatible struct {
 	http     *http.Client
 }
 
+const groqFreeTierCompletionBudget = 6_500
+
 func NewGroq(apiKey, model string, client *http.Client) *OpenAICompatible {
 	return newOpenAICompatible("groq", "https://api.groq.com/openai/v1/chat/completions", apiKey, model, client)
 }
@@ -47,7 +49,7 @@ func (provider *OpenAICompatible) Generate(ctx context.Context, system, input st
 		"response_format": map[string]any{"type": "json_schema", "json_schema": map[string]any{
 			"name": "lesson_draft", "strict": true, "schema": schema,
 		}},
-		"max_completion_tokens": outputBudget,
+		"max_completion_tokens": provider.completionBudget(outputBudget),
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -102,6 +104,13 @@ func (provider *OpenAICompatible) Generate(ctx context.Context, system, input st
 		CachedTokens: decoded.Usage.PromptDetails.CachedTokens}, nil
 }
 
+func (provider *OpenAICompatible) completionBudget(requested int) int {
+	if provider.provider == "groq" && requested > groqFreeTierCompletionBudget {
+		return groqFreeTierCompletionBudget
+	}
+	return requested
+}
+
 type Gemini struct {
 	apiKey, model string
 	http          *http.Client
@@ -124,7 +133,7 @@ func (provider *Gemini) Generate(ctx context.Context, system, input string, sche
 		"contents":           []map[string]any{{"role": "user", "parts": []map[string]string{{"text": input}}}},
 		"generationConfig": map[string]any{
 			"maxOutputTokens": outputBudget, "temperature": 0.2,
-			"responseFormat": map[string]any{"text": map[string]any{"mimeType": "application/json", "schema": schema}},
+			"responseFormat": map[string]any{"text": map[string]any{"mimeType": "APPLICATION_JSON", "schema": schema}},
 		},
 	}
 	encoded, err := json.Marshal(payload)

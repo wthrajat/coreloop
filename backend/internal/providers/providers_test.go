@@ -47,3 +47,34 @@ func TestRouterFallsBackWithoutUsingOpenAI(t *testing.T) {
 		t.Fatal("OpenAI was called automatically")
 	}
 }
+
+func TestRouterDoesNotReportQuotaForProviderContractFailures(t *testing.T) {
+	groq := &fakeProvider{name: "groq", configured: true, responses: []any{
+		&Error{Provider: "groq", Kind: FailurePermanent, Message: "request exceeds the model TPM limit"},
+	}}
+	gemini := &fakeProvider{name: "gemini", configured: true, responses: []any{
+		&Error{Provider: "gemini", Kind: FailurePermanent, Message: "invalid structured-output request"},
+	}}
+
+	_, err := NewRouter(groq, gemini, nil).Generate(context.Background(), content.LessonContext{Minutes: 30})
+	if err == nil {
+		t.Fatal("expected provider failure")
+	}
+	if errors.Is(err, ErrFreeQuotaExhausted) {
+		t.Fatalf("provider contract errors were mislabeled as quota exhaustion: %v", err)
+	}
+}
+
+func TestRouterReportsQuotaOnlyWhenEveryConfiguredFreeProviderIsExhausted(t *testing.T) {
+	groq := &fakeProvider{name: "groq", configured: true, responses: []any{
+		&Error{Provider: "groq", Kind: FailureQuota, Message: "quota"},
+	}}
+	gemini := &fakeProvider{name: "gemini", configured: true, responses: []any{
+		&Error{Provider: "gemini", Kind: FailureQuota, Message: "quota"},
+	}}
+
+	_, err := NewRouter(groq, gemini, nil).Generate(context.Background(), content.LessonContext{Minutes: 30})
+	if !errors.Is(err, ErrFreeQuotaExhausted) {
+		t.Fatalf("quota exhaustion error = %v", err)
+	}
+}

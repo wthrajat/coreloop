@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"coreloop/backend/internal/database/tursohttp"
+	"coreloop/backend/internal/qstash"
 	"coreloop/backend/internal/store"
 )
 
@@ -143,4 +144,74 @@ func TestSchedulerPublishesOneChronologicalJobPerTick(t *testing.T) {
 	if publishableJobsPerTick != 1 {
 		t.Fatalf("publishable jobs per tick = %d, want 1", publishableJobsPerTick)
 	}
+}
+
+func TestCompletedJobDispatchesTheNextDueJob(t *testing.T) {
+	databaseRequestCount := 0
+	databaseClient := &http.Client{Transport: jobRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		databaseRequestCount++
+		body := emptyTursoResult()
+		switch databaseRequestCount {
+		case 1:
+			body = tursoJobResult("job_current", "recover", "leased")
+		case 7:
+			body = tursoJobResult("job_next", "generate_lesson", "queued")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(body)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", databaseClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	var publishedBody string
+	publisherClient := &http.Client{Transport: jobRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(request.Body)
+		publishedBody = string(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	service := New(store.New(database), nil, nil, qstash.NewPublisher("secret", publisherClient), nil, "https://coreloop.example")
+	if err := service.Run(context.Background(), "job_current", "qstash:test"); err != nil {
+		t.Fatal(err)
+	}
+	if databaseRequestCount != 7 {
+		t.Fatalf("database request count = %d, want 7", databaseRequestCount)
+	}
+	if publishedBody != `{"job_id":"job_next"}` {
+		t.Fatalf("published body = %q, want next job", publishedBody)
+	}
+}
+
+func emptyTursoResult() string {
+	return `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":1,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
+}
+
+func tursoJobResult(jobID, jobType, state string) string {
+	return `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[` +
+		`{"name":"id"},{"name":"sequence"},{"name":"user_id"},{"name":"assignment_id"},` +
+		`{"name":"job_type"},{"name":"state"},{"name":"due_at"},{"name":"attempt_count"},` +
+		`{"name":"max_attempts"},{"name":"idempotency_key"},{"name":"payload_json"}` +
+		`],"rows":[[` +
+		`{"type":"text","value":"` + jobID + `"},` +
+		`{"type":"integer","value":"7"},` +
+		`{"type":"text","value":""},` +
+		`{"type":"text","value":""},` +
+		`{"type":"text","value":"` + jobType + `"},` +
+		`{"type":"text","value":"` + state + `"},` +
+		`{"type":"text","value":"2026-08-04T13:00:00Z"},` +
+		`{"type":"integer","value":"1"},` +
+		`{"type":"integer","value":"5"},` +
+		`{"type":"text","value":"test-key"},` +
+		`{"type":"text","value":"{}"}` +
+		`]],"affected_row_count":1,"last_insert_rowid":null}}},` +
+		`{"type":"ok","response":{"type":"close"}}]}`
 }

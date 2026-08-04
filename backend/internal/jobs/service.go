@@ -65,17 +65,29 @@ func (service *Service) Tick(ctx context.Context) error {
 	if err := service.store.EnqueueSourcePolls(ctx, now); err != nil {
 		return err
 	}
-	queued, err := service.store.PublishableJobs(ctx, now, publishableJobsPerTick)
+	return service.dispatchNextDueJob(ctx)
+}
+
+func (service *Service) dispatchNextDueJob(ctx context.Context) error {
+	queued, err := service.store.PublishableJobs(ctx, service.now(), publishableJobsPerTick)
 	if err != nil {
 		return err
 	}
-	for _, job := range queued {
-		destination := service.appOrigin + "/api/jobs/run"
-		if err := service.publisher.Publish(ctx, destination, dispatchDeduplicationID(job.ID), map[string]string{"job_id": job.ID}); err != nil {
-			return err
-		}
+	if len(queued) == 0 {
+		return nil
 	}
-	return nil
+	if service.publisher == nil {
+		return errors.New("QStash publisher is not configured")
+	}
+	job := queued[0]
+	destination := service.appOrigin + "/api/jobs/run"
+	return service.publisher.Publish(ctx, destination, dispatchDeduplicationID(job.ID), map[string]string{"job_id": job.ID})
+}
+
+func (service *Service) continueQueue(ctx context.Context) {
+	if err := service.dispatchNextDueJob(ctx); err != nil {
+		slog.WarnContext(ctx, "next chronological job dispatch failed", "error", err)
+	}
 }
 
 func dispatchDeduplicationID(jobID string) string {
@@ -96,7 +108,11 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	}
 	err = service.execute(ctx, job)
 	if err == nil {
-		return service.store.CompleteJob(ctx, job.ID, service.now())
+		if err := service.store.CompleteJob(ctx, job.ID, service.now()); err != nil {
+			return err
+		}
+		service.continueQueue(ctx)
+		return nil
 	}
 	quota := errors.Is(err, providers.ErrFreeQuotaExhausted)
 	code := "job_failed"
@@ -109,6 +125,7 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	if quota {
 		service.notifyQuota(ctx, job)
 	}
+	service.continueQueue(ctx)
 	return fmt.Errorf("execute %s job: %w", job.Type, err)
 }
 

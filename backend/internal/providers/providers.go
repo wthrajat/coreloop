@@ -79,9 +79,23 @@ func (router *Router) Generate(ctx context.Context, lessonContext content.Lesson
 		failures = append(failures, err)
 	}
 	if len(failures) == 0 {
-		return content.Generated{}, fmt.Errorf("%w: no free provider is configured", ErrFreeQuotaExhausted)
+		return content.Generated{}, errors.New("no free AI provider is configured")
 	}
-	return content.Generated{}, fmt.Errorf("%w: %v", ErrFreeQuotaExhausted, errors.Join(failures...))
+	joined := errors.Join(failures...)
+	if everyFailureIsQuotaExhaustion(failures) {
+		return content.Generated{}, fmt.Errorf("%w: %v", ErrFreeQuotaExhausted, joined)
+	}
+	return content.Generated{}, fmt.Errorf("all configured free AI providers failed: %w", joined)
+}
+
+func everyFailureIsQuotaExhaustion(failures []error) bool {
+	for _, failure := range failures {
+		var providerError *Error
+		if !errors.As(failure, &providerError) || providerError.Kind != FailureQuota {
+			return false
+		}
+	}
+	return len(failures) > 0
 }
 
 func (router *Router) GenerateWithOpenAI(ctx context.Context, lessonContext content.LessonContext) (content.Generated, error) {
