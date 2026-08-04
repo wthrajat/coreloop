@@ -41,6 +41,7 @@ type Claims struct {
 	Issuer            string          `json:"iss"`
 	Audience          json.RawMessage `json:"aud"`
 	Subject           string          `json:"sub"`
+	TelegramUserID    int64           `json:"id"`
 	ExpiresAt         int64           `json:"exp"`
 	IssuedAt          int64           `json:"iat"`
 	Nonce             string          `json:"nonce"`
@@ -147,6 +148,9 @@ func (client *OIDCClient) VerifyIDToken(ctx context.Context, token, expectedNonc
 	}
 	if claims.Subject == "" || claims.ExpiresAt <= client.now().Unix() {
 		return Claims{}, errors.New("Telegram ID token is expired or missing a subject")
+	}
+	if claims.TelegramUserID <= 0 {
+		return Claims{}, errors.New("Telegram ID token is missing its user ID")
 	}
 	if expectedNonce == "" || claims.Nonce != expectedNonce {
 		return Claims{}, errors.New("Telegram ID token nonce is invalid")

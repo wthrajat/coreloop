@@ -51,6 +51,8 @@ func (store *Store) DueOccurrences(ctx context.Context, now time.Time, tolerance
 	rows, err := store.database.QueryContext(ctx, `SELECT ds.user_id,ds.day_of_week,ds.local_time,ds.time_zone
 		FROM delivery_schedules ds JOIN users u ON u.id=ds.user_id
 		JOIN learning_preferences lp ON lp.user_id=ds.user_id
+		JOIN delivery_destinations dd ON dd.user_id=ds.user_id AND dd.channel='telegram'
+			AND dd.enabled=1 AND dd.status='connected'
 		WHERE ds.enabled=1 AND u.status='active' AND (lp.paused_until IS NULL OR lp.paused_until<=?)`, timestamp(now))
 	if err != nil {
 		return nil, err

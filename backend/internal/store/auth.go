@@ -95,10 +95,11 @@ func (store *Store) ConsumeAuthFlow(ctx context.Context, stateHash string, now t
 }
 
 type Identity struct {
-	Subject     string
-	DisplayName string
-	Username    string
-	AvatarURL   string
+	Subject        string
+	TelegramChatID string
+	DisplayName    string
+	Username       string
+	AvatarURL      string
 }
 
 func (store *Store) UpsertUserFromTelegram(ctx context.Context, identity Identity, inviteID string, now time.Time) (User, bool, error) {
@@ -151,7 +152,8 @@ func (store *Store) UpsertUserFromTelegram(ctx context.Context, identity Identit
 	if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_destinations
 		(id, user_id, telegram_chat_id) VALUES (?, ?, ?)
 		ON CONFLICT(user_id, channel) DO UPDATE SET telegram_chat_id=excluded.telegram_chat_id,
-		status='connected', enabled=1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`, mustID("dst"), user.ID, identity.Subject); err != nil {
+		status='connected', enabled=1, connected_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`, mustID("dst"), user.ID, identity.TelegramChatID); err != nil {
 		return User{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -271,8 +273,28 @@ func (store *Store) Destination(ctx context.Context, userID string) (string, err
 	return chatID, err
 }
 
-func (store *Store) UserByTelegramSubject(ctx context.Context, subject string) (User, error) {
-	return findUserBySubject(ctx, store.database, subject)
+func (store *Store) DisconnectDestination(ctx context.Context, userID string, now time.Time) error {
+	_, err := store.database.ExecContext(ctx, `UPDATE delivery_destinations
+		SET status='disconnected',enabled=0,updated_at=?
+		WHERE user_id=? AND channel='telegram'`, timestamp(now), userID)
+	return err
+}
+
+func (store *Store) UserByTelegramChatID(ctx context.Context, chatID string) (User, error) {
+	var user User
+	var created string
+	err := store.database.QueryRowContext(ctx, `SELECT u.id,u.telegram_subject,u.display_name,
+		u.username,u.avatar_url,u.status,u.created_at
+		FROM users u JOIN delivery_destinations dd ON dd.user_id=u.id
+		WHERE dd.channel='telegram' AND dd.telegram_chat_id=? AND dd.enabled=1
+			AND dd.status='connected' AND u.status<>'deleted'`, chatID).
+		Scan(&user.ID, &user.TelegramSubject, &user.DisplayName, &user.Username,
+			&user.AvatarURL, &user.Status, &created)
+	if err != nil {
+		return User{}, err
+	}
+	user.CreatedAt, err = parseTimestamp(created)
+	return user, err
 }
 
 func (store *Store) DeleteUser(ctx context.Context, userID string, now time.Time) error {

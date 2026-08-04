@@ -53,7 +53,7 @@ func TestVerifyTelegramIDTokenChecksRS256Claims(t *testing.T) {
 	client := NewOIDCClient("client-1", "secret", "https://example.com/callback", httpClient)
 	client.now = func() time.Time { return time.Unix(1_800_000_000, 0) }
 	header, _ := json.Marshal(map[string]string{"alg": "RS256", "kid": "key-1"})
-	claims, _ := json.Marshal(map[string]any{"iss": telegramIssuer, "aud": "client-1", "sub": "12345", "exp": int64(1_800_000_300), "nonce": "expected"})
+	claims, _ := json.Marshal(map[string]any{"iss": telegramIssuer, "aud": "client-1", "sub": "opaque-subject", "id": int64(12345), "exp": int64(1_800_000_300), "nonce": "expected"})
 	encodedHeader := base64.RawURLEncoding.EncodeToString(header)
 	encodedClaims := base64.RawURLEncoding.EncodeToString(claims)
 	digest := sha256.Sum256([]byte(encodedHeader + "." + encodedClaims))
@@ -66,8 +66,21 @@ func TestVerifyTelegramIDTokenChecksRS256Claims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verified.Subject != "12345" {
-		t.Fatalf("subject=%s", verified.Subject)
+	if verified.Subject != "opaque-subject" || verified.TelegramUserID != 12345 {
+		t.Fatalf("claims=%#v", verified)
+	}
+}
+
+func TestIdentityUsesTelegramUserIDForBotDelivery(t *testing.T) {
+	identity := identityFromClaims(Claims{
+		Subject: "opaque-authentication-subject", TelegramUserID: 987654321,
+		Name: "Coreloop Owner", PreferredUsername: "owner",
+	})
+	if identity.Subject != "opaque-authentication-subject" {
+		t.Fatalf("subject = %q", identity.Subject)
+	}
+	if identity.TelegramChatID != "987654321" {
+		t.Fatalf("Telegram chat ID = %q", identity.TelegramChatID)
 	}
 }
 

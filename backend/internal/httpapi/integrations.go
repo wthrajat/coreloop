@@ -111,7 +111,7 @@ func NewTelegramRouter(configuration TelegramConfig) http.Handler {
 			return
 		}
 		callback := update.CallbackQuery
-		user, err := configuration.Store.UserByTelegramSubject(r.Context(), strconv.FormatInt(callback.From.ID, 10))
+		user, err := configuration.Store.UserByTelegramChatID(r.Context(), strconv.FormatInt(callback.From.ID, 10))
 		if err != nil {
 			_ = configuration.Telegram.AnswerCallback(r.Context(), callback.ID, "This profile is not connected.")
 			w.WriteHeader(http.StatusNoContent)

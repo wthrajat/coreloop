@@ -123,8 +123,20 @@ func (configuration Config) authCallback(w http.ResponseWriter, r *http.Request)
 	secure := configuration.Runtime.IsProduction()
 	http.SetCookie(w, &http.Cookie{Name: auth.SessionCookieName, Value: result.SessionToken, Path: "/", Expires: result.SessionExpiry, MaxAge: int(time.Until(result.SessionExpiry).Seconds()), HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode})
 	http.SetCookie(w, &http.Cookie{Name: auth.CSRFCookieName, Value: result.CSRFToken, Path: "/", Expires: result.SessionExpiry, MaxAge: int(time.Until(result.SessionExpiry).Seconds()), HttpOnly: false, Secure: secure, SameSite: http.SameSiteStrictMode})
-	if result.Created && configuration.Telegram != nil {
-		_, _ = configuration.Telegram.SendMessage(r.Context(), result.User.TelegramSubject, "Welcome to Coreloop. Your private profile is connected. Configure your topics and schedule in the web app; complete lessons will arrive here.", telegram.MessageOptions{})
+	if configuration.Telegram != nil {
+		if err := configuration.Telegram.ValidateChat(r.Context(), result.TelegramChatID); err != nil {
+			disconnectErr := configuration.Store.DisconnectDestination(r.Context(), result.User.ID, time.Now())
+			slog.WarnContext(r.Context(), "Telegram destination validation failed", "error", err, "disconnect_error", disconnectErr)
+		} else if result.Created {
+			_, err := configuration.Telegram.SendMessage(r.Context(), result.TelegramChatID, "Welcome to Coreloop. Your private profile is connected. Configure your topics and schedule in the web app; complete lessons will arrive here.", telegram.MessageOptions{})
+			if err != nil {
+				var disconnectErr error
+				if telegram.IsChatUnavailable(err) {
+					disconnectErr = configuration.Store.DisconnectDestination(r.Context(), result.User.ID, time.Now())
+				}
+				slog.WarnContext(r.Context(), "Telegram welcome message failed", "error", err, "disconnect_error", disconnectErr)
+			}
+		}
 	}
 	http.Redirect(w, r, auth.SafeReturnPath(result.ReturnPath), http.StatusFound)
 }

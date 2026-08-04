@@ -96,7 +96,14 @@ func (store *Store) RankSourceItem(ctx context.Context, itemID string, now time.
 	var evidenceValue map[string]string
 	_ = json.Unmarshal([]byte(evidence), &evidenceValue)
 	summary := evidenceValue["summary"]
-	rows, err := store.database.QueryContext(ctx, `SELECT lp.user_id,t.id,t.title,t.objectives_json,utp.feedback_weight FROM learning_preferences lp JOIN user_topic_preferences utp ON utp.user_id=lp.user_id JOIN topics t ON t.id=utp.topic_id JOIN users u ON u.id=lp.user_id WHERE lp.radar_enabled=1 AND utp.excluded=0 AND u.status='active'`)
+	rows, err := store.database.QueryContext(ctx, `SELECT lp.user_id,t.id,t.title,t.objectives_json,utp.feedback_weight
+		FROM learning_preferences lp
+		JOIN user_topic_preferences utp ON utp.user_id=lp.user_id
+		JOIN topics t ON t.id=utp.topic_id
+		JOIN users u ON u.id=lp.user_id
+		JOIN delivery_destinations dd ON dd.user_id=lp.user_id AND dd.channel='telegram'
+			AND dd.enabled=1 AND dd.status='connected'
+		WHERE lp.radar_enabled=1 AND utp.excluded=0 AND u.status='active'`)
 	if err != nil {
 		return nil, err
 	}

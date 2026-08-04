@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -315,10 +316,16 @@ func (service *Service) deliverRadar(ctx context.Context, job store.Job) error {
 	}
 	candidate, err := service.store.RadarCandidate(ctx, payload["candidate_id"])
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		return err
 	}
 	chatID, err := service.store.Destination(ctx, candidate.UserID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return service.store.CompleteRadar(ctx, candidate.UserID, candidate.ID, "rejected", service.now())
+		}
 		return err
 	}
 	summary := candidate.Summary
@@ -328,6 +335,11 @@ func (service *Service) deliverRadar(ctx context.Context, job store.Job) error {
 	message := "<b>Radar · " + html.EscapeString(candidate.Publisher) + "</b>\n\n<b>" + html.EscapeString(candidate.Title) + "</b>\n" + html.EscapeString(summary) + "\n\n<a href=\"" + html.EscapeString(candidate.URL) + "\">Read the official source</a>"
 	_, err = service.telegram.SendMessage(ctx, chatID, message, telegram.MessageOptions{Buttons: [][]telegram.Button{{{Text: "Skip", Data: "radar_skip:" + candidate.ID}}}})
 	if err != nil {
+		if telegram.IsChatUnavailable(err) {
+			disconnectErr := service.store.DisconnectDestination(ctx, candidate.UserID, service.now())
+			rejectErr := service.store.CompleteRadar(ctx, candidate.UserID, candidate.ID, "rejected", service.now())
+			return errors.Join(disconnectErr, rejectErr)
+		}
 		return err
 	}
 	return service.store.CompleteRadar(ctx, candidate.UserID, candidate.ID, "delivered", service.now())

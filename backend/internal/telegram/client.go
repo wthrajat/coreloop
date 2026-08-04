@@ -22,6 +22,35 @@ type Client struct {
 	http    *http.Client
 }
 
+type APIError struct {
+	Method      string
+	Code        int
+	Description string
+}
+
+func (failure *APIError) Error() string {
+	return fmt.Sprintf("Telegram %s failed: %s", failure.Method, failure.Description)
+}
+
+func IsChatUnavailable(err error) bool {
+	var failure *APIError
+	if !errors.As(err, &failure) {
+		return false
+	}
+	description := strings.ToLower(failure.Description)
+	for _, message := range []string{
+		"chat not found",
+		"bot was blocked by the user",
+		"user is deactivated",
+		"bot can't initiate conversation with a user",
+	} {
+		if strings.Contains(description, message) {
+			return true
+		}
+	}
+	return false
+}
+
 func New(token string, client *http.Client) *Client {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
@@ -75,6 +104,10 @@ func (client *Client) AnswerCallback(ctx context.Context, callbackID, text strin
 	return client.call(ctx, "answerCallbackQuery", payload, nil)
 }
 
+func (client *Client) ValidateChat(ctx context.Context, chatID string) error {
+	return client.call(ctx, "getChat", map[string]string{"chat_id": chatID}, nil)
+}
+
 func (client *Client) SetWebhook(ctx context.Context, webhookURL, secret string) error {
 	if _, err := url.ParseRequestURI(webhookURL); err != nil {
 		return fmt.Errorf("invalid webhook URL: %w", err)
@@ -113,13 +146,14 @@ func (client *Client) call(ctx context.Context, method string, payload any, dest
 	}
 	var envelope struct {
 		OK          bool   `json:"ok"`
+		ErrorCode   int    `json:"error_code"`
 		Description string `json:"description"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return fmt.Errorf("decode Telegram response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.OK {
-		return fmt.Errorf("Telegram %s failed: %s", method, envelope.Description)
+		return &APIError{Method: method, Code: envelope.ErrorCode, Description: envelope.Description}
 	}
 	if destination != nil {
 		if err := json.Unmarshal(body, destination); err != nil {

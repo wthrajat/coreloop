@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,12 +30,13 @@ type Service struct {
 }
 
 type LoginResult struct {
-	User          store.User
-	SessionToken  string
-	CSRFToken     string
-	SessionExpiry time.Time
-	Created       bool
-	ReturnPath    string
+	User           store.User
+	SessionToken   string
+	CSRFToken      string
+	SessionExpiry  time.Time
+	Created        bool
+	ReturnPath     string
+	TelegramChatID string
 }
 
 func NewService(dataStore *store.Store, configuration config.Config, client *OIDCClient) *Service {
@@ -99,9 +101,8 @@ func (service *Service) Callback(ctx context.Context, code, stateValue string) (
 	if !NumericSubject(claims.Subject) {
 		return LoginResult{}, errors.New("Telegram identity subject is invalid")
 	}
-	user, created, err := service.store.UpsertUserFromTelegram(ctx, store.Identity{
-		Subject: claims.Subject, DisplayName: claims.Name, Username: claims.PreferredUsername, AvatarURL: claims.Picture,
-	}, flow.InviteID, service.now())
+	identity := identityFromClaims(claims)
+	user, created, err := service.store.UpsertUserFromTelegram(ctx, identity, flow.InviteID, service.now())
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return LoginResult{}, errors.New("this Telegram account has not been invited")
@@ -124,7 +125,15 @@ func (service *Service) Callback(ctx context.Context, code, stateValue string) (
 		return LoginResult{}, err
 	}
 	return LoginResult{User: user, SessionToken: sessionToken, CSRFToken: csrfToken,
-		SessionExpiry: expires, Created: created, ReturnPath: flow.ReturnPath}, nil
+		SessionExpiry: expires, Created: created, ReturnPath: flow.ReturnPath,
+		TelegramChatID: identity.TelegramChatID}, nil
+}
+
+func identityFromClaims(claims Claims) store.Identity {
+	return store.Identity{
+		Subject: claims.Subject, TelegramChatID: strconv.FormatInt(claims.TelegramUserID, 10),
+		DisplayName: claims.Name, Username: claims.PreferredUsername, AvatarURL: claims.Picture,
+	}
 }
 
 func (service *Service) Authenticate(ctx context.Context, token string) (store.Session, store.User, error) {
