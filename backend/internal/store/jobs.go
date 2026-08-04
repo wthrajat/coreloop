@@ -47,6 +47,38 @@ type DueOccurrence struct {
 	Key    string
 }
 
+type JobQueueCount struct {
+	Type        string
+	State       string
+	Count       int
+	OldestDueAt time.Time
+}
+
+func (store *Store) JobQueueSummary(ctx context.Context) ([]JobQueueCount, error) {
+	rows, err := store.database.QueryContext(ctx, `SELECT job_type,state,COUNT(*),MIN(due_at)
+		FROM job_queue WHERE state IN ('queued','leased','failed','blocked_quota')
+		GROUP BY job_type,state ORDER BY MIN(sequence)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summary []JobQueueCount
+	for rows.Next() {
+		var item JobQueueCount
+		var oldestDueAt string
+		if err := rows.Scan(&item.Type, &item.State, &item.Count, &oldestDueAt); err != nil {
+			return nil, err
+		}
+		item.OldestDueAt, err = parseTimestamp(oldestDueAt)
+		if err != nil {
+			return nil, err
+		}
+		summary = append(summary, item)
+	}
+	return summary, rows.Err()
+}
+
 func (store *Store) DueOccurrences(ctx context.Context, now time.Time, tolerance time.Duration) ([]DueOccurrence, error) {
 	rows, err := store.database.QueryContext(ctx, `SELECT ds.user_id,ds.day_of_week,ds.local_time,ds.time_zone
 		FROM delivery_schedules ds JOIN users u ON u.id=ds.user_id

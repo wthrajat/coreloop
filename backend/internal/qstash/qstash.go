@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -112,5 +113,15 @@ func (publisher *Publisher) Publish(ctx context.Context, destination, deduplicat
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return fmt.Errorf("QStash publish returned %s: %.400s", response.Status, body)
 	}
+	var result struct {
+		Deduplicated bool `json:"deduplicated"`
+	}
+	_ = json.Unmarshal(body, &result)
+	slog.InfoContext(
+		ctx,
+		"QStash publish accepted",
+		"deduplication_id", deduplicationID,
+		"deduplicated", result.Deduplicated || response.StatusCode == http.StatusAccepted,
+	)
 	return nil
 }

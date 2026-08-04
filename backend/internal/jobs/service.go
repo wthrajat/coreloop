@@ -53,6 +53,7 @@ func New(dataStore *store.Store, providerRouter *providers.Router, telegramClien
 
 func (service *Service) Tick(ctx context.Context) error {
 	now := service.now()
+	slog.InfoContext(ctx, "job tick started", "tick_at", now.UTC())
 	if err := service.store.RecoverJobs(ctx, now); err != nil {
 		return err
 	}
@@ -60,6 +61,7 @@ func (service *Service) Tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	slog.InfoContext(ctx, "job tick evaluated lesson schedules", "due_occurrences", len(occurrences))
 	for _, occurrence := range occurrences {
 		_, err := service.store.EnqueueJob(ctx, occurrence.UserID, "", "generate_lesson", occurrence.At, occurrence.Key, map[string]string{"scheduled_at": occurrence.At.Format(time.RFC3339)})
 		if err != nil {
@@ -69,7 +71,30 @@ func (service *Service) Tick(ctx context.Context) error {
 	if err := service.store.EnqueueSourcePolls(ctx, now); err != nil {
 		return err
 	}
+	service.logQueueSummary(ctx)
 	return service.dispatchNextDueJob(ctx)
+}
+
+func (service *Service) logQueueSummary(ctx context.Context) {
+	summary, err := service.store.JobQueueSummary(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "durable queue summary unavailable", "error", err)
+		return
+	}
+	if len(summary) == 0 {
+		slog.InfoContext(ctx, "durable queue is empty")
+		return
+	}
+	for _, item := range summary {
+		slog.InfoContext(
+			ctx,
+			"durable queue state",
+			"job_type", item.Type,
+			"job_state", item.State,
+			"count", item.Count,
+			"oldest_due_at", item.OldestDueAt.UTC(),
+		)
+	}
 }
 
 func (service *Service) dispatchNextDueJob(ctx context.Context) error {
@@ -78,6 +103,7 @@ func (service *Service) dispatchNextDueJob(ctx context.Context) error {
 		return err
 	}
 	if len(queued) == 0 {
+		slog.InfoContext(ctx, "durable queue has no due jobs")
 		return nil
 	}
 	if service.publisher == nil {
@@ -85,23 +111,54 @@ func (service *Service) dispatchNextDueJob(ctx context.Context) error {
 	}
 	job := queued[0]
 	destination := service.appOrigin + "/api/jobs/run"
-	return service.publisher.Publish(ctx, destination, dispatchDeduplicationID(job.ID), map[string]string{"job_id": job.ID})
-}
-
-func (service *Service) continueQueue(ctx context.Context) {
-	if err := service.dispatchNextDueJob(ctx); err != nil {
-		slog.WarnContext(ctx, "next chronological job dispatch failed", "error", err)
+	deduplicationID := dispatchDeduplicationID(job.ID, job.AttemptCount)
+	slog.InfoContext(
+		ctx,
+		"job dispatch requested",
+		"job_id", job.ID,
+		"job_type", job.Type,
+		"sequence", job.Sequence,
+		"attempt", job.AttemptCount,
+		"due_at", job.DueAt.UTC(),
+	)
+	if err := service.publisher.Publish(ctx, destination, deduplicationID, map[string]string{"job_id": job.ID}); err != nil {
+		return err
 	}
+	slog.InfoContext(
+		ctx,
+		"job dispatch accepted",
+		"job_id", job.ID,
+		"job_type", job.Type,
+		"attempt", job.AttemptCount,
+	)
+	return nil
 }
 
-func dispatchDeduplicationID(jobID string) string {
-	return "dispatch-" + jobID
+func (service *Service) continueQueue(ctx context.Context) error {
+	if err := service.dispatchNextDueJob(ctx); err != nil {
+		return fmt.Errorf("dispatch next chronological job: %w", err)
+	}
+	return nil
+}
+
+func dispatchDeduplicationID(jobID string, attempt int) string {
+	return fmt.Sprintf("dispatch-%s-%d", jobID, attempt)
 }
 
 func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	now := service.now()
+	slog.InfoContext(ctx, "job wake received", "job_id", jobID)
 	job, err := service.store.LeaseJob(ctx, jobID, workerID, now)
 	if errors.Is(err, store.ErrJobNotLeasable) {
+		slog.InfoContext(
+			ctx,
+			"job wake acknowledged without lease",
+			"job_id", jobID,
+			"job_state", job.State,
+		)
+		if job.State == "completed" || job.State == "failed" || job.State == "blocked_quota" {
+			return service.continueQueue(ctx)
+		}
 		return nil
 	}
 	if err != nil {
@@ -110,6 +167,16 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	if job.State != "leased" {
 		return fmt.Errorf("lease job returned unexpected state %q", job.State)
 	}
+	slog.InfoContext(
+		ctx,
+		"job lease acquired",
+		"job_id", job.ID,
+		"job_type", job.Type,
+		"sequence", job.Sequence,
+		"attempt", job.AttemptCount,
+		"max_attempts", job.MaxAttempts,
+	)
+	executionStarted := service.now()
 	executionContext, cancelExecution := jobExecutionContext(ctx)
 	err = service.execute(executionContext, job)
 	cancelExecution()
@@ -117,8 +184,15 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 		if err := service.store.CompleteJob(ctx, job.ID, service.now()); err != nil {
 			return err
 		}
-		service.continueQueue(ctx)
-		return nil
+		slog.InfoContext(
+			ctx,
+			"job completed",
+			"job_id", job.ID,
+			"job_type", job.Type,
+			"attempt", job.AttemptCount,
+			"execution_ms", service.now().Sub(executionStarted).Milliseconds(),
+		)
+		return service.continueQueue(ctx)
 	}
 	quota := errors.Is(err, providers.ErrFreeQuotaExhausted)
 	code := "job_failed"
@@ -128,11 +202,31 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	if failErr := service.store.FailJob(ctx, job, code, quota, service.now()); failErr != nil {
 		return errors.Join(err, failErr)
 	}
+	slog.WarnContext(
+		ctx,
+		"job failure persisted",
+		"job_id", job.ID,
+		"job_type", job.Type,
+		"attempt", job.AttemptCount,
+		"next_state", failedJobState(job, quota),
+		"error_code", code,
+		"execution_ms", service.now().Sub(executionStarted).Milliseconds(),
+	)
 	if quota {
 		service.notifyQuota(ctx, job)
 	}
-	service.continueQueue(ctx)
-	return fmt.Errorf("execute %s job: %w", job.Type, err)
+	continuationError := service.continueQueue(ctx)
+	return errors.Join(fmt.Errorf("execute %s job: %w", job.Type, err), continuationError)
+}
+
+func failedJobState(job store.Job, quota bool) string {
+	if quota {
+		return "blocked_quota"
+	}
+	if job.AttemptCount >= job.MaxAttempts {
+		return "failed"
+	}
+	return "queued"
 }
 
 func jobExecutionContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -162,7 +256,9 @@ func (service *Service) execute(ctx context.Context, job store.Job) error {
 }
 
 func (service *Service) generateLesson(ctx context.Context, job store.Job, useOpenAI bool) error {
+	slog.InfoContext(ctx, "lesson generation started", "job_id", job.ID, "attempt", job.AttemptCount)
 	if job.AssignmentID != "" {
+		slog.InfoContext(ctx, "lesson generation reused linked assignment", "job_id", job.ID)
 		return service.enqueueLessonDelivery(ctx, job, job.AssignmentID)
 	}
 	plan, err := service.store.PlanNextLesson(ctx, job.UserID, service.now())
@@ -176,12 +272,17 @@ func (service *Service) generateLesson(ctx context.Context, job store.Job, useOp
 	}
 	_, cachedID, _, err := service.store.CachedLesson(ctx, cacheKey)
 	if err == nil {
+		slog.InfoContext(ctx, "lesson cache hit", "job_id", job.ID)
 		assignmentID, err := service.store.AssignCachedLesson(ctx, plan, cachedID, service.now())
 		if err != nil {
 			return err
 		}
 		return service.enqueueLessonDelivery(ctx, job, assignmentID)
 	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("look up cached lesson: %w", err)
+	}
+	slog.InfoContext(ctx, "lesson cache miss", "job_id", job.ID)
 	started := service.now()
 	var generated content.Generated
 	if useOpenAI {
@@ -210,6 +311,17 @@ func (service *Service) generateLesson(ctx context.Context, job store.Job, useOp
 		warning = "Some claims could not be fully verified from the supplied sources. Treat current or changing details as unverified."
 	}
 	parts := telegram.ChunkHTML(content.RenderSections(generated.Draft), warning)
+	slog.InfoContext(
+		ctx,
+		"lesson provider generation succeeded",
+		"job_id", job.ID,
+		"provider", generated.Provider,
+		"model", generated.Model,
+		"input_tokens", generated.InputTokens,
+		"output_tokens", generated.OutputTokens,
+		"parts", len(parts),
+		"generation_ms", service.now().Sub(started).Milliseconds(),
+	)
 	_, assignmentID, err := service.store.SaveGeneratedLesson(ctx, plan, generated, parts, cacheKey, service.now())
 	if err != nil {
 		return err
@@ -219,6 +331,7 @@ func (service *Service) generateLesson(ctx context.Context, job store.Job, useOp
 }
 
 func (service *Service) deliverLesson(ctx context.Context, job store.Job) error {
+	slog.InfoContext(ctx, "lesson delivery started", "job_id", job.ID, "attempt", job.AttemptCount)
 	assignmentID := job.AssignmentID
 	if assignmentID == "" {
 		var payload map[string]string
@@ -227,13 +340,18 @@ func (service *Service) deliverLesson(ctx context.Context, job store.Job) error 
 		}
 		assignmentID = payload["assignment_id"]
 	}
+	if assignmentID == "" {
+		return errors.New("lesson delivery assignment is missing")
+	}
 	bundle, err := service.store.PrepareDelivery(ctx, job.UserID, assignmentID, job.ID, service.now())
 	if err != nil {
 		return err
 	}
 	if bundle.State == "delivered" {
+		slog.InfoContext(ctx, "lesson delivery already completed", "job_id", job.ID)
 		return nil
 	}
+	slog.InfoContext(ctx, "lesson delivery bundle prepared", "job_id", job.ID, "parts", len(bundle.Parts))
 	for index, part := range bundle.Parts {
 		if part.State == "delivered" {
 			continue
@@ -250,8 +368,19 @@ func (service *Service) deliverLesson(ctx context.Context, job store.Job) error 
 		if err := service.store.CompleteDeliveryPart(ctx, part.ID, messageID, service.now()); err != nil {
 			return err
 		}
+		slog.InfoContext(
+			ctx,
+			"lesson delivery part completed",
+			"job_id", job.ID,
+			"part", index+1,
+			"parts", len(bundle.Parts),
+		)
 	}
-	return service.store.CompleteDelivery(ctx, bundle.ID, assignmentID, service.now())
+	if err := service.store.CompleteDelivery(ctx, bundle.ID, assignmentID, service.now()); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "lesson delivery completed", "job_id", job.ID, "parts", len(bundle.Parts))
+	return nil
 }
 
 func (service *Service) ingestSource(ctx context.Context, job store.Job) error {

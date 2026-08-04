@@ -80,7 +80,7 @@ func TestTriggerLessonNowIsIdempotentForARepeatedRequest(t *testing.T) {
 	if first.JobID != second.JobID {
 		t.Fatalf("expected one durable job, got %q and %q", first.JobID, second.JobID)
 	}
-	if publisher.deduplicationID != "dispatch-"+first.JobID {
+	if publisher.deduplicationID != "dispatch-"+first.JobID+"-0" {
 		t.Fatalf("unexpected publish deduplication id: %q", publisher.deduplicationID)
 	}
 }
@@ -146,7 +146,7 @@ func TestTriggerLessonNowQueuesAndPublishes(t *testing.T) {
 	if !ok || metadata.RequestKind != "manual_owner" || metadata.DispatchDelivery != "immediate" {
 		t.Fatalf("unexpected job metadata: %#v", dataStore.enqueuedPayload)
 	}
-	if publisher.destination != "https://coreloop.example/api/jobs/run" || publisher.deduplicationID != "dispatch-job_manual" {
+	if publisher.destination != "https://coreloop.example/api/jobs/run" || publisher.deduplicationID != "dispatch-job_manual-0" {
 		t.Fatalf("unexpected publish call: %#v", publisher)
 	}
 }

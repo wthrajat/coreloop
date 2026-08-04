@@ -80,6 +80,13 @@ func triggerLessonNow(
 	if err != nil {
 		return ManualLesson{}, err
 	}
+	slog.InfoContext(
+		ctx,
+		"manual lesson durable job ready",
+		"job_id", job.ID,
+		"job_state", job.State,
+		"attempt", job.AttemptCount,
+	)
 	status, err := manualLessonStatus(ctx, dataStore, userID, job)
 	if err != nil {
 		return ManualLesson{}, err
@@ -91,9 +98,11 @@ func triggerLessonNow(
 		status.Message = "Lesson queued. Immediate dispatch is unavailable, so the scheduler will retry it."
 		return status, nil
 	}
-	if err := publishJob(ctx, publisher, appOrigin, job.ID); err != nil {
+	if err := publishJob(ctx, publisher, appOrigin, job.ID, job.AttemptCount); err != nil {
 		slog.WarnContext(ctx, "immediate lesson dispatch failed", "job_id", job.ID, "error", err)
 		status.Message = "Lesson queued. Immediate dispatch is unavailable, so the scheduler will retry it."
+	} else {
+		slog.InfoContext(ctx, "immediate lesson dispatch accepted", "job_id", job.ID, "attempt", job.AttemptCount)
 	}
 	return status, nil
 }
@@ -173,21 +182,34 @@ func (service *Service) enqueueLessonDelivery(ctx context.Context, sourceJob sto
 	if err != nil {
 		return err
 	}
+	slog.InfoContext(
+		ctx,
+		"lesson delivery job enqueued",
+		"source_job_id", sourceJob.ID,
+		"delivery_job_id", deliveryJobID,
+		"immediate", dispatchLessonDeliveryImmediately(sourceJob),
+	)
 	if !dispatchLessonDeliveryImmediately(sourceJob) {
 		return nil
 	}
-	if err := publishJob(ctx, service.publisher, service.appOrigin, deliveryJobID); err != nil {
+	deliveryJob, err := service.store.Job(ctx, deliveryJobID)
+	if err != nil {
+		return err
+	}
+	if err := publishJob(ctx, service.publisher, service.appOrigin, deliveryJobID, deliveryJob.AttemptCount); err != nil {
 		slog.WarnContext(ctx, "immediate lesson delivery dispatch failed", "job_id", deliveryJobID, "error", err)
+	} else {
+		slog.InfoContext(ctx, "immediate lesson delivery dispatch accepted", "job_id", deliveryJobID, "attempt", deliveryJob.AttemptCount)
 	}
 	return nil
 }
 
-func publishJob(ctx context.Context, publisher manualLessonPublisher, appOrigin, jobID string) error {
+func publishJob(ctx context.Context, publisher manualLessonPublisher, appOrigin, jobID string, attempt int) error {
 	if publisher == nil {
 		return errors.New("QStash publisher is not configured")
 	}
 	destination := strings.TrimRight(appOrigin, "/") + "/api/jobs/run"
-	return publisher.Publish(ctx, destination, dispatchDeduplicationID(jobID), map[string]string{"job_id": jobID})
+	return publisher.Publish(ctx, destination, dispatchDeduplicationID(jobID, attempt), map[string]string{"job_id": jobID})
 }
 
 func manualLessonKey(userID, requestID string) string {

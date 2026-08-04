@@ -49,10 +49,95 @@ func TestRunAcknowledgesAJobThatIsNotCurrentlyLeasable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("job in state %q must be acknowledged: %v", state, err)
 			}
-			if requestCount != 2 {
-				t.Fatalf("request count = %d, want 2", requestCount)
+			wantRequests := 2
+			if state == "completed" || state == "blocked_quota" || state == "failed" {
+				wantRequests = 3
+			}
+			if requestCount != wantRequests {
+				t.Fatalf("request count = %d, want %d", requestCount, wantRequests)
 			}
 		})
+	}
+}
+
+func TestCompletedDuplicateWakeResumesTheQueue(t *testing.T) {
+	databaseRequestCount := 0
+	databaseClient := &http.Client{Transport: jobRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		databaseRequestCount++
+		body := emptyTursoResult()
+		switch databaseRequestCount {
+		case 1:
+			body = `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
+		case 2:
+			body = `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"state"}],"rows":[[{"type":"text","value":"completed"}]],"affected_row_count":0,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
+		case 3:
+			body = tursoJobResult("job_next", "deliver_lesson", "queued")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", databaseClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	var publishedBody string
+	var publishedDeduplicationID string
+	publisherClient := &http.Client{Transport: jobRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(request.Body)
+		publishedBody = string(body)
+		publishedDeduplicationID = request.Header.Get("Upstash-Deduplication-Id")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"messageId":"msg_next","deduplicated":false}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	service := New(store.New(database), nil, nil, qstash.NewPublisher("secret", publisherClient), nil, "https://coreloop.example")
+	if err := service.Run(context.Background(), "job_completed", "qstash:duplicate"); err != nil {
+		t.Fatal(err)
+	}
+	if databaseRequestCount != 3 {
+		t.Fatalf("database request count = %d, want 3", databaseRequestCount)
+	}
+	if publishedBody != `{"job_id":"job_next"}` {
+		t.Fatalf("published body = %q", publishedBody)
+	}
+	if publishedDeduplicationID != "dispatch-job_next-1" {
+		t.Fatalf("published deduplication id = %q", publishedDeduplicationID)
+	}
+}
+
+func TestQueueContinuationKeepsAPublishFailureRetryable(t *testing.T) {
+	databaseClient := &http.Client{Transport: jobRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(tursoJobResult("job_next", "deliver_lesson", "queued"))),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", databaseClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	publisherClient := &http.Client{Transport: jobRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Status:     "503 Service Unavailable",
+			Body:       io.NopCloser(strings.NewReader(`{"error":"temporarily unavailable"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	service := New(store.New(database), nil, nil, qstash.NewPublisher("secret", publisherClient), nil, "https://coreloop.example")
+	err = service.continueQueue(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "dispatch next chronological job") || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("continuation error = %v", err)
 	}
 }
 
@@ -143,6 +228,72 @@ func TestLeaseJobDoesNotRequireATransactionBaton(t *testing.T) {
 func TestSchedulerPublishesOneChronologicalJobPerTick(t *testing.T) {
 	if publishableJobsPerTick != 1 {
 		t.Fatalf("publishable jobs per tick = %d, want 1", publishableJobsPerTick)
+	}
+}
+
+func TestDispatchDeduplicationIsScopedToTheDurableAttempt(t *testing.T) {
+	first := dispatchDeduplicationID("job_retry-safe", 0)
+	retry := dispatchDeduplicationID("job_retry-safe", 1)
+	if first != "dispatch-job_retry-safe-0" {
+		t.Fatalf("first deduplication id = %q", first)
+	}
+	if retry != "dispatch-job_retry-safe-1" || retry == first {
+		t.Fatalf("retry deduplication id = %q, first = %q", retry, first)
+	}
+	if strings.Contains(first, ":") || strings.Contains(retry, ":") {
+		t.Fatalf("QStash deduplication ids must not contain colons: %q, %q", first, retry)
+	}
+}
+
+func TestJobQueueSummaryReportsTheStageAndOldestDueTime(t *testing.T) {
+	client := &http.Client{Transport: jobRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		body := `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[` +
+			`{"name":"job_type"},{"name":"state"},{"name":"count(*)"},{"name":"min(due_at)"}` +
+			`],"rows":[[` +
+			`{"type":"text","value":"generate_lesson"},{"type":"text","value":"queued"},` +
+			`{"type":"integer","value":"2"},{"type":"text","value":"2026-08-04T13:00:00Z"}` +
+			`],[` +
+			`{"type":"text","value":"deliver_lesson"},{"type":"text","value":"blocked_quota"},` +
+			`{"type":"integer","value":"1"},{"type":"text","value":"2026-08-04T14:00:00Z"}` +
+			`]],"affected_row_count":0,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	summary, err := store.New(database).JobQueueSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary) != 2 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if summary[0].Type != "generate_lesson" || summary[0].State != "queued" || summary[0].Count != 2 {
+		t.Fatalf("generation summary = %#v", summary[0])
+	}
+	if got := summary[1].OldestDueAt.UTC().Format(time.RFC3339); got != "2026-08-04T14:00:00Z" {
+		t.Fatalf("oldest delivery due time = %q", got)
+	}
+}
+
+func TestFailedJobStateMatchesDurableRetryRules(t *testing.T) {
+	job := store.Job{AttemptCount: 2, MaxAttempts: 5}
+	if state := failedJobState(job, false); state != "queued" {
+		t.Fatalf("retryable state = %q", state)
+	}
+	job.AttemptCount = job.MaxAttempts
+	if state := failedJobState(job, false); state != "failed" {
+		t.Fatalf("exhausted state = %q", state)
+	}
+	if state := failedJobState(job, true); state != "blocked_quota" {
+		t.Fatalf("quota state = %q", state)
 	}
 }
 
