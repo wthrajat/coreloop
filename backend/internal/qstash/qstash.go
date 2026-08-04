@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -95,7 +94,7 @@ func (publisher *Publisher) Publish(ctx context.Context, destination, deduplicat
 	if err != nil {
 		return err
 	}
-	endpoint := publisher.baseURL + "/v2/publish/" + url.PathEscape(destination)
+	endpoint := publisher.baseURL + "/v2/publish/" + destination
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(encoded))
 	if err != nil {
 		return err

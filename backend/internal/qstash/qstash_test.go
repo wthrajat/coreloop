@@ -1,13 +1,23 @@
 package qstash
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
 
 func TestReceiverVerifiesSignatureSubjectAndBody(t *testing.T) {
 	key := "c2VjcmV0-with-a-qstash-shaped-key"
@@ -21,5 +31,53 @@ func TestReceiverVerifiesSignatureSubjectAndBody(t *testing.T) {
 	token := parts[0] + "." + parts[1] + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	if err := NewReceiver(key, "").Verify(token, "https://example.com/api/jobs/run", body); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPublisherPreservesDestinationURLInPublishPath(t *testing.T) {
+	type capturedRequest struct {
+		escapedPath     string
+		authorization   string
+		deduplicationID string
+		body            string
+	}
+	var captured capturedRequest
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		captured = capturedRequest{
+			escapedPath:     request.URL.EscapedPath(),
+			authorization:   request.Header.Get("Authorization"),
+			deduplicationID: request.Header.Get("Upstash-Deduplication-Id"),
+			body:            string(body),
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+			Request:    request,
+		}, nil
+	})}
+
+	publisher := NewPublisher("qstash-token", client)
+	publisher.baseURL = "https://qstash.upstash.io"
+	destination := "https://coreloop1.vercel.app/api/jobs/run"
+	if err := publisher.Publish(context.Background(), destination, "dispatch:job_1", map[string]string{"job_id": "job_1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if captured.escapedPath != "/v2/publish/https://coreloop1.vercel.app/api/jobs/run" {
+		t.Fatalf("unexpected escaped path: %q", captured.escapedPath)
+	}
+	if captured.authorization != "Bearer qstash-token" {
+		t.Fatalf("unexpected authorization header: %q", captured.authorization)
+	}
+	if captured.deduplicationID != "dispatch:job_1" {
+		t.Fatalf("unexpected deduplication ID: %q", captured.deduplicationID)
+	}
+	if captured.body != `{"job_id":"job_1"}` {
+		t.Fatalf("unexpected body: %q", captured.body)
 	}
 }
