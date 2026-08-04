@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -12,16 +13,23 @@ import (
 	"time"
 
 	"coreloop/backend/internal/apperror"
-	"coreloop/backend/internal/jobs"
 	"coreloop/backend/internal/qstash"
 	"coreloop/backend/internal/store"
 	"coreloop/backend/internal/telegram"
 )
 
+const defaultJobRunTimeout = 55 * time.Second
+
+type durableJobs interface {
+	Tick(context.Context) error
+	Run(context.Context, string, string) error
+}
+
 type JobsConfig struct {
-	AppOrigin string
-	Receiver  *qstash.Receiver
-	Jobs      *jobs.Service
+	AppOrigin  string
+	Receiver   *qstash.Receiver
+	Jobs       durableJobs
+	RunTimeout time.Duration
 }
 
 func NewJobsRouter(configuration JobsConfig) http.Handler {
@@ -50,7 +58,13 @@ func NewJobsRouter(configuration JobsConfig) http.Handler {
 			WriteProblem(w, apperror.New(apperror.CodeInvalidRequest, "job_id is required", http.StatusBadRequest))
 			return
 		}
-		if err := configuration.Jobs.Run(r.Context(), input.JobID, "qstash:"+r.Header.Get("Upstash-Message-Id")); err != nil {
+		runTimeout := configuration.RunTimeout
+		if runTimeout <= 0 || runTimeout > defaultJobRunTimeout {
+			runTimeout = defaultJobRunTimeout
+		}
+		runContext, cancel := context.WithTimeout(r.Context(), runTimeout)
+		defer cancel()
+		if err := configuration.Jobs.Run(runContext, input.JobID, "qstash:"+r.Header.Get("Upstash-Message-Id")); err != nil {
 			slog.ErrorContext(r.Context(), "job failed", "job_id", input.JobID, "error", err)
 			WriteProblem(w, apperror.New(apperror.CodeInternal, "job execution failed", http.StatusInternalServerError))
 			return

@@ -191,6 +191,23 @@ func TestCompletedJobDispatchesTheNextDueJob(t *testing.T) {
 	}
 }
 
+func TestJobExecutionDeadlinePreservesFinalizationTime(t *testing.T) {
+	parentDeadline := time.Now().Add(30 * time.Second)
+	parent, cancelParent := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancelParent()
+
+	execution, cancelExecution := jobExecutionContext(parent)
+	defer cancelExecution()
+	executionDeadline, ok := execution.Deadline()
+	if !ok {
+		t.Fatal("execution context has no deadline")
+	}
+	reserve := parentDeadline.Sub(executionDeadline)
+	if reserve < 7*time.Second || reserve > 9*time.Second {
+		t.Fatalf("finalization reserve = %s, want approximately 8s", reserve)
+	}
+}
+
 func emptyTursoResult() string {
 	return `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":1,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
 }

@@ -48,10 +48,13 @@ type Provider interface {
 }
 
 type Router struct {
-	free   []Provider
-	openAI Provider
-	now    func() time.Time
+	free               []Provider
+	openAI             Provider
+	now                func() time.Time
+	freeAttemptTimeout time.Duration
 }
+
+const defaultFreeProviderAttemptTimeout = 18 * time.Second
 
 func NewRouter(groq, gemini, openAI Provider) *Router {
 	var free []Provider
@@ -61,7 +64,7 @@ func NewRouter(groq, gemini, openAI Provider) *Router {
 	if gemini != nil {
 		free = append(free, gemini)
 	}
-	return &Router{free: free, openAI: openAI, now: time.Now}
+	return &Router{free: free, openAI: openAI, now: time.Now, freeAttemptTimeout: defaultFreeProviderAttemptTimeout}
 }
 
 var ErrFreeQuotaExhausted = errors.New("all configured free AI providers are unavailable or out of quota")
@@ -72,7 +75,13 @@ func (router *Router) Generate(ctx context.Context, lessonContext content.Lesson
 		if !provider.Configured() {
 			continue
 		}
-		generated, err := generateWithCorrection(ctx, provider, lessonContext)
+		attemptTimeout := router.freeAttemptTimeout
+		if attemptTimeout <= 0 || attemptTimeout > defaultFreeProviderAttemptTimeout {
+			attemptTimeout = defaultFreeProviderAttemptTimeout
+		}
+		attemptContext, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
+		generated, err := generateWithCorrection(attemptContext, provider, lessonContext)
+		cancelAttempt()
 		if err == nil {
 			return generated, nil
 		}

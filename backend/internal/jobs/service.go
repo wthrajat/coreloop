@@ -35,7 +35,11 @@ type Service struct {
 	now       func() time.Time
 }
 
-const publishableJobsPerTick = 1
+const (
+	publishableJobsPerTick     = 1
+	defaultJobExecutionTimeout = 45 * time.Second
+	jobFinalizationReserve     = 8 * time.Second
+)
 
 func New(dataStore *store.Store, providerRouter *providers.Router, telegramClient *telegram.Client, publisher *qstash.Publisher, alertService *alerts.Service, appOrigin string) *Service {
 	sourceClient := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(request *http.Request, via []*http.Request) error {
@@ -106,7 +110,9 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	if job.State != "leased" {
 		return fmt.Errorf("lease job returned unexpected state %q", job.State)
 	}
-	err = service.execute(ctx, job)
+	executionContext, cancelExecution := jobExecutionContext(ctx)
+	err = service.execute(executionContext, job)
+	cancelExecution()
 	if err == nil {
 		if err := service.store.CompleteJob(ctx, job.ID, service.now()); err != nil {
 			return err
@@ -127,6 +133,13 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	}
 	service.continueQueue(ctx)
 	return fmt.Errorf("execute %s job: %w", job.Type, err)
+}
+
+func jobExecutionContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parentDeadline, ok := parent.Deadline(); ok {
+		return context.WithDeadline(parent, parentDeadline.Add(-jobFinalizationReserve))
+	}
+	return context.WithTimeout(parent, defaultJobExecutionTimeout)
 }
 
 func (service *Service) execute(ctx context.Context, job store.Job) error {
@@ -400,7 +413,10 @@ func (service *Service) RunBlockedWithOpenAI(ctx context.Context, jobID string) 
 	if job.Type != "generate_lesson" || job.State != "blocked_quota" {
 		return errors.New("job is not a quota-blocked lesson generation job")
 	}
-	if err := service.generateLesson(ctx, job, true); err != nil {
+	executionContext, cancelExecution := jobExecutionContext(ctx)
+	err = service.generateLesson(executionContext, job, true)
+	cancelExecution()
+	if err != nil {
 		return err
 	}
 	return service.store.CompleteJob(ctx, job.ID, service.now())

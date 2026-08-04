@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"coreloop/backend/internal/content"
 )
@@ -15,6 +16,20 @@ type fakeProvider struct {
 	configured bool
 	responses  []any
 	calls      int
+}
+
+type blockingProvider struct {
+	name  string
+	calls int
+}
+
+func (provider *blockingProvider) Name() string { return provider.name }
+func (*blockingProvider) Model() string         { return "test" }
+func (*blockingProvider) Configured() bool      { return true }
+func (provider *blockingProvider) Generate(ctx context.Context, _ string, _ string, _ map[string]any, _ int) (Response, error) {
+	provider.calls++
+	<-ctx.Done()
+	return Response{}, &Error{Provider: provider.name, Kind: FailureTransient, Message: "request timed out", Cause: ctx.Err()}
 }
 
 func (provider *fakeProvider) Name() string     { return provider.name }
@@ -32,9 +47,7 @@ func (provider *fakeProvider) Generate(context.Context, string, string, map[stri
 
 func TestRouterFallsBackWithoutUsingOpenAI(t *testing.T) {
 	groq := &fakeProvider{name: "groq", configured: true, responses: []any{&Error{Provider: "groq", Kind: FailureQuota, Message: "quota"}}}
-	long := strings.Repeat("technical detail ", 180)
-	draft := content.LessonDraft{Title: "T", EstimatedMinutes: 15, Motivation: long, PriorApproaches: []string{long}, Definition: long, Mechanics: []string{long}, ProductionExample: long, Tradeoffs: []string{long}, FailureModes: []string{long}, WhenNotToUse: []string{long}, Alternatives: []string{long}, Security: long, Reliability: long, Performance: long, Cost: long, PresentMaturity: long, FutureDirection: long, CareerRelevance: long, InterviewAnswer: long, RecallQuestion: "R"}
-	gemini := &fakeProvider{name: "gemini", configured: true, responses: []any{draft}}
+	gemini := &fakeProvider{name: "gemini", configured: true, responses: []any{validProviderDraft()}}
 	openAI := &fakeProvider{name: "openai", configured: true, responses: []any{errors.New("must not run")}}
 	generated, err := NewRouter(groq, gemini, openAI).Generate(context.Background(), content.LessonContext{Minutes: 15})
 	if err != nil {
@@ -45,6 +58,25 @@ func TestRouterFallsBackWithoutUsingOpenAI(t *testing.T) {
 	}
 	if openAI.calls != 0 {
 		t.Fatal("OpenAI was called automatically")
+	}
+}
+
+func TestRouterPreservesTimeForGeminiWhenGroqHangs(t *testing.T) {
+	groq := &blockingProvider{name: "groq"}
+	gemini := &fakeProvider{name: "gemini", configured: true, responses: []any{validProviderDraft()}}
+	router := NewRouter(groq, gemini, nil)
+	router.freeAttemptTimeout = 20 * time.Millisecond
+
+	started := time.Now()
+	generated, err := router.Generate(context.Background(), content.LessonContext{Minutes: 15})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.Provider != "gemini" || groq.calls != 1 || gemini.calls != 1 {
+		t.Fatalf("fallback result = %#v, Groq calls = %d, Gemini calls = %d", generated, groq.calls, gemini.calls)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("fallback took %s", elapsed)
 	}
 }
 
@@ -77,4 +109,9 @@ func TestRouterReportsQuotaOnlyWhenEveryConfiguredFreeProviderIsExhausted(t *tes
 	if !errors.Is(err, ErrFreeQuotaExhausted) {
 		t.Fatalf("quota exhaustion error = %v", err)
 	}
+}
+
+func validProviderDraft() content.LessonDraft {
+	long := strings.Repeat("technical detail ", 180)
+	return content.LessonDraft{Title: "T", EstimatedMinutes: 15, Motivation: long, PriorApproaches: []string{long}, Definition: long, Mechanics: []string{long}, ProductionExample: long, Tradeoffs: []string{long}, FailureModes: []string{long}, WhenNotToUse: []string{long}, Alternatives: []string{long}, Security: long, Reliability: long, Performance: long, Cost: long, PresentMaturity: long, FutureDirection: long, CareerRelevance: long, InterviewAnswer: long, RecallQuestion: "R"}
 }
