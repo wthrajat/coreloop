@@ -65,6 +65,47 @@ func TestGroqRequestFitsTheFreeTierTPMLimit(t *testing.T) {
 	}
 }
 
+func TestGroqThirtyMinutePromptKeepsEnoughDetailedOutputBudget(t *testing.T) {
+	var requestBody []byte
+	client := &http.Client{Transport: providerRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestBody, _ = io.ReadAll(request.Body)
+		return jsonResponse(request, `{"id":"request-1","choices":[{"message":{"content":"{}"}}]}`), nil
+	})}
+	system, input, err := content.Compile(content.LessonContext{
+		Topic: "Database replication", Minutes: 30, Depth: "detailed",
+		Objectives: []string{"Explain replication mechanics and production failure recovery"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := NewGroq("secret", "openai/gpt-oss-20b", client)
+	if _, err := provider.Generate(
+		context.Background(), system, input, content.JSONSchema(), content.OutputBudget(30),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var payload struct {
+		MaxCompletionTokens int `json:"max_completion_tokens"`
+		Messages            []struct {
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(requestBody, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.MaxCompletionTokens < 5_000 {
+		t.Fatalf("30-minute Groq completion budget = %d, want at least 5000", payload.MaxCompletionTokens)
+	}
+	promptTokens := 0
+	for _, message := range payload.Messages {
+		promptTokens += content.EstimateTokens(message.Content)
+	}
+	if total := promptTokens + payload.MaxCompletionTokens + groqTokenBudgetReserve; total > groqFreeTierTokenBudget {
+		t.Fatalf("30-minute Groq request budget = %d, exceeds %d", total, groqFreeTierTokenBudget)
+	}
+}
+
 func TestOpenAIKeepsStrictStructuredOutput(t *testing.T) {
 	var requestBody []byte
 	client := &http.Client{Transport: providerRoundTripFunc(func(request *http.Request) (*http.Response, error) {

@@ -192,5 +192,12 @@ func TestRouterReportsQuotaOnlyWhenEveryConfiguredFreeProviderIsExhausted(t *tes
 
 func validProviderDraft() content.LessonDraft {
 	long := strings.Repeat("technical detail ", 180)
-	return content.LessonDraft{Title: "T", EstimatedMinutes: 15, Motivation: long, PriorApproaches: []string{long}, Definition: long, Mechanics: []string{long}, ProductionExample: long, Tradeoffs: []string{long}, FailureModes: []string{long}, WhenNotToUse: []string{long}, Alternatives: []string{long}, Security: long, Reliability: long, Performance: long, Cost: long, PresentMaturity: long, FutureDirection: long, CareerRelevance: long, InterviewAnswer: long, RecallQuestion: "R"}
+	developedList := []string{long, long, long, long}
+	return content.LessonDraft{Title: "T", EstimatedMinutes: 15, Motivation: long,
+		PriorApproaches: developedList, Definition: long, Mechanics: developedList,
+		ProductionExample: long, Tradeoffs: developedList, FailureModes: developedList,
+		WhenNotToUse: developedList, Alternatives: developedList, Security: long,
+		Reliability: long, Performance: long, Cost: long, PresentMaturity: long,
+		FutureDirection: long, CareerRelevance: long, InterviewAnswer: long,
+		RecallQuestion: "R"}
 }

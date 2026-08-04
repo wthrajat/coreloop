@@ -139,8 +139,10 @@ func (store *Store) SaveGeneratedLesson(ctx context.Context, plan LessonPlan, ge
 		_, err = tx.ExecContext(ctx, `INSERT INTO lessons
 			(id,topic_id,prompt_version_id,lesson_type,title,estimated_reading_minutes,normalized_content_json,
 			content_fingerprint,cache_key,verification_state,generation_state,generated_at,published_at)
-			VALUES (?,?,'prompt_lesson_v1','foundation',?,?,?,?,?,?,'validated',?,?)`, lessonID, plan.Topic.ID,
-			generated.Draft.Title, generated.Draft.EstimatedMinutes, string(encoded), fingerprint, cacheKey, generated.VerificationState, timestamp(now), timestamp(now))
+			VALUES (?,?,?,'foundation',?,?,?,?,?,?,'validated',?,?)`,
+			lessonID, plan.Topic.ID, content.PromptRecordID, generated.Draft.Title,
+			generated.Draft.EstimatedMinutes, string(encoded), fingerprint, cacheKey,
+			generated.VerificationState, timestamp(now), timestamp(now))
 		if err != nil {
 			return "", "", err
 		}

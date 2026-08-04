@@ -6,6 +6,7 @@ import { useState, type ReactNode } from "react";
 
 import { AppNavigation } from "@/components/app-navigation";
 import { useSession } from "@/components/session-provider";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { api } from "@/lib/api-client";
 
 export function AppShell({ children }: { children: ReactNode }) {
@@ -88,6 +89,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </span>
         </Link>
         <AppNavigation owner={session.owner} />
+        <ThemeToggle />
         <div className="rail-status">
           <span className="status-dot status-dot-ready" aria-hidden="true" />
           <span>
@@ -104,6 +106,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <span />
         </span>
         <strong>Coreloop</strong>
+        <ThemeToggle compact />
         <button className="mobile-signout" onClick={() => void logout()}>
           Sign out
         </button>

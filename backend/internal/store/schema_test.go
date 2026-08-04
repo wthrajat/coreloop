@@ -63,3 +63,26 @@ func TestRadarQualityMigrationContainsDurableFallbackAndFrequencyState(t *testin
 		}
 	}
 }
+
+func TestLessonClarityMigrationRegistersVersionedPrompt(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	migration, err := os.ReadFile(filepath.Join(projectRoot, "migrations", "0005_lesson_clarity.sql"))
+	if err != nil {
+		t.Fatalf("read lesson clarity migration: %v", err)
+	}
+	text := strings.ToLower(string(migration))
+	for _, required := range []string{
+		"prompt_lesson_v2",
+		"lesson-v2",
+		"lesson-draft-v1",
+		"compiler-v2",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("lesson clarity migration is missing %q", required)
+		}
+	}
+}

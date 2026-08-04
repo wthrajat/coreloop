@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"coreloop/backend/internal/content"
 	"coreloop/backend/internal/ids"
 )
 
@@ -311,6 +312,8 @@ func (store *Store) RecordProviderRun(ctx context.Context, job Job, generatedBy,
 	}
 	_, err = store.database.ExecContext(ctx, `INSERT INTO provider_runs
 		(id,user_id,job_id,provider,model_id,prompt_version,schema_version,provider_request_id,request_kind,result_state,input_tokens,output_tokens,error_code,started_at,completed_at)
-		VALUES (?,?,?,?,?,'lesson-v1','lesson-draft-v1',?,?,?,?,?,?,?,?)`, id, user, job.ID, generatedBy, model, request, requestKind, state, input, output, errorCode, timestamp(started), timestamp(completed))
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, user, job.ID, generatedBy, model,
+		content.PromptVersion, content.SchemaVersion, request, requestKind, state,
+		input, output, errorCode, timestamp(started), timestamp(completed))
 	return err
 }
