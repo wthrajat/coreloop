@@ -10,8 +10,11 @@ import (
 )
 
 type Item struct {
-	Title, URL, Summary string
-	PublishedAt         time.Time
+	Title, URL, Summary                string
+	PublishedAt                        time.Time
+	CommunityPoints, CommunityComments int
+	CommunitySignalsAvailable          bool
+	DiscoveredVia                      []SourceReference
 }
 
 type feed struct {
@@ -21,10 +24,13 @@ type feed struct {
 	Entries []atomEntry `xml:"entry"`
 }
 type rssItem struct {
-	Title       string `xml:"title"`
-	Link        string `xml:"link"`
-	Description string `xml:"description"`
-	Published   string `xml:"pubDate"`
+	Title          string `xml:"title"`
+	Link           string `xml:"link"`
+	Description    string `xml:"description"`
+	ContentEncoded string `xml:"encoded"`
+	Published      string `xml:"pubDate"`
+	Date           string `xml:"date"`
+	Updated        string `xml:"updated"`
 }
 type atomEntry struct {
 	Title string `xml:"title"`
@@ -47,8 +53,9 @@ func ParseFeed(input []byte) ([]Item, error) {
 	}
 	var items []Item
 	for _, entry := range document.Channel.Items {
-		published := parseTime(entry.Published)
-		items = append(items, Item{Title: clean(entry.Title), URL: strings.TrimSpace(entry.Link), Summary: clean(entry.Description), PublishedAt: published})
+		published := parseTime(firstFeedValue(entry.Published, entry.Date, entry.Updated))
+		summary := firstFeedValue(entry.ContentEncoded, entry.Description)
+		items = append(items, Item{Title: clean(entry.Title), URL: strings.TrimSpace(entry.Link), Summary: clean(summary), PublishedAt: published})
 	}
 	for _, entry := range document.Entries {
 		link := ""
@@ -78,6 +85,16 @@ func clean(value string) string {
 	value = html.UnescapeString(tags.ReplaceAllString(value, " "))
 	return strings.Join(strings.Fields(value), " ")
 }
+
+func firstFeedValue(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func parseTime(value string) time.Time {
 	for _, layout := range []string{time.RFC1123Z, time.RFC1123, time.RFC3339, time.RFC822Z, time.RFC822} {
 		if parsed, err := time.Parse(layout, strings.TrimSpace(value)); err == nil {

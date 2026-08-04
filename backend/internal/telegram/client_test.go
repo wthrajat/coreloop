@@ -49,6 +49,34 @@ func TestSendMessageDoesNotMisclassifyContentErrors(t *testing.T) {
 	}
 }
 
+func TestSendMessageSupportsSourceURLButtons(t *testing.T) {
+	client := New("test-token", &http.Client{Transport: telegramRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var payload struct {
+			ReplyMarkup struct {
+				Keyboard [][]map[string]string `json:"inline_keyboard"`
+			} `json:"reply_markup"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		button := payload.ReplyMarkup.Keyboard[0][0]
+		if button["url"] != "https://example.com/source" || button["callback_data"] != "" {
+			t.Fatalf("source button = %#v", button)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"ok":true,"result":{"message_id":42}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})})
+	_, err := client.SendMessage(context.Background(), "987654321", "Source", MessageOptions{
+		Buttons: [][]Button{{{Text: "Open source", URL: "https://example.com/source"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateChatUsesTelegramGetChat(t *testing.T) {
 	client := New("test-token", &http.Client{Transport: telegramRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.URL.Path != "/bottest-token/getChat" {

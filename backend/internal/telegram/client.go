@@ -66,7 +66,8 @@ func (client *Client) WithBaseURL(baseURL string) *Client {
 
 type Button struct {
 	Text string `json:"text"`
-	Data string `json:"callback_data"`
+	Data string `json:"callback_data,omitempty"`
+	URL  string `json:"url,omitempty"`
 }
 
 type MessageOptions struct {

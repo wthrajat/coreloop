@@ -33,3 +33,33 @@ func TestInitialMigrationContainsRequiredTables(t *testing.T) {
 		}
 	}
 }
+
+func TestRadarQualityMigrationContainsDurableFallbackAndFrequencyState(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	migration, err := os.ReadFile(filepath.Join(projectRoot, "migrations", "0004_radar_quality.sql"))
+	if err != nil {
+		t.Fatalf("read Radar quality migration: %v", err)
+	}
+	text := strings.ToLower(string(migration))
+	for _, required := range []string{
+		"radar_items_per_day",
+		"radar_weekends_enabled",
+		"set normalized_url=canonical_url",
+		"community_signals_available",
+		"create table radar_deliveries",
+		"create table radar_delivery_parts",
+		"create table radar_daily_usage",
+		"create table radar_enrichments",
+		"source_hacker_news",
+		"source_openai_news",
+		"source_stacker_news",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("Radar quality migration is missing %q", required)
+		}
+	}
+}

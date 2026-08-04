@@ -22,8 +22,8 @@ func (store *Store) Ping(ctx context.Context) error {
 	if err := store.database.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM schema_migrations").Scan(&version); err != nil {
 		return err
 	}
-	if version < 3 {
-		return fmt.Errorf("database schema is at version %d; version 3 is required", version)
+	if version < 4 {
+		return fmt.Errorf("database schema is at version %d; version 4 is required", version)
 	}
 	return nil
 }

@@ -6,109 +6,348 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"net/url"
+	"math"
+	"strings"
 	"time"
 
 	"coreloop/backend/internal/radar"
 )
 
 type SourceRecord struct {
-	ID, Publisher, URL, FetchMethod, ETag, LastModified string
-	Tier                                                int
+	ID, Publisher, URL, FetchMethod, Role, AdapterConfig, ETag, LastModified string
+	Tier                                                                     int
 }
+
 type RadarCandidate struct {
-	ID, UserID, SourceItemID, TopicID, Publisher, Title, URL, Summary string
-	Score                                                             float64
-	PublishedAt                                                       time.Time
+	ID, UserID, SourceItemID, TopicID, Publisher, SourceRole string
+	Title, URL, Summary, Category                            string
+	Discovery                                                []radar.SourceReference
+	Score                                                    float64
+	PublishedAt                                              time.Time
 }
 
 func (store *Store) Source(ctx context.Context, id string) (SourceRecord, error) {
 	var source SourceRecord
 	var etag, last sql.NullString
-	err := store.database.QueryRowContext(ctx, `SELECT id,publisher,canonical_url,source_tier,fetch_method,etag,last_modified FROM sources WHERE id=? AND enabled=1`, id).Scan(&source.ID, &source.Publisher, &source.URL, &source.Tier, &source.FetchMethod, &etag, &last)
+	err := store.database.QueryRowContext(ctx, `SELECT id,publisher,canonical_url,source_tier,fetch_method,
+		source_role,adapter_config_json,etag,last_modified FROM sources WHERE id=? AND enabled=1`, id).
+		Scan(&source.ID, &source.Publisher, &source.URL, &source.Tier, &source.FetchMethod,
+			&source.Role, &source.AdapterConfig, &etag, &last)
 	source.ETag, source.LastModified = etag.String, last.String
 	return source, err
 }
 
-func (store *Store) SaveSourceItems(ctx context.Context, source SourceRecord, items []radar.Item, etag, lastModified string, now time.Time) ([]string, error) {
+func (store *Store) SaveSourceItems(
+	ctx context.Context,
+	source SourceRecord,
+	items []radar.Item,
+	etag string,
+	lastModified string,
+	now time.Time,
+) ([]string, error) {
+	valueGroups := make([]string, 0, len(items))
+	arguments := make([]any, 0, len(items)*17)
+	for _, item := range items {
+		values, valid := normalizedSourceItemValues(source, item, etag, lastModified, now)
+		if !valid {
+			continue
+		}
+		valueGroups = append(valueGroups, "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		arguments = append(arguments, values...)
+	}
+
 	tx, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	var inserted []string
-	for _, item := range items {
-		parsedURL, parseError := url.Parse(item.URL)
-		if item.URL == "" || item.Title == "" || parseError != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" {
-			continue
-		}
-		sum := sha256.Sum256([]byte(item.Title + "\n" + item.Summary))
-		hash := hex.EncodeToString(sum[:])
-		id := mustID("srcitem")
-		published := any(nil)
-		if !item.PublishedAt.IsZero() {
-			published = timestamp(item.PublishedAt)
-		}
-		evidence, _ := json.Marshal(map[string]string{"summary": item.Summary})
-		result, err := tx.ExecContext(ctx, `INSERT INTO source_items
-			(id,source_id,canonical_url,title,published_at,retrieved_at,content_hash,evidence_json,etag,last_modified)
-			VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(canonical_url) DO UPDATE SET title=excluded.title,published_at=excluded.published_at,retrieved_at=excluded.retrieved_at,content_hash=excluded.content_hash,evidence_json=excluded.evidence_json,etag=excluded.etag,last_modified=excluded.last_modified
-			WHERE source_items.content_hash<>excluded.content_hash`, id, source.ID, item.URL, item.Title, published, timestamp(now), hash, string(evidence), etag, lastModified)
+	var changedItems []string
+	if len(valueGroups) > 0 {
+		query := `INSERT INTO source_items
+			(id,source_id,canonical_url,normalized_url,title,published_at,retrieved_at,
+			 content_hash,evidence_json,cluster_key,etag,last_modified,category,
+			 community_score,community_comments,community_signals_available,discovery_json)
+			VALUES ` + strings.Join(valueGroups, ",") + `
+			ON CONFLICT(canonical_url) DO UPDATE SET
+				source_id=CASE WHEN
+					excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN excluded.source_id ELSE source_items.source_id END,
+				normalized_url=excluded.normalized_url,
+				title=CASE WHEN excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN excluded.title ELSE source_items.title END,
+				published_at=CASE WHEN excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN COALESCE(excluded.published_at,source_items.published_at)
+					ELSE source_items.published_at END,
+				retrieved_at=excluded.retrieved_at,
+				content_hash=CASE WHEN excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN excluded.content_hash ELSE source_items.content_hash END,
+				evidence_json=CASE WHEN excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN excluded.evidence_json ELSE source_items.evidence_json END,
+				cluster_key=CASE WHEN excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN excluded.cluster_key ELSE source_items.cluster_key END,
+				etag=CASE WHEN excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN excluded.etag ELSE source_items.etag END,
+				last_modified=CASE WHEN excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN excluded.last_modified ELSE source_items.last_modified END,
+				category=CASE WHEN excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+					THEN excluded.category ELSE source_items.category END,
+				community_score=MAX(source_items.community_score,excluded.community_score),
+				community_comments=MAX(source_items.community_comments,excluded.community_comments),
+				community_signals_available=MAX(
+					source_items.community_signals_available,
+					excluded.community_signals_available),
+				discovery_json=CASE WHEN excluded.discovery_json='[]'
+					THEN source_items.discovery_json ELSE excluded.discovery_json END
+			WHERE (source_items.content_hash<>excluded.content_hash AND (
+					excluded.source_id=source_items.source_id OR
+					(SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)))
+				OR excluded.community_score>source_items.community_score
+				OR excluded.community_comments>source_items.community_comments
+				OR excluded.community_signals_available>
+					source_items.community_signals_available
+				OR (excluded.discovery_json<>'[]' AND
+					excluded.discovery_json<>source_items.discovery_json)
+				OR (SELECT source_tier FROM sources WHERE id=excluded.source_id)<
+					(SELECT source_tier FROM sources WHERE id=source_items.source_id)
+			RETURNING id`
+		rows, err := tx.QueryContext(ctx, query, arguments...)
 		if err != nil {
 			return nil, err
 		}
-		changed, _ := result.RowsAffected()
-		if changed > 0 {
-			var actual string
-			if err := tx.QueryRowContext(ctx, "SELECT id FROM source_items WHERE canonical_url=?", item.URL).Scan(&actual); err != nil {
+		seen := make(map[string]bool)
+		for rows.Next() {
+			var actualID string
+			if err := rows.Scan(&actualID); err != nil {
+				rows.Close()
 				return nil, err
 			}
-			inserted = append(inserted, actual)
+			if !seen[actualID] {
+				seen[actualID] = true
+				changedItems = append(changedItems, actualID)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
 		}
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE sources SET etag=?,last_modified=?,last_polled_at=?,consecutive_failures=0,updated_at=? WHERE id=?`, etag, lastModified, timestamp(now), timestamp(now), source.ID)
+	_, err = tx.ExecContext(ctx, `UPDATE sources SET etag=?,last_modified=?,last_polled_at=?,
+		consecutive_failures=0,updated_at=? WHERE id=?`, etag, lastModified,
+		timestamp(now), timestamp(now), source.ID)
 	if err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return inserted, nil
+	return changedItems, nil
+}
+
+func normalizedSourceItemValues(
+	source SourceRecord,
+	item radar.Item,
+	etag string,
+	lastModified string,
+	now time.Time,
+) ([]any, bool) {
+	normalizedURL, err := radar.CanonicalURL(item.URL)
+	if item.Title == "" || err != nil {
+		return nil, false
+	}
+	neutralTitle := radar.NeutralText(item.Title)
+	if neutralTitle == "" {
+		return nil, false
+	}
+	neutralSummary := radar.NeutralText(item.Summary)
+	category := radar.Classify(neutralTitle, neutralSummary)
+	contentDigest := sha256.Sum256([]byte(
+		normalizedURL + "\n" + neutralTitle + "\n" + neutralSummary,
+	))
+	published := any(nil)
+	if !item.PublishedAt.IsZero() {
+		published = timestamp(item.PublishedAt)
+	}
+	discovery, _ := json.Marshal(item.DiscoveredVia)
+	evidence, _ := json.Marshal(map[string]any{
+		"summary":                     neutralSummary,
+		"community_points":            item.CommunityPoints,
+		"community_comments":          item.CommunityComments,
+		"community_signals_available": item.CommunitySignalsAvailable,
+		"discovered_via":              item.DiscoveredVia,
+	})
+	return []any{
+		mustID("srcitem"), source.ID, normalizedURL, normalizedURL, neutralTitle,
+		published, timestamp(now), hex.EncodeToString(contentDigest[:]), string(evidence),
+		radar.ClusterKey(normalizedURL, neutralTitle), etag, lastModified, string(category),
+		item.CommunityPoints, item.CommunityComments, boolInt(item.CommunitySignalsAvailable),
+		string(discovery),
+	}, true
 }
 
 func (store *Store) SourcePollFailed(ctx context.Context, id string, now time.Time) error {
-	_, err := store.database.ExecContext(ctx, `UPDATE sources SET consecutive_failures=consecutive_failures+1,last_polled_at=?,updated_at=? WHERE id=?`, timestamp(now), timestamp(now), id)
+	_, err := store.database.ExecContext(ctx, `UPDATE sources SET
+		consecutive_failures=consecutive_failures+1,last_polled_at=?,updated_at=? WHERE id=?`,
+		timestamp(now), timestamp(now), id)
 	return err
 }
 
+type radarUserTopic struct {
+	TopicID        string
+	Terms          []string
+	FeedbackWeight float64
+}
+
+type radarUser struct {
+	ID     string
+	Topics []radarUserTopic
+}
+
 func (store *Store) RankSourceItem(ctx context.Context, itemID string, now time.Time) ([]RadarCandidate, error) {
-	var title, url, publisher, evidence string
-	var tier int
-	var publishedNull sql.NullString
-	err := store.database.QueryRowContext(ctx, `SELECT si.title,si.canonical_url,s.publisher,s.source_tier,si.evidence_json,si.published_at FROM source_items si JOIN sources s ON s.id=si.source_id WHERE si.id=?`, itemID).Scan(&title, &url, &publisher, &tier, &evidence, &publishedNull)
+	item, tier, communityPoints, communityComments, communityAvailable, err :=
+		store.radarItemForRanking(ctx, itemID, now)
 	if err != nil {
 		return nil, err
 	}
-	publishedTime := now
-	if publishedNull.Valid {
-		publishedTime, _ = parseTimestamp(publishedNull.String)
+	users, err := store.radarUsers(ctx)
+	if err != nil {
+		return nil, err
 	}
-	var evidenceValue map[string]string
+	category := radar.Category(item.Category)
+	var candidates []RadarCandidate
+	for _, user := range users {
+		var selectedTopic radarUserTopic
+		var selectedBreakdown radar.ScoreBreakdown
+		for _, topic := range user.Topics {
+			breakdown := radar.CalculateScore(radar.ScoreInput{
+				Title: item.Title, Summary: item.Summary, TopicTerms: topic.Terms,
+				SourceTier: tier, PublishedAgeHours: now.Sub(item.PublishedAt).Hours(),
+				Category: category, CommunityPoints: communityPoints,
+				CommunityComments:         communityComments,
+				CommunitySignalsAvailable: communityAvailable,
+			})
+			if breakdown.Total > selectedBreakdown.Total {
+				selectedTopic, selectedBreakdown = topic, breakdown
+			}
+		}
+		if selectedTopic.TopicID == "" {
+			continue
+		}
+		adjustedScore := math.Max(0, math.Min(1, selectedBreakdown.Total+selectedTopic.FeedbackWeight))
+		selectedBreakdown.Total = math.Round(adjustedScore*1000) / 1000
+		breakdown, _ := json.Marshal(map[string]any{
+			"ranker": radar.RankerVersion, "category": category,
+			"scores": selectedBreakdown,
+		})
+		candidateID := mustID("rad")
+		var actualID, status string
+		err := store.database.QueryRowContext(ctx, `INSERT INTO radar_candidates
+			(id,user_id,source_item_id,topic_id,ranker_version,relevance_score,
+			 score_breakdown_json,status)
+			VALUES (?,?,?,?,?,?,?,CASE
+				WHEN EXISTS (SELECT 1 FROM radar_candidates previous
+					WHERE previous.user_id=? AND previous.source_item_id=? AND previous.status='delivered')
+					THEN 'delivered'
+				WHEN EXISTS (SELECT 1 FROM radar_candidates previous
+					WHERE previous.user_id=? AND previous.source_item_id=? AND previous.status='skipped')
+					THEN 'skipped'
+				ELSE 'pending' END)
+			ON CONFLICT(user_id,source_item_id,ranker_version) DO UPDATE SET
+				topic_id=excluded.topic_id,relevance_score=excluded.relevance_score,
+				score_breakdown_json=excluded.score_breakdown_json,
+				status=CASE WHEN radar_candidates.status IN ('delivered','skipped','qualified')
+					THEN radar_candidates.status ELSE 'pending' END,
+				updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+			RETURNING id,status`,
+			candidateID, user.ID, itemID, selectedTopic.TopicID, radar.RankerVersion,
+			selectedBreakdown.Total, string(breakdown), user.ID, itemID, user.ID, itemID).
+			Scan(&actualID, &status)
+		if err != nil {
+			return nil, err
+		}
+		if status == "pending" {
+			candidate := item
+			candidate.ID, candidate.UserID, candidate.TopicID = actualID, user.ID, selectedTopic.TopicID
+			candidate.Score = selectedBreakdown.Total
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates, nil
+}
+
+func (store *Store) radarItemForRanking(
+	ctx context.Context,
+	itemID string,
+	now time.Time,
+) (RadarCandidate, int, int, int, bool, error) {
+	var item RadarCandidate
+	var tier, communityPoints, communityComments, communityAvailable int
+	var published sql.NullString
+	var evidence, discovery string
+	err := store.database.QueryRowContext(ctx, `SELECT si.id,s.publisher,s.source_role,si.title,
+		si.normalized_url,si.evidence_json,si.category,si.community_score,si.community_comments,
+		si.community_signals_available,
+		si.discovery_json,s.source_tier,si.published_at
+		FROM source_items si JOIN sources s ON s.id=si.source_id WHERE si.id=?`, itemID).
+		Scan(&item.SourceItemID, &item.Publisher, &item.SourceRole, &item.Title, &item.URL,
+			&evidence, &item.Category, &communityPoints, &communityComments, &communityAvailable,
+			&discovery, &tier, &published)
+	if err != nil {
+		return RadarCandidate{}, 0, 0, 0, false, err
+	}
+	item.PublishedAt = now
+	if published.Valid {
+		if parsed, parseErr := parseTimestamp(published.String); parseErr == nil {
+			item.PublishedAt = parsed
+		}
+	}
+	var evidenceValue struct {
+		Summary string `json:"summary"`
+	}
 	_ = json.Unmarshal([]byte(evidence), &evidenceValue)
-	summary := evidenceValue["summary"]
-	rows, err := store.database.QueryContext(ctx, `SELECT lp.user_id,t.id,t.title,t.objectives_json,utp.feedback_weight
+	item.Summary = evidenceValue.Summary
+	_ = json.Unmarshal([]byte(discovery), &item.Discovery)
+	return item, tier, communityPoints, communityComments, communityAvailable == 1, nil
+}
+
+func (store *Store) radarUsers(ctx context.Context) ([]radarUser, error) {
+	rows, err := store.database.QueryContext(ctx, `SELECT lp.user_id,t.id,t.title,
+		t.objectives_json,utp.feedback_weight
 		FROM learning_preferences lp
 		JOIN user_topic_preferences utp ON utp.user_id=lp.user_id
 		JOIN topics t ON t.id=utp.topic_id
 		JOIN users u ON u.id=lp.user_id
 		JOIN delivery_destinations dd ON dd.user_id=lp.user_id AND dd.channel='telegram'
 			AND dd.enabled=1 AND dd.status='connected'
-		WHERE lp.radar_enabled=1 AND utp.excluded=0 AND u.status='active'`)
+		WHERE lp.radar_enabled=1 AND utp.excluded=0 AND u.status='active'
+		ORDER BY lp.user_id,utp.priority DESC,t.id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var candidates []RadarCandidate
+	byID := map[string]*radarUser{}
+	var order []string
 	for rows.Next() {
 		var userID, topicID, topicTitle, objectives string
 		var feedbackWeight float64
@@ -117,35 +356,25 @@ func (store *Store) RankSourceItem(ctx context.Context, itemID string, now time.
 		}
 		var objectiveValues []string
 		_ = json.Unmarshal([]byte(objectives), &objectiveValues)
+		user := byID[userID]
+		if user == nil {
+			user = &radarUser{ID: userID}
+			byID[userID] = user
+			order = append(order, userID)
+		}
 		terms := append([]string{topicTitle}, objectiveValues...)
-		score := radar.Score(title, summary, terms, tier, now.Sub(publishedTime).Hours()) + feedbackWeight
-		if score > 1 {
-			score = 1
-		}
-		if score < 0 {
-			score = 0
-		}
-		if score < 0.58 {
-			continue
-		}
-		candidateID := mustID("rad")
-		breakdown, _ := json.Marshal(map[string]any{"score": score, "ranker": radar.RankerVersion})
-		_, err := store.database.ExecContext(ctx, `INSERT INTO radar_candidates
-			(id,user_id,source_item_id,topic_id,ranker_version,relevance_score,score_breakdown_json,status)
-			VALUES (?,?,?,?,?,?,?,'qualified') ON CONFLICT(user_id,source_item_id,ranker_version) DO NOTHING`, candidateID, userID, itemID, topicID, radar.RankerVersion, score, string(breakdown))
-		if err != nil {
-			return nil, err
-		}
-		var actualID, status string
-		err = store.database.QueryRowContext(ctx, `SELECT id,status FROM radar_candidates WHERE user_id=? AND source_item_id=? AND ranker_version=?`, userID, itemID, radar.RankerVersion).Scan(&actualID, &status)
-		if err != nil {
-			return nil, err
-		}
-		if status == "qualified" {
-			candidates = append(candidates, RadarCandidate{ID: actualID, UserID: userID, SourceItemID: itemID, TopicID: topicID, Publisher: publisher, Title: title, URL: url, Summary: summary, Score: score, PublishedAt: publishedTime})
-		}
+		user.Topics = append(user.Topics, radarUserTopic{
+			TopicID: topicID, Terms: terms, FeedbackWeight: feedbackWeight,
+		})
 	}
-	return candidates, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	users := make([]radarUser, 0, len(order))
+	for _, id := range order {
+		users = append(users, *byID[id])
+	}
+	return users, nil
 }
 
 func (store *Store) CompleteRadar(ctx context.Context, userID, candidateID, state string, now time.Time) error {
@@ -154,7 +383,8 @@ func (store *Store) CompleteRadar(ctx context.Context, userID, candidateID, stat
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE radar_candidates SET status=?,updated_at=? WHERE id=? AND user_id=?`, state, timestamp(now), candidateID, userID)
+	result, err := tx.ExecContext(ctx, `UPDATE radar_candidates SET status=?,updated_at=?
+		WHERE id=? AND user_id=?`, state, timestamp(now), candidateID, userID)
 	if err != nil {
 		return err
 	}
@@ -163,7 +393,10 @@ func (store *Store) CompleteRadar(ctx context.Context, userID, candidateID, stat
 		return sql.ErrNoRows
 	}
 	if state == "skipped" {
-		_, err = tx.ExecContext(ctx, `UPDATE user_topic_preferences SET feedback_weight=MAX(-0.25,feedback_weight-0.03),updated_at=? WHERE user_id=? AND topic_id=(SELECT topic_id FROM radar_candidates WHERE id=?)`, timestamp(now), userID, candidateID)
+		_, err = tx.ExecContext(ctx, `UPDATE user_topic_preferences SET
+			feedback_weight=MAX(-0.25,feedback_weight-0.03),updated_at=?
+			WHERE user_id=? AND topic_id=(SELECT topic_id FROM radar_candidates WHERE id=?)`,
+			timestamp(now), userID, candidateID)
 		if err != nil {
 			return err
 		}
@@ -174,14 +407,25 @@ func (store *Store) CompleteRadar(ctx context.Context, userID, candidateID, stat
 func (store *Store) RadarCandidate(ctx context.Context, candidateID string) (RadarCandidate, error) {
 	var candidate RadarCandidate
 	var published sql.NullString
-	err := store.database.QueryRowContext(ctx, `SELECT rc.id,rc.user_id,rc.source_item_id,COALESCE(rc.topic_id,''),s.publisher,si.title,si.canonical_url,si.evidence_json,rc.relevance_score,si.published_at FROM radar_candidates rc JOIN source_items si ON si.id=rc.source_item_id JOIN sources s ON s.id=si.source_id WHERE rc.id=? AND rc.status='qualified'`, candidateID).Scan(&candidate.ID, &candidate.UserID, &candidate.SourceItemID, &candidate.TopicID, &candidate.Publisher, &candidate.Title, &candidate.URL, &candidate.Summary, &candidate.Score, &published)
+	var evidence, discovery string
+	err := store.database.QueryRowContext(ctx, `SELECT rc.id,rc.user_id,rc.source_item_id,
+		COALESCE(rc.topic_id,''),s.publisher,s.source_role,si.title,si.normalized_url,
+		si.evidence_json,si.category,si.discovery_json,rc.relevance_score,si.published_at
+		FROM radar_candidates rc JOIN source_items si ON si.id=rc.source_item_id
+		JOIN sources s ON s.id=si.source_id
+		WHERE rc.id=? AND rc.status='qualified'`, candidateID).
+		Scan(&candidate.ID, &candidate.UserID, &candidate.SourceItemID, &candidate.TopicID,
+			&candidate.Publisher, &candidate.SourceRole, &candidate.Title, &candidate.URL,
+			&evidence, &candidate.Category, &discovery, &candidate.Score, &published)
 	if err != nil {
 		return candidate, err
 	}
-	var evidence map[string]string
-	if json.Unmarshal([]byte(candidate.Summary), &evidence) == nil {
-		candidate.Summary = evidence["summary"]
+	var evidenceValue struct {
+		Summary string `json:"summary"`
 	}
+	_ = json.Unmarshal([]byte(evidence), &evidenceValue)
+	candidate.Summary = evidenceValue.Summary
+	_ = json.Unmarshal([]byte(discovery), &candidate.Discovery)
 	if published.Valid {
 		candidate.PublishedAt, _ = parseTimestamp(published.String)
 	}

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -39,6 +38,7 @@ const (
 	publishableJobsPerTick     = 1
 	defaultJobExecutionTimeout = 45 * time.Second
 	jobFinalizationReserve     = 8 * time.Second
+	maximumRadarRankBatchSize  = 5
 )
 
 func New(dataStore *store.Store, providerRouter *providers.Router, telegramClient *telegram.Client, publisher *qstash.Publisher, alertService *alerts.Service, appOrigin string) *Service {
@@ -71,6 +71,11 @@ func (service *Service) Tick(ctx context.Context) error {
 	if err := service.store.EnqueueSourcePolls(ctx, now); err != nil {
 		return err
 	}
+	releasedRadar, err := service.store.ReleaseRadarCandidates(ctx, now)
+	if err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "Radar release evaluated", "released_candidates", releasedRadar)
 	service.logQueueSummary(ctx)
 	return service.dispatchNextDueJob(ctx)
 }
@@ -402,55 +407,56 @@ func (service *Service) ingestSource(ctx context.Context, job store.Job) error {
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source.URL, nil)
-	if err != nil {
-		return err
-	}
-	if err := validateSourceURL(request.URL); err != nil {
-		return err
-	}
-	request.Header.Set("User-Agent", "Coreloop/1.0 (+"+service.appOrigin+")")
-	if source.ETag != "" {
-		request.Header.Set("If-None-Match", source.ETag)
-	}
-	if source.LastModified != "" {
-		request.Header.Set("If-Modified-Since", source.LastModified)
-	}
-	response, err := service.http.Do(request)
+	result, err := service.fetchSource(ctx, source)
 	if err != nil {
 		_ = service.store.SourcePollFailed(ctx, source.ID, service.now())
 		return err
 	}
-	defer response.Body.Close()
-	if response.StatusCode == http.StatusNotModified {
-		_, err := service.store.SaveSourceItems(ctx, source, nil, source.ETag, source.LastModified, service.now())
+	if result.NotModified {
+		_, err := service.store.SaveSourceItems(ctx, source, nil, result.ETag, result.LastModified, service.now())
+		if err == nil {
+			slog.InfoContext(ctx, "source poll not modified", "source_id", source.ID, "publisher", source.Publisher)
+		}
 		return err
 	}
-	if response.StatusCode != http.StatusOK {
+	itemIDs, err := service.store.SaveSourceItems(
+		ctx, source, result.Items, result.ETag, result.LastModified, service.now(),
+	)
+	if err != nil {
 		_ = service.store.SourcePollFailed(ctx, source.ID, service.now())
-		return fmt.Errorf("source returned %s", response.Status)
-	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
-	if err != nil {
-		return err
-	}
-	items, err := radar.ParseFeed(body)
-	if err != nil {
-		return err
-	}
-	if len(items) > 50 {
-		items = items[:50]
-	}
-	itemIDs, err := service.store.SaveSourceItems(ctx, source, items, response.Header.Get("ETag"), response.Header.Get("Last-Modified"), service.now())
-	if err != nil {
 		return err
 	}
 	if len(itemIDs) == 0 {
+		slog.InfoContext(ctx, "source poll completed", "source_id", source.ID,
+			"publisher", source.Publisher, "fetched_items", len(result.Items), "changed_items", 0)
 		return nil
 	}
-	batchKey := job.ID
-	_, err = service.store.EnqueueJob(ctx, "", "", "rank_radar", service.now(), "rank-batch:"+batchKey+":"+radar.RankerVersion, map[string]any{"source_item_ids": itemIDs})
-	return err
+	slog.InfoContext(ctx, "source poll completed", "source_id", source.ID,
+		"publisher", source.Publisher, "fetched_items", len(result.Items), "changed_items", len(itemIDs))
+	for batchIndex, batch := range splitRadarItemIDs(itemIDs, maximumRadarRankBatchSize) {
+		idempotencyKey := fmt.Sprintf(
+			"rank-batch:%s:%s:%d", job.ID, radar.RankerVersion, batchIndex,
+		)
+		if _, err := service.store.EnqueueJob(
+			ctx, "", "", "rank_radar", service.now(), idempotencyKey,
+			map[string]any{"source_item_ids": batch},
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitRadarItemIDs(itemIDs []string, batchSize int) [][]string {
+	if batchSize <= 0 {
+		return nil
+	}
+	batches := make([][]string, 0, (len(itemIDs)+batchSize-1)/batchSize)
+	for start := 0; start < len(itemIDs); start += batchSize {
+		end := min(start+batchSize, len(itemIDs))
+		batches = append(batches, itemIDs[start:end])
+	}
+	return batches
 }
 
 func (service *Service) rankRadar(ctx context.Context, job store.Job) error {
@@ -465,22 +471,21 @@ func (service *Service) rankRadar(ctx context.Context, job store.Job) error {
 	if payload.SourceItemID != "" {
 		itemIDs = append(itemIDs, payload.SourceItemID)
 	}
+	candidateCount := 0
 	for _, itemID := range itemIDs {
 		candidates, err := service.store.RankSourceItem(ctx, itemID, service.now())
 		if err != nil {
 			return err
 		}
-		for _, candidate := range candidates {
-			_, err := service.store.EnqueueJob(ctx, candidate.UserID, "", "deliver_radar", service.now(), "radar-deliver:"+candidate.ID, map[string]string{"candidate_id": candidate.ID})
-			if err != nil {
-				return err
-			}
-		}
+		candidateCount += len(candidates)
 	}
+	slog.InfoContext(ctx, "Radar ranking completed", "job_id", job.ID,
+		"source_items", len(itemIDs), "pending_candidates", candidateCount)
 	return nil
 }
 
 func (service *Service) deliverRadar(ctx context.Context, job store.Job) error {
+	slog.InfoContext(ctx, "Radar delivery started", "job_id", job.ID, "attempt", job.AttemptCount)
 	var payload map[string]string
 	if err := json.Unmarshal([]byte(job.PayloadJSON), &payload); err != nil {
 		return err
@@ -492,28 +497,100 @@ func (service *Service) deliverRadar(ctx context.Context, job store.Job) error {
 		}
 		return err
 	}
-	chatID, err := service.store.Destination(ctx, candidate.UserID)
+	sourceName := radarSourceName(candidate)
+	summary, whyItMatters := service.radarBriefingContent(ctx, candidate)
+	briefing, err := radar.RenderBriefing(radar.BriefingInput{
+		Category: radar.Category(candidate.Category), Title: candidate.Title,
+		Summary: summary, WhyItMatters: whyItMatters,
+		Source:        radar.SourceReference{Name: sourceName, URL: candidate.URL},
+		DiscoveredVia: candidate.Discovery,
+	})
+	if err != nil {
+		return fmt.Errorf("render deterministic Radar briefing: %w", err)
+	}
+	parts := telegram.ChunkHTML([]string{html.EscapeString(briefing)}, "")
+	bundle, err := service.store.PrepareRadarDelivery(
+		ctx, candidate.UserID, candidate.ID, job.ID, parts, service.now(),
+	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return service.store.CompleteRadar(ctx, candidate.UserID, candidate.ID, "rejected", service.now())
 		}
 		return err
 	}
-	summary := candidate.Summary
-	if len([]rune(summary)) > 900 {
-		summary = string([]rune(summary)[:900]) + "…"
+	if bundle.State == "delivered" {
+		return nil
 	}
-	message := "<b>Radar · " + html.EscapeString(candidate.Publisher) + "</b>\n\n<b>" + html.EscapeString(candidate.Title) + "</b>\n" + html.EscapeString(summary) + "\n\n<a href=\"" + html.EscapeString(candidate.URL) + "\">Read the official source</a>"
-	_, err = service.telegram.SendMessage(ctx, chatID, message, telegram.MessageOptions{Buttons: [][]telegram.Button{{{Text: "Skip", Data: "radar_skip:" + candidate.ID}}}})
-	if err != nil {
-		if telegram.IsChatUnavailable(err) {
-			disconnectErr := service.store.DisconnectDestination(ctx, candidate.UserID, service.now())
-			rejectErr := service.store.CompleteRadar(ctx, candidate.UserID, candidate.ID, "rejected", service.now())
-			return errors.Join(disconnectErr, rejectErr)
+	for index, part := range bundle.Parts {
+		if part.State == "delivered" {
+			continue
 		}
+		options := telegram.MessageOptions{}
+		if index == len(bundle.Parts)-1 {
+			options.Buttons = [][]telegram.Button{{
+				{Text: "Open source", URL: candidate.URL},
+				{Text: "Skip", Data: "radar_skip:" + candidate.ID},
+			}}
+		}
+		messageID, sendErr := service.telegram.SendMessage(ctx, bundle.ChatID, part.Text, options)
+		if sendErr != nil {
+			_ = service.store.FailRadarDelivery(ctx, bundle.ID, "telegram_send_failed", service.now())
+			if telegram.IsChatUnavailable(sendErr) {
+				disconnectErr := service.store.DisconnectDestination(ctx, candidate.UserID, service.now())
+				rejectErr := service.store.CompleteRadar(ctx, candidate.UserID, candidate.ID, "rejected", service.now())
+				return errors.Join(disconnectErr, rejectErr)
+			}
+			return sendErr
+		}
+		if err := service.store.CompleteRadarDeliveryPart(ctx, part.ID, messageID, service.now()); err != nil {
+			return err
+		}
+		slog.InfoContext(ctx, "Radar delivery part completed", "job_id", job.ID,
+			"part", index+1, "parts", len(bundle.Parts))
+	}
+	if err := service.store.CompleteRadarDelivery(
+		ctx, bundle.ID, candidate.UserID, candidate.ID, service.now(),
+	); err != nil {
 		return err
 	}
-	return service.store.CompleteRadar(ctx, candidate.UserID, candidate.ID, "delivered", service.now())
+	slog.InfoContext(ctx, "Radar delivery completed", "job_id", job.ID, "parts", len(bundle.Parts))
+	return nil
+}
+
+func radarSourceName(candidate store.RadarCandidate) string {
+	if candidate.SourceRole != "community_discovery" || len(candidate.Discovery) == 0 {
+		return candidate.Publisher
+	}
+	parsed, err := url.Parse(candidate.URL)
+	if err != nil || parsed.Hostname() == "" {
+		return "Original source"
+	}
+	return strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
+}
+
+func radarDeveloperContext(category string) string {
+	switch radar.Category(category) {
+	case radar.CategorySecurity:
+		return "Check whether affected software, dependencies, or services appear in systems you operate, then review the source for impact and remediation details."
+	case radar.CategoryRelease:
+		return "If you use this project, review compatibility, migration, and deployment notes before adopting the release."
+	case radar.CategoryResearch:
+		return "This may indicate a useful new technique or result, but research claims still need methodology and real-world validation before production use."
+	case radar.CategoryPricing:
+		return "This may change architecture or provider decisions where operating cost is an important constraint."
+	case radar.CategoryFunding:
+		return "Funding can affect a company's hiring, product roadmap, and ability to maintain or expand its technology."
+	case radar.CategoryPartnership:
+		return "The practical value depends on what the integration makes available to developers and whether it changes existing workflows."
+	case radar.CategoryIndustry:
+		return "This may influence technology adoption, regulation, company strategy, or the tools available to engineering teams."
+	case radar.CategoryDiscussion:
+		return "Community discussion can reveal operational experience and trade-offs that do not appear in official documentation."
+	case radar.CategoryEngineering:
+		return "The implementation details may contain reusable architecture, reliability, performance, or migration lessons."
+	default:
+		return "Review the concrete capabilities, availability, and limitations to decide whether this changes tools or systems relevant to you."
+	}
 }
 
 func (service *Service) notifyQuota(ctx context.Context, job store.Job) {

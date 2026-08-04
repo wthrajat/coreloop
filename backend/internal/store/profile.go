@@ -61,17 +61,20 @@ func (store *Store) Profile(ctx context.Context, userID string) (LearningProfile
 
 func (store *Store) Preferences(ctx context.Context, userID string) (Preferences, error) {
 	var preferences Preferences
-	var radar, weekends int
+	var radar, radarWeekends, weekends int
 	var paused sql.NullString
 	err := store.database.QueryRowContext(ctx, `SELECT lesson_minutes, explanation_depth, lessons_per_day,
-		radar_enabled, recall_mode, weekends_enabled, bundle_mode, time_zone, paused_until
+		radar_enabled, radar_items_per_day, radar_weekends_enabled, recall_mode, weekends_enabled,
+		bundle_mode, time_zone, paused_until
 		FROM learning_preferences WHERE user_id=?`, userID).Scan(&preferences.LessonMinutes,
-		&preferences.ExplanationDepth, &preferences.LessonsPerDay, &radar, &preferences.RecallMode,
-		&weekends, &preferences.BundleMode, &preferences.TimeZone, &paused)
+		&preferences.ExplanationDepth, &preferences.LessonsPerDay, &radar, &preferences.RadarItemsPerDay,
+		&radarWeekends, &preferences.RecallMode, &weekends, &preferences.BundleMode, &preferences.TimeZone, &paused)
 	if err != nil {
 		return Preferences{}, err
 	}
-	preferences.RadarEnabled, preferences.WeekendsEnabled = radar == 1, weekends == 1
+	preferences.RadarEnabled = radar == 1
+	preferences.RadarWeekendsEnabled = radarWeekends == 1
+	preferences.WeekendsEnabled = weekends == 1
 	if paused.Valid {
 		value, err := parseTimestamp(paused.String)
 		if err != nil {
@@ -129,11 +132,13 @@ func (store *Store) UpdatePreferences(ctx context.Context, userID string, prefer
 		paused = timestamp(*preferences.PausedUntil)
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE learning_preferences SET lesson_minutes=?, explanation_depth=?,
-		lessons_per_day=?, radar_enabled=?, recall_mode=?, weekends_enabled=?, bundle_mode=?, time_zone=?,
-		paused_until=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE user_id=?`,
+		lessons_per_day=?, radar_enabled=?, radar_items_per_day=?, radar_weekends_enabled=?, recall_mode=?,
+		weekends_enabled=?, bundle_mode=?, time_zone=?, paused_until=?,
+		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE user_id=?`,
 		preferences.LessonMinutes, preferences.ExplanationDepth, preferences.LessonsPerDay,
-		boolInt(preferences.RadarEnabled), preferences.RecallMode, boolInt(preferences.WeekendsEnabled),
-		preferences.BundleMode, preferences.TimeZone, paused, userID)
+		boolInt(preferences.RadarEnabled), preferences.RadarItemsPerDay,
+		boolInt(preferences.RadarWeekendsEnabled), preferences.RecallMode,
+		boolInt(preferences.WeekendsEnabled), preferences.BundleMode, preferences.TimeZone, paused, userID)
 	if err != nil {
 		return err
 	}

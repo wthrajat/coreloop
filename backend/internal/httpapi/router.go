@@ -434,6 +434,9 @@ func validatePreferences(value store.Preferences) error {
 	if value.LessonsPerDay < 1 || value.LessonsPerDay > 6 {
 		return errors.New("lessons_per_day must be between 1 and 6")
 	}
+	if value.RadarItemsPerDay < 0 || value.RadarItemsPerDay > 50 {
+		return errors.New("radar_items_per_day must be between 0 and 50")
+	}
 	if len(value.DeliveryTimes) != value.LessonsPerDay {
 		return errors.New("delivery_times must match lessons_per_day")
 	}

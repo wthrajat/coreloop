@@ -308,8 +308,8 @@ export function LearningSettings({
           </div>
           <label className="toggle-row">
             <span>
-              <strong>Send on weekends</strong>
-              <small>Keep Saturday and Sunday active.</small>
+              <strong>Send lessons on weekends</strong>
+              <small>Keep lesson delivery active on Saturday and Sunday.</small>
             </span>
             <input
               checked={preferences.weekends_enabled}
@@ -323,14 +323,44 @@ export function LearningSettings({
             <span>
               <strong>Current-tech radar</strong>
               <small>
-                Ranked official updates arrive outside lesson windows, with no
-                daily cap.
+                Receive source-backed technology updates independently of
+                lessons.
               </small>
             </span>
             <input
               checked={preferences.radar_enabled}
               onChange={(event) =>
                 update("radar_enabled", event.target.checked)
+              }
+              type="checkbox"
+            />
+          </label>
+          <label className="field">
+            <span>Radar updates per day</span>
+            <input
+              max={50}
+              min={0}
+              onChange={(event) =>
+                update("radar_items_per_day", Number(event.target.value))
+              }
+              step={1}
+              type="number"
+              value={preferences.radar_items_per_day}
+            />
+            <small>Choose 1–50, or set 0 for unlimited updates.</small>
+          </label>
+          <label className="toggle-row">
+            <span>
+              <strong>Send Radar updates on weekends</strong>
+              <small>
+                Keep technology news active on Saturday and Sunday, independent
+                of lesson delivery.
+              </small>
+            </span>
+            <input
+              checked={preferences.radar_weekends_enabled}
+              onChange={(event) =>
+                update("radar_weekends_enabled", event.target.checked)
               }
               type="checkbox"
             />

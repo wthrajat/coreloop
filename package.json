@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.ts",
     "test:go": "GOCACHE=$PWD/.cache/go-build GOENV=off go test ./api/... ./backend/... ./cmd/... ./migrations/...",
-    "test:schema": "sqlite3 :memory: '.read migrations/0001_initial.sql' '.read migrations/0002_production.sql' '.read migrations/0003_seed_catalog.sql' 'PRAGMA foreign_key_check;'",
+    "test:schema": "sqlite3 :memory: '.read migrations/0001_initial.sql' '.read migrations/0002_production.sql' '.read migrations/0003_seed_catalog.sql' '.read migrations/0004_radar_quality.sql' 'PRAGMA foreign_key_check;'",
     "migrate": "go run ./backend/cmd/migrate",
     "admin": "go run ./backend/cmd/admin",
     "format": "prettier --write .",

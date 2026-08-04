@@ -44,17 +44,19 @@ type LearningProfile struct {
 }
 
 type Preferences struct {
-	LessonMinutes    int        `json:"lesson_minutes"`
-	ExplanationDepth string     `json:"explanation_depth"`
-	LessonsPerDay    int        `json:"lessons_per_day"`
-	RadarEnabled     bool       `json:"radar_enabled"`
-	RecallMode       string     `json:"recall_mode"`
-	WeekendsEnabled  bool       `json:"weekends_enabled"`
-	BundleMode       string     `json:"bundle_mode"`
-	TimeZone         string     `json:"time_zone"`
-	PausedUntil      *time.Time `json:"paused_until,omitempty"`
-	DeliveryTimes    []string   `json:"delivery_times"`
-	TopicIDs         []string   `json:"topic_ids"`
+	LessonMinutes        int        `json:"lesson_minutes"`
+	ExplanationDepth     string     `json:"explanation_depth"`
+	LessonsPerDay        int        `json:"lessons_per_day"`
+	RadarEnabled         bool       `json:"radar_enabled"`
+	RadarItemsPerDay     int        `json:"radar_items_per_day"`
+	RadarWeekendsEnabled bool       `json:"radar_weekends_enabled"`
+	RecallMode           string     `json:"recall_mode"`
+	WeekendsEnabled      bool       `json:"weekends_enabled"`
+	BundleMode           string     `json:"bundle_mode"`
+	TimeZone             string     `json:"time_zone"`
+	PausedUntil          *time.Time `json:"paused_until,omitempty"`
+	DeliveryTimes        []string   `json:"delivery_times"`
+	TopicIDs             []string   `json:"topic_ids"`
 }
 
 type Topic struct {

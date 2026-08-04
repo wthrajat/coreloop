@@ -9,9 +9,11 @@ It is invite-only, supports independent profiles, and is designed to run on free
 service tiers without maintaining a traditional server.
 
 #### Overview
+
 ![Coreloop overview](assets/images/dashboard.png)
 
 #### Onboarding and Configs
+
 ![Coreloop onboarding and learning configuration](assets/images/onboarding.png)
 
 ## What it does

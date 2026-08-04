@@ -31,6 +31,8 @@ export type Preferences = {
   explanation_depth: "foundation" | "standard" | "detailed";
   lessons_per_day: number;
   radar_enabled: boolean;
+  radar_items_per_day: number;
+  radar_weekends_enabled: boolean;
   recall_mode: "off" | "light" | "standard";
   weekends_enabled: boolean;
   bundle_mode: "complete" | "continue_after_intro";

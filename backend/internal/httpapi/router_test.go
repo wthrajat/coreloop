@@ -89,3 +89,30 @@ func TestTriggerLessonNowUsesAuthenticatedUser(t *testing.T) {
 		t.Fatalf("unexpected trigger input: %#v", jobService)
 	}
 }
+
+func TestValidatePreferencesRejectsInvalidRadarItemsPerDay(t *testing.T) {
+	preferences := store.Preferences{
+		LessonMinutes:    15,
+		ExplanationDepth: "standard",
+		LessonsPerDay:    1,
+		RecallMode:       "light",
+		BundleMode:       "complete",
+		TimeZone:         "Asia/Kolkata",
+		DeliveryTimes:    []string{"20:30"},
+		TopicIDs:         []string{"topic_backend"},
+	}
+
+	for _, itemsPerDay := range []int{-1, 51} {
+		preferences.RadarItemsPerDay = itemsPerDay
+		if err := validatePreferences(preferences); err == nil {
+			t.Fatalf("expected radar_items_per_day=%d to be rejected", itemsPerDay)
+		}
+	}
+
+	for _, itemsPerDay := range []int{0, 8, 50} {
+		preferences.RadarItemsPerDay = itemsPerDay
+		if err := validatePreferences(preferences); err != nil {
+			t.Fatalf("expected radar_items_per_day=%d to be accepted: %v", itemsPerDay, err)
+		}
+	}
+}
