@@ -67,14 +67,7 @@ func verifySignature(parts []string, key string) bool {
 	if key == "" {
 		return false
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(key)
-	if err != nil {
-		decoded, err = base64.StdEncoding.DecodeString(key)
-	}
-	if err != nil {
-		decoded = []byte(key)
-	}
-	mac := hmac.New(sha256.New, decoded)
+	mac := hmac.New(sha256.New, []byte(key))
 	_, _ = mac.Write([]byte(parts[0] + "." + parts[1]))
 	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return hmac.Equal([]byte(expected), []byte(parts[2]))
