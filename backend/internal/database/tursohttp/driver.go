@@ -269,8 +269,10 @@ type statement struct {
 }
 
 type argument struct {
-	Type  string `json:"type"`
-	Value string `json:"value,omitempty"`
+	Type string `json:"type"`
+	// Value is a wire union: text/integer use strings and float uses a number.
+	Value  any     `json:"value,omitempty"`
+	Base64 *string `json:"base64,omitempty"`
 }
 
 type pipelineResponse struct {
@@ -365,62 +367,89 @@ func encodeArgument(value any) (argument, error) {
 		return argument{Type: "null"}, nil
 	case bool:
 		if typed {
-			return argument{Type: "integer", Value: "1"}, nil
+			return argumentWithValue("integer", "1"), nil
 		}
-		return argument{Type: "integer", Value: "0"}, nil
+		return argumentWithValue("integer", "0"), nil
 	case []byte:
-		return argument{Type: "blob", Value: base64.StdEncoding.EncodeToString(typed)}, nil
+		encoded := base64.RawStdEncoding.EncodeToString(typed)
+		return argument{Type: "blob", Base64: &encoded}, nil
 	case string:
-		return argument{Type: "text", Value: typed}, nil
+		return argumentWithValue("text", typed), nil
 	case time.Time:
-		return argument{Type: "text", Value: typed.UTC().Format(time.RFC3339Nano)}, nil
+		return argumentWithValue("text", typed.UTC().Format(time.RFC3339Nano)), nil
 	case int:
-		return argument{Type: "integer", Value: strconv.FormatInt(int64(typed), 10)}, nil
+		return argumentWithValue("integer", strconv.FormatInt(int64(typed), 10)), nil
 	case int8:
-		return argument{Type: "integer", Value: strconv.FormatInt(int64(typed), 10)}, nil
+		return argumentWithValue("integer", strconv.FormatInt(int64(typed), 10)), nil
 	case int16:
-		return argument{Type: "integer", Value: strconv.FormatInt(int64(typed), 10)}, nil
+		return argumentWithValue("integer", strconv.FormatInt(int64(typed), 10)), nil
 	case int32:
-		return argument{Type: "integer", Value: strconv.FormatInt(int64(typed), 10)}, nil
+		return argumentWithValue("integer", strconv.FormatInt(int64(typed), 10)), nil
 	case int64:
-		return argument{Type: "integer", Value: strconv.FormatInt(typed, 10)}, nil
+		return argumentWithValue("integer", strconv.FormatInt(typed, 10)), nil
 	case uint:
-		return argument{Type: "integer", Value: strconv.FormatUint(uint64(typed), 10)}, nil
+		return argumentWithValue("integer", strconv.FormatUint(uint64(typed), 10)), nil
 	case uint8:
-		return argument{Type: "integer", Value: strconv.FormatUint(uint64(typed), 10)}, nil
+		return argumentWithValue("integer", strconv.FormatUint(uint64(typed), 10)), nil
 	case uint16:
-		return argument{Type: "integer", Value: strconv.FormatUint(uint64(typed), 10)}, nil
+		return argumentWithValue("integer", strconv.FormatUint(uint64(typed), 10)), nil
 	case uint32:
-		return argument{Type: "integer", Value: strconv.FormatUint(uint64(typed), 10)}, nil
+		return argumentWithValue("integer", strconv.FormatUint(uint64(typed), 10)), nil
 	case uint64:
 		if typed > uint64(^uint64(0)>>1) {
 			return argument{}, errors.New("integer exceeds SQLite range")
 		}
-		return argument{Type: "integer", Value: strconv.FormatUint(typed, 10)}, nil
+		return argumentWithValue("integer", strconv.FormatUint(typed, 10)), nil
 	case float32:
-		return argument{Type: "float", Value: strconv.FormatFloat(float64(typed), 'g', -1, 64)}, nil
+		return argumentWithValue("float", float64(typed)), nil
 	case float64:
-		return argument{Type: "float", Value: strconv.FormatFloat(typed, 'g', -1, 64)}, nil
+		return argumentWithValue("float", typed), nil
 	default:
 		return argument{}, fmt.Errorf("unsupported SQL argument type %T", value)
 	}
 }
 
+func argumentWithValue(argumentType string, value any) argument {
+	return argument{Type: argumentType, Value: value}
+}
+
 func decodeArgument(value argument) (driver.Value, error) {
-	switch value.Type {
-	case "null":
+	if value.Type == "null" {
 		return nil, nil
+	}
+
+	switch value.Type {
 	case "text":
-		return value.Value, nil
+		return stringArgumentValue(value)
 	case "integer":
-		return strconv.ParseInt(value.Value, 10, 64)
+		encoded, err := stringArgumentValue(value)
+		if err != nil {
+			return nil, err
+		}
+		return strconv.ParseInt(encoded, 10, 64)
 	case "float":
-		return strconv.ParseFloat(value.Value, 64)
+		encoded, ok := value.Value.(float64)
+		if !ok {
+			return nil, fmt.Errorf("Turso value type %q has an invalid value", value.Type)
+		}
+		return encoded, nil
 	case "blob":
-		return base64.StdEncoding.DecodeString(value.Value)
+		if value.Base64 == nil {
+			return nil, errors.New("Turso value type \"blob\" is missing its base64 value")
+		}
+		encoded := strings.TrimRight(*value.Base64, "=")
+		return base64.RawStdEncoding.DecodeString(encoded)
 	default:
 		return nil, fmt.Errorf("unsupported Turso value type %q", value.Type)
 	}
+}
+
+func stringArgumentValue(value argument) (string, error) {
+	encoded, ok := value.Value.(string)
+	if !ok {
+		return "", fmt.Errorf("Turso value type %q has an invalid value", value.Type)
+	}
+	return encoded, nil
 }
 
 func pipelineURL(databaseURL string) (string, error) {

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql/driver"
+	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"testing"
 )
 
@@ -30,7 +32,7 @@ func TestOpenExecutesPipelineWithTypedArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	result, err := database.ExecContext(context.Background(), "INSERT INTO test VALUES (?, ?)", "value", 7)
+	result, err := database.ExecContext(context.Background(), "INSERT INTO test VALUES (?, ?, ?)", "value", 7, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,11 +43,68 @@ func TestOpenExecutesPipelineWithTypedArguments(t *testing.T) {
 	if !bytes.Contains(received, []byte(`"type":"integer","value":"7"`)) {
 		t.Fatalf("typed integer was not encoded: %s", received)
 	}
+	if !bytes.Contains(received, []byte(`"type":"text","value":""`)) {
+		t.Fatalf("empty text was not encoded: %s", received)
+	}
 }
 
 func TestDecodeArgument(t *testing.T) {
-	value, err := decodeArgument(argument{Type: "integer", Value: "42"})
-	if err != nil || value != driver.Value(int64(42)) {
-		t.Fatalf("value=%v err=%v", value, err)
+	testCases := []struct {
+		name string
+		json string
+		want driver.Value
+	}{
+		{name: "integer", json: `{"type":"integer","value":"42"}`, want: int64(42)},
+		{name: "float", json: `{"type":"float","value":1.25}`, want: float64(1.25)},
+		{name: "empty text", json: `{"type":"text","value":""}`, want: ""},
+		{name: "blob", json: `{"type":"blob","base64":"+w"}`, want: []byte{251}},
+		{name: "null", json: `{"type":"null"}`, want: nil},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var encoded argument
+			if err := json.Unmarshal([]byte(testCase.json), &encoded); err != nil {
+				t.Fatal(err)
+			}
+			value, err := decodeArgument(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(value, testCase.want) {
+				t.Fatalf("value = %#v, want %#v", value, testCase.want)
+			}
+		})
+	}
+}
+
+func TestEncodeArgumentUsesHranaWireFormat(t *testing.T) {
+	testCases := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{name: "text", value: "", want: `{"type":"text","value":""}`},
+		{name: "empty blob", value: []byte{}, want: `{"type":"blob","base64":""}`},
+		{name: "blob", value: []byte{251}, want: `{"type":"blob","base64":"+w"}`},
+		{name: "float", value: 1.25, want: `{"type":"float","value":1.25}`},
+		{name: "zero float", value: 0.0, want: `{"type":"float","value":0}`},
+		{name: "null", value: nil, want: `{"type":"null"}`},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			argumentValue, err := encodeArgument(testCase.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(argumentValue)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(encoded) != testCase.want {
+				t.Fatalf("encoded argument = %s, want %s", encoded, testCase.want)
+			}
+		})
 	}
 }
