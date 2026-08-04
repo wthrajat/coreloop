@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"coreloop/backend/internal/content"
 )
 
 type OpenAICompatible struct {
@@ -19,7 +21,11 @@ type OpenAICompatible struct {
 	http     *http.Client
 }
 
-const groqFreeTierCompletionBudget = 6_500
+const (
+	groqFreeTierTokenBudget      = 8_000
+	groqFreeTierCompletionBudget = 6_500
+	groqTokenBudgetReserve       = 250
+)
 
 func NewGroq(apiKey, model string, client *http.Client) *OpenAICompatible {
 	return newOpenAICompatible("groq", "https://api.groq.com/openai/v1/chat/completions", apiKey, model, client)
@@ -43,13 +49,21 @@ func (provider *OpenAICompatible) Configured() bool {
 }
 
 func (provider *OpenAICompatible) Generate(ctx context.Context, system, input string, schema map[string]any, outputBudget int) (Response, error) {
+	generationSystem, responseFormat, err := provider.outputContract(system, schema)
+	if err != nil {
+		return Response{}, err
+	}
 	payload := map[string]any{
-		"model":    provider.model,
-		"messages": []map[string]string{{"role": "system", "content": system}, {"role": "user", "content": input}},
-		"response_format": map[string]any{"type": "json_schema", "json_schema": map[string]any{
-			"name": "lesson_draft", "strict": true, "schema": schema,
-		}},
-		"max_completion_tokens": provider.completionBudget(outputBudget),
+		"model": provider.model,
+		"messages": []map[string]string{
+			{"role": "system", "content": generationSystem},
+			{"role": "user", "content": input},
+		},
+		"response_format":       responseFormat,
+		"max_completion_tokens": provider.completionBudget(outputBudget, generationSystem, input),
+	}
+	if provider.provider == "groq" {
+		payload["reasoning_effort"] = "low"
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -104,9 +118,38 @@ func (provider *OpenAICompatible) Generate(ctx context.Context, system, input st
 		CachedTokens: decoded.Usage.PromptDetails.CachedTokens}, nil
 }
 
-func (provider *OpenAICompatible) completionBudget(requested int) int {
-	if provider.provider == "groq" && requested > groqFreeTierCompletionBudget {
-		return groqFreeTierCompletionBudget
+func (provider *OpenAICompatible) outputContract(system string, schema map[string]any) (string, map[string]any, error) {
+	if provider.provider != "groq" {
+		return system, map[string]any{"type": "json_schema", "json_schema": map[string]any{
+			"name": "lesson_draft", "strict": true, "schema": schema,
+		}}, nil
+	}
+	encodedSchema, err := json.Marshal(schema)
+	if err != nil {
+		return "", nil, fmt.Errorf("encode Groq output schema: %w", err)
+	}
+	contract := system +
+		"\nReturn one JSON object containing every required property in this schema: " +
+		string(encodedSchema)
+	return contract, map[string]any{"type": "json_object"}, nil
+}
+
+func (provider *OpenAICompatible) completionBudget(requested int, system, input string) int {
+	if provider.provider != "groq" {
+		return requested
+	}
+	available := groqFreeTierTokenBudget -
+		content.EstimateTokens(system) -
+		content.EstimateTokens(input) -
+		groqTokenBudgetReserve
+	if available < requested {
+		requested = available
+	}
+	if requested > groqFreeTierCompletionBudget {
+		requested = groqFreeTierCompletionBudget
+	}
+	if requested < 1 {
+		return 1
 	}
 	return requested
 }

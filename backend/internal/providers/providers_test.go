@@ -23,6 +23,13 @@ type blockingProvider struct {
 	calls int
 }
 
+type delayedProvider struct {
+	name     string
+	delay    time.Duration
+	response any
+	calls    int
+}
+
 func (provider *blockingProvider) Name() string { return provider.name }
 func (*blockingProvider) Model() string         { return "test" }
 func (*blockingProvider) Configured() bool      { return true }
@@ -30,6 +37,33 @@ func (provider *blockingProvider) Generate(ctx context.Context, _ string, _ stri
 	provider.calls++
 	<-ctx.Done()
 	return Response{}, &Error{Provider: provider.name, Kind: FailureTransient, Message: "request timed out", Cause: ctx.Err()}
+}
+
+func (provider *delayedProvider) Name() string { return provider.name }
+func (*delayedProvider) Model() string         { return "test" }
+func (*delayedProvider) Configured() bool      { return true }
+func (provider *delayedProvider) Generate(
+	ctx context.Context,
+	_ string,
+	_ string,
+	_ map[string]any,
+	_ int,
+) (Response, error) {
+	provider.calls++
+	timer := time.NewTimer(provider.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return Response{}, &Error{
+			Provider: provider.name,
+			Kind:     FailureTransient,
+			Message:  "request timed out",
+			Cause:    ctx.Err(),
+		}
+	case <-timer.C:
+	}
+	encoded, _ := json.Marshal(provider.response)
+	return Response{Body: encoded}, nil
 }
 
 func (provider *fakeProvider) Name() string     { return provider.name }
@@ -77,6 +111,51 @@ func TestRouterPreservesTimeForGeminiWhenGroqHangs(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
 		t.Fatalf("fallback took %s", elapsed)
+	}
+}
+
+func TestRouterGivesTheFinalFallbackMoreTime(t *testing.T) {
+	groq := &fakeProvider{name: "groq", configured: true, responses: []any{
+		&Error{Provider: "groq", Kind: FailurePermanent, Message: "structured output rejected"},
+	}}
+	gemini := &delayedProvider{
+		name: "gemini", delay: 40 * time.Millisecond, response: validProviderDraft(),
+	}
+	router := NewRouter(groq, gemini, nil)
+	router.freeAttemptTimeout = 10 * time.Millisecond
+	router.finalFreeAttemptTimeout = 100 * time.Millisecond
+
+	generated, err := router.Generate(context.Background(), content.LessonContext{Minutes: 15})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.Provider != "gemini" || gemini.calls != 1 {
+		t.Fatalf("fallback result = %#v, Gemini calls = %d", generated, gemini.calls)
+	}
+}
+
+func TestRouterDeliversAUsableDraftWhenItsCorrectionRequestFails(t *testing.T) {
+	partial := content.LessonDraft{
+		Title: "A useful partial lesson", Motivation: "Why this matters", Definition: "A precise definition",
+		Mechanics: []string{"The core mechanism"}, EstimatedMinutes: 15,
+	}
+	groq := &fakeProvider{name: "groq", configured: true, responses: []any{
+		partial,
+		&Error{Provider: "groq", Kind: FailureTransient, Message: "correction timed out"},
+	}}
+
+	generated, err := NewRouter(groq, nil, nil).Generate(
+		context.Background(),
+		content.LessonContext{Minutes: 15},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groq.calls != 2 || generated.Draft.Title != partial.Title {
+		t.Fatalf("generated = %#v, provider calls = %d", generated, groq.calls)
+	}
+	if generated.VerificationState != "unverified_warning" || generated.Warning == "" {
+		t.Fatalf("usable correction fallback was not marked with a warning: %#v", generated)
 	}
 }
 

@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
+
+	"coreloop/backend/internal/content"
 )
 
 type providerRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -23,18 +26,70 @@ func TestGroqRequestFitsTheFreeTierTPMLimit(t *testing.T) {
 	})}
 
 	provider := NewGroq("secret", "openai/gpt-oss-20b", client)
-	if _, err := provider.Generate(context.Background(), "system", "input", map[string]any{"type": "object"}, 8_000); err != nil {
+	if _, err := provider.Generate(context.Background(), "system", "input", content.JSONSchema(), 8_000); err != nil {
 		t.Fatal(err)
 	}
 
 	var payload struct {
-		MaxCompletionTokens int `json:"max_completion_tokens"`
+		MaxCompletionTokens int    `json:"max_completion_tokens"`
+		ReasoningEffort     string `json:"reasoning_effort"`
+		ResponseFormat      struct {
+			Type string `json:"type"`
+		} `json:"response_format"`
+		Messages []struct {
+			Content string `json:"content"`
+		} `json:"messages"`
 	}
 	if err := json.Unmarshal(requestBody, &payload); err != nil {
 		t.Fatal(err)
 	}
 	if payload.MaxCompletionTokens != 6_500 {
 		t.Fatalf("Groq completion budget = %d, want 6500", payload.MaxCompletionTokens)
+	}
+	if payload.ReasoningEffort != "low" {
+		t.Fatalf("Groq reasoning effort = %q, want low", payload.ReasoningEffort)
+	}
+	if payload.ResponseFormat.Type != "json_object" {
+		t.Fatalf("Groq response format = %q, want json_object", payload.ResponseFormat.Type)
+	}
+	if len(payload.Messages) != 2 ||
+		!strings.Contains(payload.Messages[0].Content, "every required property") ||
+		!strings.Contains(payload.Messages[0].Content, `"production_example"`) ||
+		!strings.Contains(payload.Messages[0].Content, `"uncertainty"`) {
+		t.Fatalf("Groq system contract was not included: %#v", payload.Messages)
+	}
+	promptTokens := content.EstimateTokens(payload.Messages[0].Content) +
+		content.EstimateTokens(payload.Messages[1].Content)
+	if promptTokens+payload.MaxCompletionTokens+groqTokenBudgetReserve > groqFreeTierTokenBudget {
+		t.Fatalf("Groq request budget = %d, exceeds %d", promptTokens+payload.MaxCompletionTokens+groqTokenBudgetReserve, groqFreeTierTokenBudget)
+	}
+}
+
+func TestOpenAIKeepsStrictStructuredOutput(t *testing.T) {
+	var requestBody []byte
+	client := &http.Client{Transport: providerRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestBody, _ = io.ReadAll(request.Body)
+		return jsonResponse(request, `{"id":"request-1","choices":[{"message":{"content":"{}"}}]}`), nil
+	})}
+
+	provider := NewOpenAI("secret", "gpt-test", client)
+	if _, err := provider.Generate(context.Background(), "system", "input", map[string]any{"type": "object"}, 4_500); err != nil {
+		t.Fatal(err)
+	}
+
+	var payload struct {
+		ResponseFormat struct {
+			Type       string `json:"type"`
+			JSONSchema struct {
+				Strict bool `json:"strict"`
+			} `json:"json_schema"`
+		} `json:"response_format"`
+	}
+	if err := json.Unmarshal(requestBody, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ResponseFormat.Type != "json_schema" || !payload.ResponseFormat.JSONSchema.Strict {
+		t.Fatalf("OpenAI response format = %#v", payload.ResponseFormat)
 	}
 }
 
