@@ -20,7 +20,7 @@ type SourceRecord struct {
 
 type RadarCandidate struct {
 	ID, UserID, SourceItemID, TopicID, Publisher, SourceRole string
-	Title, URL, Summary, Category                            string
+	Title, URL, Summary, Category, RankerVersion             string
 	Discovery                                                []radar.SourceReference
 	Score                                                    float64
 	PublishedAt                                              time.Time
@@ -256,15 +256,28 @@ func (store *Store) RankSourceItem(ctx context.Context, itemID string, now time.
 		}
 		adjustedScore := math.Max(0, math.Min(1, selectedBreakdown.Total+selectedTopic.FeedbackWeight))
 		selectedBreakdown.Total = math.Round(adjustedScore*1000) / 1000
+		decision := radar.DecideEditorialEligibility(radar.ScoreInput{
+			Title: item.Title, Summary: item.Summary, TopicTerms: selectedTopic.Terms,
+			SourceTier: tier, PublishedAgeHours: now.Sub(item.PublishedAt).Hours(),
+			Category: category, CommunityPoints: communityPoints,
+			CommunityComments:         communityComments,
+			CommunitySignalsAvailable: communityAvailable,
+		}, selectedBreakdown)
 		breakdown, _ := json.Marshal(map[string]any{
 			"ranker": radar.RankerVersion, "category": category,
-			"scores": selectedBreakdown,
+			"scores": selectedBreakdown, "editorial_decision": decision,
 		})
+		candidateState := "rejected"
+		var rejectionReason any = decision.Reason
+		if decision.Eligible {
+			candidateState = "pending"
+			rejectionReason = nil
+		}
 		candidateID := mustID("rad")
 		var actualID, status string
 		err := store.database.QueryRowContext(ctx, `INSERT INTO radar_candidates
 			(id,user_id,source_item_id,topic_id,ranker_version,relevance_score,
-			 score_breakdown_json,status)
+			 score_breakdown_json,status,rejection_reason)
 			VALUES (?,?,?,?,?,?,?,CASE
 				WHEN EXISTS (SELECT 1 FROM radar_candidates previous
 					WHERE previous.user_id=? AND previous.source_item_id=? AND previous.status='delivered')
@@ -272,16 +285,20 @@ func (store *Store) RankSourceItem(ctx context.Context, itemID string, now time.
 				WHEN EXISTS (SELECT 1 FROM radar_candidates previous
 					WHERE previous.user_id=? AND previous.source_item_id=? AND previous.status='skipped')
 					THEN 'skipped'
-				ELSE 'pending' END)
+				ELSE ? END,?)
 			ON CONFLICT(user_id,source_item_id,ranker_version) DO UPDATE SET
 				topic_id=excluded.topic_id,relevance_score=excluded.relevance_score,
 				score_breakdown_json=excluded.score_breakdown_json,
 				status=CASE WHEN radar_candidates.status IN ('delivered','skipped','qualified')
-					THEN radar_candidates.status ELSE 'pending' END,
+					THEN radar_candidates.status ELSE excluded.status END,
+				rejection_reason=CASE
+					WHEN radar_candidates.status IN ('delivered','skipped','qualified')
+					THEN radar_candidates.rejection_reason ELSE excluded.rejection_reason END,
 				updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 			RETURNING id,status`,
 			candidateID, user.ID, itemID, selectedTopic.TopicID, radar.RankerVersion,
-			selectedBreakdown.Total, string(breakdown), user.ID, itemID, user.ID, itemID).
+			selectedBreakdown.Total, string(breakdown), user.ID, itemID, user.ID, itemID,
+			candidateState, rejectionReason).
 			Scan(&actualID, &status)
 		if err != nil {
 			return nil, err
@@ -404,19 +421,45 @@ func (store *Store) CompleteRadar(ctx context.Context, userID, candidateID, stat
 	return tx.Commit()
 }
 
+func (store *Store) RejectRadar(
+	ctx context.Context,
+	userID string,
+	candidateID string,
+	reason string,
+	now time.Time,
+) error {
+	result, err := store.database.ExecContext(ctx, `UPDATE radar_candidates
+		SET status='rejected',rejection_reason=?,updated_at=?
+		WHERE id=? AND user_id=? AND status IN ('pending','qualified')`,
+		reason, timestamp(now), candidateID, userID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (store *Store) RadarCandidate(ctx context.Context, candidateID string) (RadarCandidate, error) {
 	var candidate RadarCandidate
-	var published sql.NullString
+	var published string
 	var evidence, discovery string
 	err := store.database.QueryRowContext(ctx, `SELECT rc.id,rc.user_id,rc.source_item_id,
 		COALESCE(rc.topic_id,''),s.publisher,s.source_role,si.title,si.normalized_url,
-		si.evidence_json,si.category,si.discovery_json,rc.relevance_score,si.published_at
+		si.evidence_json,si.category,si.discovery_json,rc.relevance_score,
+		COALESCE(si.published_at,si.retrieved_at),rc.ranker_version
 		FROM radar_candidates rc JOIN source_items si ON si.id=rc.source_item_id
 		JOIN sources s ON s.id=si.source_id
 		WHERE rc.id=? AND rc.status='qualified'`, candidateID).
 		Scan(&candidate.ID, &candidate.UserID, &candidate.SourceItemID, &candidate.TopicID,
 			&candidate.Publisher, &candidate.SourceRole, &candidate.Title, &candidate.URL,
-			&evidence, &candidate.Category, &discovery, &candidate.Score, &published)
+			&evidence, &candidate.Category, &discovery, &candidate.Score, &published,
+			&candidate.RankerVersion)
 	if err != nil {
 		return candidate, err
 	}
@@ -426,8 +469,6 @@ func (store *Store) RadarCandidate(ctx context.Context, candidateID string) (Rad
 	_ = json.Unmarshal([]byte(evidence), &evidenceValue)
 	candidate.Summary = evidenceValue.Summary
 	_ = json.Unmarshal([]byte(discovery), &candidate.Discovery)
-	if published.Valid {
-		candidate.PublishedAt, _ = parseTimestamp(published.String)
-	}
+	candidate.PublishedAt, _ = parseTimestamp(published)
 	return candidate, nil
 }

@@ -13,7 +13,7 @@ import (
 	"coreloop/backend/internal/store"
 )
 
-const radarEnrichmentVersion = "simple-neutral-v1"
+const radarEnrichmentVersion = "simple-neutral-v2"
 const maximumRadarAIInputRunes = 6_000
 
 // radarBriefingContent is deliberately fail-open. Every cache, provider,

@@ -497,18 +497,28 @@ func (service *Service) deliverRadar(ctx context.Context, job store.Job) error {
 		}
 		return err
 	}
+	now := service.now()
+	rejectionReason := radarDeliveryRejectionReason(candidate, now)
+	if rejectionReason != "" {
+		slog.InfoContext(ctx, "Radar delivery suppressed", "job_id", job.ID,
+			"candidate_id", candidate.ID, "reason", rejectionReason,
+			"published_at", candidate.PublishedAt.UTC())
+		return service.store.RejectRadar(
+			ctx, candidate.UserID, candidate.ID, rejectionReason, now,
+		)
+	}
 	sourceName := radarSourceName(candidate)
 	summary, whyItMatters := service.radarBriefingContent(ctx, candidate)
-	briefing, err := radar.RenderBriefing(radar.BriefingInput{
+	briefing, err := radar.RenderCompactBriefing(radar.BriefingInput{
 		Category: radar.Category(candidate.Category), Title: candidate.Title,
 		Summary: summary, WhyItMatters: whyItMatters,
 		Source:        radar.SourceReference{Name: sourceName, URL: candidate.URL},
 		DiscoveredVia: candidate.Discovery,
-	})
+	}, telegram.SafeChunkCharacters)
 	if err != nil {
 		return fmt.Errorf("render deterministic Radar briefing: %w", err)
 	}
-	parts := telegram.ChunkHTML([]string{html.EscapeString(briefing)}, "")
+	parts := []string{html.EscapeString(briefing)}
 	bundle, err := service.store.PrepareRadarDelivery(
 		ctx, candidate.UserID, candidate.ID, job.ID, parts, service.now(),
 	)
@@ -566,6 +576,19 @@ func radarSourceName(candidate store.RadarCandidate) string {
 		return "Original source"
 	}
 	return strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
+}
+
+func radarDeliveryRejectionReason(candidate store.RadarCandidate, now time.Time) string {
+	switch {
+	case candidate.RankerVersion != radar.RankerVersion:
+		return "superseded_ranking_policy"
+	case candidate.Score < radar.MinimumDeliveryScore:
+		return "below_editorial_threshold"
+	case candidate.PublishedAt.Before(now.Add(-radar.MaximumItemAge)):
+		return "outside_freshness_window"
+	default:
+		return ""
+	}
 }
 
 func radarDeveloperContext(category string) string {

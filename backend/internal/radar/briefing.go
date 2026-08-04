@@ -2,8 +2,10 @@ package radar
 
 import (
 	"errors"
+	"html"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 type SourceReference struct {
@@ -18,6 +20,11 @@ type BriefingInput struct {
 	WhyItMatters  string
 	Source        SourceReference
 	DiscoveredVia []SourceReference
+}
+
+type briefingTextLimits struct {
+	Summary int
+	Context int
 }
 
 var callToAction = regexp.MustCompile(`(?i)^\s*(?:learn more|read more|read the (?:full|official) (?:article|post|source)|click here|sign up|register now|register today|get started|contact sales|try (?:it|this) (?:now|today)|watch now|download (?:it )?today|visit .+ to learn more)\b`)
@@ -86,6 +93,115 @@ func RenderBriefing(input BriefingInput) (string, error) {
 		sections = append(sections, "Discovered via\n"+additionalSources)
 	}
 	return strings.Join(sections, "\n\n"), nil
+}
+
+// RenderCompactBriefing preserves one source-backed news item inside one
+// delivery message. Release notices are intentionally terse; incidents,
+// research, and engineering articles retain more useful evidence.
+func RenderCompactBriefing(input BriefingInput, maximumEscapedRunes int) (string, error) {
+	if maximumEscapedRunes <= 0 {
+		return "", errors.New("briefing character limit must be positive")
+	}
+	category := input.Category
+	if category == "" {
+		category = Classify(input.Title, input.Summary)
+	}
+	limits := compactBriefingLimits(category)
+	input.Summary = truncateNeutralText(input.Summary, limits.Summary)
+	input.WhyItMatters = truncateNeutralText(input.WhyItMatters, limits.Context)
+
+	briefing, err := RenderBriefing(input)
+	if err != nil {
+		return "", err
+	}
+	if escapedRuneCount(briefing) <= maximumEscapedRunes {
+		return briefing, nil
+	}
+
+	// Scale both optional sections down together. The required category,
+	// headline, publisher, and source URL always remain intact.
+	originalSummary := input.Summary
+	originalContext := input.WhyItMatters
+	bestInput := input
+	bestInput.Summary = ""
+	bestInput.WhyItMatters = ""
+	best, err := RenderBriefing(bestInput)
+	if err != nil {
+		return "", err
+	}
+	if escapedRuneCount(best) > maximumEscapedRunes {
+		// Discovery links are useful provenance but secondary to the original
+		// source. Drop them before sacrificing the explanatory sections.
+		input.DiscoveredVia = nil
+		bestInput.DiscoveredVia = nil
+		best, err = RenderBriefing(bestInput)
+		if err != nil {
+			return "", err
+		}
+		if escapedRuneCount(best) > maximumEscapedRunes {
+			return "", errors.New("required briefing fields exceed character limit")
+		}
+	}
+	low, high := 0.0, 1.0
+	for range 18 {
+		scale := (low + high) / 2
+		candidateInput := input
+		candidateInput.Summary = truncateNeutralText(
+			originalSummary, int(float64(utf8.RuneCountInString(originalSummary))*scale),
+		)
+		candidateInput.WhyItMatters = truncateNeutralText(
+			originalContext, int(float64(utf8.RuneCountInString(originalContext))*scale),
+		)
+		candidate, renderErr := RenderBriefing(candidateInput)
+		if renderErr != nil {
+			return "", renderErr
+		}
+		if escapedRuneCount(candidate) <= maximumEscapedRunes {
+			best, low = candidate, scale
+		} else {
+			high = scale
+		}
+	}
+	return best, nil
+}
+
+func compactBriefingLimits(category Category) briefingTextLimits {
+	switch category {
+	case CategoryRelease:
+		return briefingTextLimits{Summary: 600, Context: 220}
+	case CategorySecurity, CategoryIndustry:
+		return briefingTextLimits{Summary: 1_500, Context: 450}
+	case CategoryEngineering, CategoryResearch, CategoryDiscussion:
+		return briefingTextLimits{Summary: 1_400, Context: 450}
+	default:
+		return briefingTextLimits{Summary: 800, Context: 280}
+	}
+}
+
+func truncateNeutralText(value string, maximumRunes int) string {
+	value = NeutralText(value)
+	if value == "" || maximumRunes <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maximumRunes {
+		return value
+	}
+	if maximumRunes == 1 {
+		return "…"
+	}
+	cut := maximumRunes - 1
+	for index := cut; index > cut/2; index-- {
+		if runes[index-1] == ' ' || runes[index-1] == '\n' {
+			cut = index - 1
+			break
+		}
+	}
+	return strings.TrimSpace(string(runes[:cut])) + "…"
+}
+
+func escapedRuneCount(value string) int {
+	return utf8.RuneCountInString(html.EscapeString(value))
 }
 
 func renderAdditionalSources(sources []SourceReference, primarySourceURL string) string {

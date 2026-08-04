@@ -8,12 +8,14 @@ import (
 	"math"
 	"sort"
 	"time"
+
+	"coreloop/backend/internal/radar"
 )
 
 const (
 	maximumRadarReleasesPerPass = 50
 	maximumUnlimitedReleasePass = 20
-	radarCandidateMaxAge        = 14 * 24 * time.Hour
+	radarCandidateMaxAge        = radar.MaximumItemAge
 )
 
 type radarReleaseUser struct {
@@ -33,6 +35,18 @@ type radarReleaseCandidate struct {
 // transaction so a process failure cannot leave a qualified item without a
 // wakeable job.
 func (store *Store) ReleaseRadarCandidates(ctx context.Context, now time.Time) (int, error) {
+	if _, err := store.database.ExecContext(ctx, `UPDATE radar_candidates
+		SET status='rejected',rejection_reason='superseded_ranking_policy',updated_at=?
+		WHERE status='pending' AND ranker_version<>?`,
+		timestamp(now), radar.RankerVersion); err != nil {
+		return 0, err
+	}
+	if _, err := store.database.ExecContext(ctx, `UPDATE radar_candidates
+		SET status='rejected',rejection_reason='below_editorial_threshold',updated_at=?
+		WHERE status='pending' AND ranker_version=? AND relevance_score<?`,
+		timestamp(now), radar.RankerVersion, radar.MinimumDeliveryScore); err != nil {
+		return 0, err
+	}
 	if _, err := store.database.ExecContext(ctx, `UPDATE radar_candidates
 		SET status='rejected',rejection_reason='expired_before_release',updated_at=?
 		WHERE status='pending' AND source_item_id IN (
@@ -156,9 +170,11 @@ func (store *Store) releaseRadarForUser(
 		FROM radar_candidates rc
 		JOIN source_items si ON si.id=rc.source_item_id
 		WHERE rc.user_id=? AND rc.status='pending'
+			AND rc.ranker_version=? AND rc.relevance_score>=?
 			AND COALESCE(si.published_at,si.retrieved_at)>=?
 		ORDER BY rc.relevance_score DESC,rc.created_at,rc.id LIMIT ?`,
-		user.ID, timestamp(now.Add(-radarCandidateMaxAge)), candidatePoolLimit)
+		user.ID, radar.RankerVersion, radar.MinimumDeliveryScore,
+		timestamp(now.Add(-radarCandidateMaxAge)), candidatePoolLimit)
 	if err != nil {
 		return 0, err
 	}

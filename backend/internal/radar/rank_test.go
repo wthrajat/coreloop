@@ -77,3 +77,99 @@ func TestCalculateScoreUsesCommunityInterestOnlyWhenAvailable(t *testing.T) {
 		t.Fatalf("unknown community signal = %f, want neutral 0.5", unknown.CommunityInterest)
 	}
 }
+
+func TestEditorialDecisionSuppressesRoutineCVEBulletins(t *testing.T) {
+	input := ScoreInput{
+		Title:             "CVE-2026-12345 security advisory",
+		Summary:           "A security update is available for Example Runtime 3.2.",
+		TopicTerms:        []string{"security", "runtime", "backend engineering"},
+		SourceTier:        1,
+		PublishedAgeHours: 2,
+		Category:          CategorySecurity,
+	}
+	decision := DecideEditorialEligibility(input, CalculateScore(input))
+	if decision.Eligible || decision.Reason != "routine_security_bulletin" {
+		t.Fatalf("routine CVE decision = %#v", decision)
+	}
+}
+
+func TestEditorialDecisionSuppressesRoutineAdvisoryDigests(t *testing.T) {
+	input := ScoreInput{
+		Title:             "CISA releases seven industrial control systems advisories",
+		Summary:           "The advisories describe vulnerabilities and updates for critical infrastructure operators.",
+		TopicTerms:        []string{"security", "infrastructure", "reliability"},
+		SourceTier:        1,
+		PublishedAgeHours: 2,
+		Category:          CategorySecurity,
+	}
+	decision := DecideEditorialEligibility(input, CalculateScore(input))
+	if decision.Eligible || decision.Reason != "routine_security_bulletin" {
+		t.Fatalf("routine advisory decision = %#v", decision)
+	}
+}
+
+func TestEditorialDecisionKeepsUrgentSecurityIncidents(t *testing.T) {
+	input := ScoreInput{
+		Title:   "Critical CVE-2026-12345 is actively exploited",
+		Summary: "The vulnerability permits remote code execution in a widely used runtime.",
+		TopicTerms: []string{
+			"security", "runtime", "backend engineering", "reliability",
+		},
+		SourceTier:        1,
+		PublishedAgeHours: 2,
+		Category:          CategorySecurity,
+	}
+	score := CalculateScore(input)
+	decision := DecideEditorialEligibility(input, score)
+	if !decision.Eligible {
+		t.Fatalf("urgent security incident was suppressed: score=%#v decision=%#v", score, decision)
+	}
+}
+
+func TestEditorialDecisionSuppressesRoutineRegionalAvailability(t *testing.T) {
+	input := ScoreInput{
+		Title:             "Compute instances now available in Europe (Paris) region",
+		Summary:           "The existing instance type adds another cloud region.",
+		TopicTerms:        []string{"cloud", "infrastructure", "backend engineering"},
+		SourceTier:        1,
+		PublishedAgeHours: 2,
+		Category:          CategoryProductUpdate,
+	}
+	decision := DecideEditorialEligibility(input, CalculateScore(input))
+	if decision.Eligible || decision.Reason != "routine_regional_availability" {
+		t.Fatalf("regional availability decision = %#v", decision)
+	}
+}
+
+func TestEditorialDecisionKeepsHighValueEngineeringWork(t *testing.T) {
+	input := ScoreInput{
+		Title:   "How we redesigned database replication after a production outage",
+		Summary: "A postmortem explains the architecture, failure mode, migration, observability, and reliability trade-offs.",
+		TopicTerms: []string{
+			"database", "architecture", "reliability", "backend engineering",
+		},
+		SourceTier:        2,
+		PublishedAgeHours: 8,
+		Category:          CategoryEngineering,
+	}
+	score := CalculateScore(input)
+	decision := DecideEditorialEligibility(input, score)
+	if !decision.Eligible {
+		t.Fatalf("high-value engineering item was suppressed: score=%#v decision=%#v", score, decision)
+	}
+}
+
+func TestEditorialDecisionRejectsItemsOlderThanTenDays(t *testing.T) {
+	input := ScoreInput{
+		Title:             "Major runtime architecture release",
+		Summary:           "The release changes the compiler, performance, and deployment model.",
+		TopicTerms:        []string{"runtime", "compiler", "performance", "deployment"},
+		SourceTier:        1,
+		PublishedAgeHours: MaximumItemAge.Hours() + 1,
+		Category:          CategoryRelease,
+	}
+	decision := DecideEditorialEligibility(input, CalculateScore(input))
+	if decision.Eligible || decision.Reason != "outside_freshness_window" {
+		t.Fatalf("stale item decision = %#v", decision)
+	}
+}

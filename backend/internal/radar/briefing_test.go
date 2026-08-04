@@ -1,8 +1,10 @@
 package radar
 
 import (
+	"html"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestNeutralTextRemovesMarketingButKeepsFacts(t *testing.T) {
@@ -55,5 +57,54 @@ func TestRenderBriefingRequiresOriginalSource(t *testing.T) {
 	_, err := RenderBriefing(BriefingInput{Title: "News", Source: SourceReference{Name: "Example"}})
 	if err == nil {
 		t.Fatal("RenderBriefing() unexpectedly accepted a missing source URL")
+	}
+}
+
+func TestCompactBriefingKeepsVersionReleasesShortAndSourced(t *testing.T) {
+	detail := strings.Repeat(
+		"This release changes compatibility, deployment, performance, and runtime behavior. ",
+		80,
+	)
+	got, err := RenderCompactBriefing(BriefingInput{
+		Category:     CategoryRelease,
+		Title:        "Example Runtime 4.2.1 released",
+		Summary:      detail,
+		WhyItMatters: "Teams using this runtime should review compatibility and migration notes before upgrading.",
+		Source: SourceReference{
+			Name: "Example Runtime", URL: "https://example.com/releases/4.2.1",
+		},
+	}, 3_900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if utf8.RuneCountInString(got) > 1_100 {
+		t.Fatalf("version release is too long: %d runes", utf8.RuneCountInString(got))
+	}
+	if !strings.Contains(got, "https://example.com/releases/4.2.1") {
+		t.Fatalf("compact briefing lost its source:\n%s", got)
+	}
+}
+
+func TestCompactBriefingUsesEscapedTelegramLimit(t *testing.T) {
+	got, err := RenderCompactBriefing(BriefingInput{
+		Category:     CategoryEngineering,
+		Title:        "Storage & replication incident",
+		Summary:      strings.Repeat("Queues < workers & retries > timeouts. ", 200),
+		WhyItMatters: strings.Repeat("This explains reliability & recovery trade-offs. ", 40),
+		Source: SourceReference{
+			Name: "Engineering & Reliability", URL: "https://example.com/incident",
+		},
+	}, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	escaped := html.EscapeString(got)
+	if count := utf8.RuneCountInString(escaped); count > 900 {
+		t.Fatalf("escaped briefing has %d runes, want at most 900", count)
+	}
+	for _, required := range []string{"Storage & replication incident", "Engineering & Reliability", "https://example.com/incident"} {
+		if !strings.Contains(got, required) {
+			t.Fatalf("compact briefing lost %q:\n%s", required, got)
+		}
 	}
 }

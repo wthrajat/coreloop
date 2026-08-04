@@ -30,6 +30,12 @@ func TestRadarReleaseIntervalSpreadsFiniteTargetAcrossTheDay(t *testing.T) {
 	}
 }
 
+func TestRadarCandidatesExpireAfterTenDays(t *testing.T) {
+	if radarCandidateMaxAge != 10*24*time.Hour {
+		t.Fatalf("Radar candidate max age = %s, want 10 days", radarCandidateMaxAge)
+	}
+}
+
 func TestDiverseRadarCandidatesStillFillsFromOneSource(t *testing.T) {
 	pool := []radarReleaseCandidate{
 		{ID: "source-1", SourceID: "source", Score: 0.9},

@@ -5,17 +5,20 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"coreloop/backend/internal/radar"
+	"coreloop/backend/internal/store"
 	"coreloop/backend/internal/telegram"
 )
 
-func TestDeterministicRadarBriefingReachesMultipartTelegramContract(t *testing.T) {
+func TestDeterministicRadarBriefingAlwaysFitsOneTelegramMessage(t *testing.T) {
 	detail := strings.Repeat(
 		"The release changes request routing, deployment compatibility, observability, and rollback behavior for production services. ",
 		45,
 	)
-	briefing, err := radar.RenderBriefing(radar.BriefingInput{
+	briefing, err := radar.RenderCompactBriefing(radar.BriefingInput{
 		Category: radar.CategoryRelease,
 		Title:    "Runtime 2.0 is generally available",
 		Summary: "We are thrilled to announce a world-class release. " + detail +
@@ -27,7 +30,7 @@ func TestDeterministicRadarBriefingReachesMultipartTelegramContract(t *testing.T
 		DiscoveredVia: []radar.SourceReference{{
 			Name: "Hacker News discussion", URL: "https://news.ycombinator.com/item?id=42",
 		}},
-	})
+	}, telegram.SafeChunkCharacters)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,14 +44,12 @@ func TestDeterministicRadarBriefingReachesMultipartTelegramContract(t *testing.T
 		!strings.Contains(briefing, "https://news.ycombinator.com/item?id=42") {
 		t.Fatalf("briefing is missing source provenance: %s", briefing)
 	}
-	parts := telegram.ChunkHTML([]string{html.EscapeString(briefing)}, "")
-	if len(parts) < 2 {
-		t.Fatalf("detailed Radar briefing was not split: %d part(s)", len(parts))
+	message := html.EscapeString(briefing)
+	if strings.TrimSpace(message) == "" {
+		t.Fatal("Radar message is empty")
 	}
-	for index, part := range parts {
-		if strings.TrimSpace(part) == "" {
-			t.Fatalf("part %d is empty", index+1)
-		}
+	if got := utf8.RuneCountInString(message); got > telegram.SafeChunkCharacters {
+		t.Fatalf("Radar message has %d escaped runes, limit %d", got, telegram.SafeChunkCharacters)
 	}
 }
 
@@ -79,5 +80,34 @@ func TestRadarAIInputIsBounded(t *testing.T) {
 	}
 	if len([]rune(source)) <= len([]rune(compact)) {
 		t.Fatal("test source was not longer than the AI input budget")
+	}
+}
+
+func TestRadarDeliveryRechecksRankingPolicyAndFreshness(t *testing.T) {
+	now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	candidate := store.RadarCandidate{
+		RankerVersion: radar.RankerVersion,
+		Score:         radar.MinimumDeliveryScore,
+		PublishedAt:   now.Add(-radar.MaximumItemAge),
+	}
+	if reason := radarDeliveryRejectionReason(candidate, now); reason != "" {
+		t.Fatalf("boundary candidate rejected: %s", reason)
+	}
+
+	candidate.PublishedAt = candidate.PublishedAt.Add(-time.Second)
+	if reason := radarDeliveryRejectionReason(candidate, now); reason != "outside_freshness_window" {
+		t.Fatalf("stale candidate reason = %q", reason)
+	}
+
+	candidate.PublishedAt = now
+	candidate.RankerVersion = "deterministic-editorial-v2"
+	if reason := radarDeliveryRejectionReason(candidate, now); reason != "superseded_ranking_policy" {
+		t.Fatalf("old-ranker candidate reason = %q", reason)
+	}
+
+	candidate.RankerVersion = radar.RankerVersion
+	candidate.Score = radar.MinimumDeliveryScore - 0.001
+	if reason := radarDeliveryRejectionReason(candidate, now); reason != "below_editorial_threshold" {
+		t.Fatalf("low-score candidate reason = %q", reason)
 	}
 }

@@ -5,9 +5,17 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
-const RankerVersion = "deterministic-editorial-v2"
+const RankerVersion = "deterministic-editorial-v3"
+
+const MaximumItemAge = 10 * 24 * time.Hour
+
+// MinimumDeliveryScore is a defensive release threshold. EditorialDecision
+// applies more specific quality rules before a candidate reaches the queue,
+// while the release store uses this value to avoid draining weak backlogs.
+const MinimumDeliveryScore = 0.58
 
 const (
 	significanceWeight      = 0.25
@@ -34,6 +42,23 @@ var impactTerms = map[string]bool{
 	"migration": true, "outage": true, "standard": true,
 	"vulnerability": true,
 }
+
+var urgentSecurityTerms = map[string]bool{
+	"actively": true, "critical": true, "exploited": true,
+	"ransomware": true, "rce": true, "remote": true,
+	"wormable": true,
+}
+
+var cvePattern = regexp.MustCompile(`(?i)\bCVE-\d{4}-\d+\b`)
+var routineSecurityPattern = regexp.MustCompile(`(?i)\b(?:security advisor(?:y|ies)|security bulletin|security update|ICS advisor(?:y|ies)|vulnerabilit(?:y|ies)(?: notice)?)\b`)
+var urgentSecurityPattern = regexp.MustCompile(
+	`(?i)\b(?:actively exploited|known exploited|exploitation observed|public exploit|` +
+		`in the wild|critical(?:[- ]severity| vulnerability| flaw| bug| issue| CVE)|` +
+		`rated critical|CVSS\s+(?:9|10)(?:\.\d)?|high[- ]severity|zero[- ]day|` +
+		`remote code execution|arbitrary code execution|RCE|authentication bypass|` +
+		`privilege escalation|emergency patch|ransomware|supply[- ]chain attack|wormable)\b`,
+)
+var regionalAvailabilityPattern = regexp.MustCompile(`(?i)(?:\b(?:now available|available)\s+in\b.{0,100}\bregions?\b|\bregional availability\b|\bnew regions?\b)`)
 
 var developerTerms = map[string]bool{
 	"ai": true, "api": true, "architecture": true, "benchmark": true,
@@ -70,6 +95,14 @@ type ScoreBreakdown struct {
 	CommunityInterest float64 `json:"community_interest"`
 	Recency           float64 `json:"recency"`
 	Total             float64 `json:"total"`
+}
+
+// EditorialDecision explains whether a ranked item is strong enough to enter
+// the delivery backlog. A daily target is a ceiling, not a requirement to send
+// weak items.
+type EditorialDecision struct {
+	Eligible bool   `json:"eligible"`
+	Reason   string `json:"reason"`
 }
 
 // Score is retained for existing callers. New integrations should use
@@ -115,6 +148,33 @@ func CalculateScore(input ScoreInput) ScoreBreakdown {
 	return breakdown
 }
 
+// DecideEditorialEligibility suppresses deterministic low-signal patterns and
+// then applies the general score threshold. It deliberately does not require
+// AI, so Radar quality remains stable when provider quota is unavailable.
+func DecideEditorialEligibility(input ScoreInput, score ScoreBreakdown) EditorialDecision {
+	documentText := strings.TrimSpace(input.Title + " " + input.Summary)
+	category := input.Category
+	if category == "" {
+		category = Classify(input.Title, input.Summary)
+	}
+	if input.PublishedAgeHours > MaximumItemAge.Hours() {
+		return EditorialDecision{Reason: "outside_freshness_window"}
+	}
+
+	if category == CategorySecurity &&
+		(cvePattern.MatchString(documentText) || routineSecurityPattern.MatchString(documentText)) &&
+		!urgentSecurityPattern.MatchString(documentText) {
+		return EditorialDecision{Reason: "routine_security_bulletin"}
+	}
+	if category == CategoryProductUpdate && regionalAvailabilityPattern.MatchString(documentText) {
+		return EditorialDecision{Reason: "routine_regional_availability"}
+	}
+	if score.Total < MinimumDeliveryScore {
+		return EditorialDecision{Reason: "below_editorial_threshold"}
+	}
+	return EditorialDecision{Eligible: true, Reason: "high_editorial_value"}
+}
+
 func Keywords(values ...string) []string {
 	set := terms(strings.Join(values, " "))
 	output := make([]string, 0, len(set))
@@ -137,7 +197,7 @@ func terms(value string) map[string]bool {
 
 func significance(category Category, document map[string]bool) float64 {
 	base := map[Category]float64{
-		CategorySecurity:      0.85,
+		CategorySecurity:      0.62,
 		CategoryResearch:      0.75,
 		CategoryRelease:       0.72,
 		CategoryEngineering:   0.68,
@@ -151,7 +211,11 @@ func significance(category Category, document map[string]bool) float64 {
 	if base == 0 {
 		base = 0.5
 	}
-	return clamp(base + math.Min(0.2, float64(countTerms(document, impactTerms))*0.05))
+	impactBonus := math.Min(0.2, float64(countTerms(document, impactTerms))*0.05)
+	if category == CategorySecurity {
+		impactBonus += math.Min(0.25, float64(countTerms(document, urgentSecurityTerms))*0.05)
+	}
+	return clamp(base + impactBonus)
 }
 
 func topicRelevance(document map[string]bool, topicTerms []string) float64 {
