@@ -4,11 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"coreloop/backend/internal/ids"
 )
+
+// ErrJobNotLeasable means a duplicate wake found an existing job that another
+// worker owns or that the durable queue has already rescheduled or finished.
+var ErrJobNotLeasable = errors.New("job is not currently leasable")
 
 func (store *Store) EnqueueJob(ctx context.Context, userID, assignmentID, jobType string, dueAt time.Time, idempotencyKey string, payload any) (string, error) {
 	encoded, err := json.Marshal(payload)
@@ -188,10 +193,10 @@ func (store *Store) LeaseJob(ctx context.Context, jobID, owner string, now time.
 		if err != nil {
 			return Job{}, err
 		}
-		if state == "completed" {
-			return Job{ID: jobID, State: state}, tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return Job{}, err
 		}
-		return Job{}, sql.ErrNoRows
+		return Job{ID: jobID, State: state}, ErrJobNotLeasable
 	}
 	row := tx.QueryRowContext(ctx, `SELECT id,sequence,COALESCE(user_id,''),COALESCE(assignment_id,''),job_type,state,due_at,attempt_count,max_attempts,idempotency_key,payload_json FROM job_queue WHERE id=?`, jobID)
 	job, err := scanJob(row)

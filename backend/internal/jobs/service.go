@@ -82,11 +82,14 @@ func dispatchDeduplicationID(jobID string) string {
 func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	now := service.now()
 	job, err := service.store.LeaseJob(ctx, jobID, workerID, now)
-	if err != nil {
-		return err
-	}
-	if job.State == "completed" {
+	if errors.Is(err, store.ErrJobNotLeasable) {
 		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lease job: %w", err)
+	}
+	if job.State != "leased" {
+		return fmt.Errorf("lease job returned unexpected state %q", job.State)
 	}
 	err = service.execute(ctx, job)
 	if err == nil {
@@ -103,7 +106,7 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	if quota {
 		service.notifyQuota(ctx, job)
 	}
-	return err
+	return fmt.Errorf("execute %s job: %w", job.Type, err)
 }
 
 func (service *Service) execute(ctx context.Context, job store.Job) error {

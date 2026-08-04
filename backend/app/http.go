@@ -3,6 +3,7 @@ package app
 import (
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 
 	"coreloop/backend/internal/alerts"
@@ -30,13 +31,20 @@ type runtime struct {
 var runtimeOnce sync.Once
 var shared runtime
 
-func dependencies() runtime {
+func dependencies(component string) runtime {
 	runtimeOnce.Do(func() {
 		configuration := config.FromEnv()
 		shared.configuration = configuration
 		if err := configuration.ValidateRuntime(); err != nil {
 			shared.err = err
-			slog.Warn("runtime is not fully configured", "error", err)
+			slog.Warn(
+				"runtime is not fully configured",
+				"component", component,
+				"app_environment", configuration.Environment,
+				"vercel_environment", os.Getenv("VERCEL_ENV"),
+				"build_version", configuration.BuildVersion,
+				"error", err,
+			)
 			return
 		}
 		database, err := tursohttp.Open(configuration.TursoURL, configuration.TursoToken, nil)
@@ -60,7 +68,7 @@ func dependencies() runtime {
 }
 
 func NewHTTPHandler(buildVersion string) http.Handler {
-	value := dependencies()
+	value := dependencies("application API")
 	if buildVersion == "" {
 		buildVersion = value.configuration.BuildVersion
 	}
@@ -68,14 +76,14 @@ func NewHTTPHandler(buildVersion string) http.Handler {
 }
 
 func NewJobsHandler() http.Handler {
-	value := dependencies()
+	value := dependencies("QStash job worker")
 	if value.jobs == nil {
 		return httpapi.NewNotReadyHandler("QStash job worker")
 	}
 	return httpapi.NewJobsRouter(httpapi.JobsConfig{AppOrigin: value.configuration.AppOrigin, Receiver: value.receiver, Jobs: value.jobs})
 }
 func NewTelegramHandler() http.Handler {
-	value := dependencies()
+	value := dependencies("Telegram webhook")
 	if value.telegram == nil {
 		return httpapi.NewNotReadyHandler("Telegram webhook")
 	}
