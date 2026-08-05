@@ -134,7 +134,7 @@ func TestRouterGivesTheFinalFallbackMoreTime(t *testing.T) {
 	}
 }
 
-func TestRouterDeliversAUsableDraftWhenItsCorrectionRequestFails(t *testing.T) {
+func TestRouterRejectsAnIncompleteDraftWhenItsCorrectionRequestFails(t *testing.T) {
 	partial := content.LessonDraft{
 		Title: "A useful partial lesson", Motivation: "Why this matters", Definition: "A precise definition",
 		Mechanics: []string{"The core mechanism"}, EstimatedMinutes: 15,
@@ -144,18 +144,46 @@ func TestRouterDeliversAUsableDraftWhenItsCorrectionRequestFails(t *testing.T) {
 		&Error{Provider: "groq", Kind: FailureTransient, Message: "correction timed out"},
 	}}
 
-	generated, err := NewRouter(groq, nil, nil).Generate(
+	_, err := NewRouter(groq, nil, nil).Generate(
+		context.Background(),
+		content.LessonContext{Minutes: 15},
+	)
+	if err == nil {
+		t.Fatal("expected the incomplete draft to be rejected")
+	}
+	if groq.calls != 2 {
+		t.Fatalf("provider calls = %d, want one generation and one correction", groq.calls)
+	}
+}
+
+func TestRouterFallsBackAfterAnIncompleteProviderDraft(t *testing.T) {
+	partial := content.LessonDraft{
+		Title: "A partial lesson", Motivation: "Why this matters",
+		Definition: "A definition", Mechanics: []string{"One mechanism"},
+		EstimatedMinutes: 15,
+	}
+	groq := &fakeProvider{name: "groq", configured: true, responses: []any{
+		partial,
+		&Error{Provider: "groq", Kind: FailureTransient, Message: "correction timed out"},
+	}}
+	gemini := &fakeProvider{name: "gemini", configured: true, responses: []any{
+		validProviderDraft(),
+	}}
+
+	generated, err := NewRouter(groq, gemini, nil).Generate(
 		context.Background(),
 		content.LessonContext{Minutes: 15},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if groq.calls != 2 || generated.Draft.Title != partial.Title {
-		t.Fatalf("generated = %#v, provider calls = %d", generated, groq.calls)
-	}
-	if generated.VerificationState != "unverified_warning" || generated.Warning == "" {
-		t.Fatalf("usable correction fallback was not marked with a warning: %#v", generated)
+	if generated.Provider != "gemini" || groq.calls != 2 || gemini.calls != 1 {
+		t.Fatalf(
+			"provider = %q, Groq calls = %d, Gemini calls = %d",
+			generated.Provider,
+			groq.calls,
+			gemini.calls,
+		)
 	}
 }
 

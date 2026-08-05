@@ -7,9 +7,10 @@ import (
 )
 
 func RenderSections(draft LessonDraft) []string {
-	var sections []string
-	sections = append(sections,
-		"<b>"+escape(draft.Title)+"</b>\n<i>Estimated reading time: "+fmt.Sprint(draft.EstimatedMinutes)+" minutes</i>",
+	sections := []string{
+		"<b>" + escape(draft.Title) + "</b>\n<i>Estimated reading time: " + fmt.Sprint(draft.EstimatedMinutes) + " minutes</i>",
+	}
+	for _, rendered := range []string{
 		section("Why this matters", draft.Motivation),
 		listSection("What existed before", draft.PriorApproaches),
 		section("What it is", draft.Definition),
@@ -28,7 +29,11 @@ func RenderSections(draft LessonDraft) []string {
 		section("Career relevance", draft.CareerRelevance),
 		section("Interview answer", draft.InterviewAnswer),
 		section("Recall question", draft.RecallQuestion),
-	)
+	} {
+		if rendered != "" {
+			sections = append(sections, rendered)
+		}
+	}
 	if len(draft.Uncertainty) > 0 {
 		sections = append(sections, listSection("Uncertainty", draft.Uncertainty))
 	}
@@ -47,13 +52,22 @@ func RenderSections(draft LessonDraft) []string {
 	return sections
 }
 
-func section(title, body string) string { return "<b>" + escape(title) + "</b>\n" + escape(body) }
+func section(title, body string) string {
+	body = escape(body)
+	if body == "" {
+		return ""
+	}
+	return "<b>" + escape(title) + "</b>\n" + body
+}
 func listSection(title string, values []string) string {
 	var items []string
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
 			items = append(items, "• "+escape(value))
 		}
+	}
+	if len(items) == 0 {
+		return ""
 	}
 	return "<b>" + escape(title) + "</b>\n" + strings.Join(items, "\n")
 }

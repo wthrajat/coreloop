@@ -94,13 +94,14 @@ func TestGeneratedLessonReachesTelegramContract(t *testing.T) {
 func deliveryContractDraft() content.LessonDraft {
 	detail := strings.Repeat(
 		"precise engineering detail with production tradeoffs and failure analysis ",
-		12,
+		20,
 	)
+	developed := []string{detail, detail, detail, detail}
 	return content.LessonDraft{
 		Title: "A production lesson", EstimatedMinutes: 15, Motivation: detail,
-		PriorApproaches: []string{detail}, Definition: detail, Mechanics: []string{detail},
-		ProductionExample: detail, Tradeoffs: []string{detail}, FailureModes: []string{detail},
-		WhenNotToUse: []string{detail}, Alternatives: []string{detail}, Security: detail,
+		PriorApproaches: developed, Definition: detail, Mechanics: developed,
+		ProductionExample: detail, Tradeoffs: developed, FailureModes: developed,
+		WhenNotToUse: developed, Alternatives: developed, Security: detail,
 		Reliability: detail, Performance: detail, Cost: detail, PresentMaturity: detail,
 		FutureDirection: detail, CareerRelevance: detail, InterviewAnswer: detail,
 		RecallQuestion: "Which tradeoff would you evaluate first?",

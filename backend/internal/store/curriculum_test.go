@@ -1,8 +1,13 @@
 package store
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
+	"time"
+
+	"coreloop/backend/internal/content"
 )
 
 func TestLessonPlanContextCarriesThemeProgression(t *testing.T) {
@@ -25,5 +30,28 @@ func TestLessonPlanContextCarriesThemeProgression(t *testing.T) {
 	}
 	if !reflect.DeepEqual(lessonContext.Prerequisites, []string{"Transactions"}) {
 		t.Fatalf("prerequisites = %#v", lessonContext.Prerequisites)
+	}
+}
+
+func TestSaveGeneratedLessonRejectsIncompleteContentBeforeDatabaseWrites(t *testing.T) {
+	dataStore := &Store{}
+	plan := LessonPlan{
+		Preferences: Preferences{LessonMinutes: 30},
+	}
+	generated := content.Generated{Draft: content.LessonDraft{
+		Title: "A partial lesson", EstimatedMinutes: 30,
+		Motivation: "Only the opening was generated.",
+	}}
+
+	_, _, err := dataStore.SaveGeneratedLesson(
+		context.Background(),
+		plan,
+		generated,
+		[]string{"<b>A partial lesson</b>"},
+		"cache-key",
+		time.Now(),
+	)
+	if !errors.Is(err, ErrIncompleteLesson) {
+		t.Fatalf("save error = %v, want ErrIncompleteLesson", err)
 	}
 }

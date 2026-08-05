@@ -21,12 +21,36 @@ func TestDiverseRadarCandidatesPrefersSourceBreadth(t *testing.T) {
 	}
 }
 
-func TestRadarReleaseIntervalSpreadsFiniteTargetAcrossTheDay(t *testing.T) {
-	if got := radarReleaseInterval(8); got != 3*time.Hour {
-		t.Fatalf("8-item interval = %s", got)
+func TestRadarReleaseSlotsStayAnchoredWhenCronRunsLate(t *testing.T) {
+	location := time.FixedZone("Asia/Kolkata", 5*60*60+30*60)
+	lastReleased := time.Date(2026, time.August, 5, 10, 9, 0, 0, location)
+	// Twenty daily items create 72-minute slots. The current slot began at
+	// 10:48, so an 11:10 cron tick is due even though the previous release was
+	// only 61 minutes ago. A last-release-plus-interval calculation would drift.
+	localNow := time.Date(2026, time.August, 5, 11, 10, 0, 0, location)
+	if !radarReleaseSlotDue(lastReleased, localNow, 20) {
+		t.Fatal("late cron tick did not release in the current deterministic slot")
 	}
-	if got := radarReleaseInterval(0); got != 0 {
-		t.Fatalf("unlimited interval = %s", got)
+}
+
+func TestRadarReleaseSlotsAllowOnlyOneItemPerSlot(t *testing.T) {
+	location := time.FixedZone("Asia/Kolkata", 5*60*60+30*60)
+	localNow := time.Date(2026, time.August, 5, 11, 10, 0, 0, location)
+	lastReleased := time.Date(2026, time.August, 5, 10, 55, 0, 0, location)
+	if radarReleaseSlotDue(lastReleased, localNow, 20) {
+		t.Fatal("a second item was allowed in the same Radar slot")
+	}
+	if !radarReleaseSlotDue(lastReleased, localNow, 0) {
+		t.Fatal("unlimited Radar should not apply finite slot spacing")
+	}
+}
+
+func TestRadarReleaseSlotsResetAtTheLocalDayBoundary(t *testing.T) {
+	location := time.FixedZone("Asia/Kolkata", 5*60*60+30*60)
+	lastReleased := time.Date(2026, time.August, 4, 23, 58, 0, 0, location)
+	localNow := time.Date(2026, time.August, 5, 0, 4, 0, 0, location)
+	if !radarReleaseSlotDue(lastReleased, localNow, 20) {
+		t.Fatal("the first Radar slot of a new local day was not released")
 	}
 }
 

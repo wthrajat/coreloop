@@ -10,7 +10,7 @@ type Store struct {
 	database *sql.DB
 }
 
-const RequiredSchemaVersion = 8
+const RequiredSchemaVersion = 9
 
 func New(database *sql.DB) *Store {
 	return &Store{database: database}

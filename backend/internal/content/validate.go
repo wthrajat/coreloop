@@ -6,42 +6,7 @@ import (
 )
 
 func Validate(draft LessonDraft, requestedMinutes int, allowedEvidence []Evidence) ([]string, string) {
-	var problems []string
-	requiredStrings := map[string]string{
-		"title": draft.Title, "motivation": draft.Motivation, "definition": draft.Definition,
-		"production_example": draft.ProductionExample, "security": draft.Security, "reliability": draft.Reliability,
-		"performance": draft.Performance, "cost": draft.Cost, "present_maturity": draft.PresentMaturity,
-		"future_direction": draft.FutureDirection, "career_relevance": draft.CareerRelevance,
-		"interview_answer": draft.InterviewAnswer, "recall_question": draft.RecallQuestion,
-	}
-	for name, value := range requiredStrings {
-		if strings.TrimSpace(value) == "" {
-			problems = append(problems, name+" is empty")
-		}
-	}
-	requiredLists := map[string][]string{"prior_approaches": draft.PriorApproaches, "mechanics": draft.Mechanics,
-		"tradeoffs": draft.Tradeoffs, "failure_modes": draft.FailureModes, "when_not_to_use": draft.WhenNotToUse,
-		"alternatives": draft.Alternatives}
-	for name, values := range requiredLists {
-		if len(values) == 0 {
-			problems = append(problems, name+" is empty")
-		}
-	}
-	if requestedMinutes != 15 && requestedMinutes != 30 {
-		requestedMinutes = 15
-	}
-	if draft.EstimatedMinutes < requestedMinutes-5 || draft.EstimatedMinutes > requestedMinutes+10 {
-		problems = append(problems, fmt.Sprintf("estimated_minutes %d does not match the %d-minute preset", draft.EstimatedMinutes, requestedMinutes))
-	}
-	wordCount := lessonWordCount(draft)
-	minimumWords := minimumLessonWords(requestedMinutes)
-	if wordCount < minimumWords {
-		problems = append(problems, fmt.Sprintf(
-			"lesson is too short: %d words; the %d-minute preset needs at least %d",
-			wordCount, requestedMinutes, minimumWords,
-		))
-	}
-	problems = append(problems, validateSectionDepth(draft, requestedMinutes)...)
+	problems := ContentProblems(draft, requestedMinutes)
 	allowed := make(map[string]Evidence)
 	for _, evidence := range allowedEvidence {
 		allowed[evidence.ID] = evidence
@@ -85,6 +50,93 @@ func Validate(draft LessonDraft, requestedMinutes int, allowedEvidence []Evidenc
 		verification = "partially_verified"
 	}
 	return problems, verification
+}
+
+// ContentProblems contains only completeness and depth failures. Source and
+// verification problems are intentionally handled separately: a complete
+// lesson may be delivered with an explicit verification warning, but an empty
+// or shallow lesson must never reach Telegram.
+func ContentProblems(draft LessonDraft, requestedMinutes int) []string {
+	requestedMinutes = normalizedLessonMinutes(requestedMinutes)
+	var problems []string
+	for _, section := range []struct {
+		name  string
+		value string
+	}{
+		{"title", draft.Title},
+		{"motivation", draft.Motivation},
+		{"definition", draft.Definition},
+		{"production_example", draft.ProductionExample},
+		{"security", draft.Security},
+		{"reliability", draft.Reliability},
+		{"performance", draft.Performance},
+		{"cost", draft.Cost},
+		{"present_maturity", draft.PresentMaturity},
+		{"future_direction", draft.FutureDirection},
+		{"career_relevance", draft.CareerRelevance},
+		{"interview_answer", draft.InterviewAnswer},
+		{"recall_question", draft.RecallQuestion},
+	} {
+		if strings.TrimSpace(section.value) == "" {
+			problems = append(problems, section.name+" is empty")
+		}
+	}
+	for _, section := range []struct {
+		name   string
+		values []string
+	}{
+		{"prior_approaches", draft.PriorApproaches},
+		{"mechanics", draft.Mechanics},
+		{"tradeoffs", draft.Tradeoffs},
+		{"failure_modes", draft.FailureModes},
+		{"when_not_to_use", draft.WhenNotToUse},
+		{"alternatives", draft.Alternatives},
+	} {
+		itemCount := nonEmptyItemCount(section.values)
+		if itemCount == 0 {
+			problems = append(problems, section.name+" is empty")
+		}
+		if itemCount != len(section.values) {
+			problems = append(problems, section.name+" contains empty points")
+		}
+	}
+	if draft.EstimatedMinutes < requestedMinutes-5 || draft.EstimatedMinutes > requestedMinutes+10 {
+		problems = append(problems, fmt.Sprintf(
+			"estimated_minutes %d does not match the %d-minute preset",
+			draft.EstimatedMinutes,
+			requestedMinutes,
+		))
+	}
+	wordCount := lessonWordCount(draft)
+	minimumWords := minimumLessonWords(requestedMinutes)
+	if wordCount < minimumWords {
+		problems = append(problems, fmt.Sprintf(
+			"lesson is too short: %d words; the %d-minute preset needs at least %d",
+			wordCount, requestedMinutes, minimumWords,
+		))
+	}
+	return append(problems, validateSectionDepth(draft, requestedMinutes)...)
+}
+
+func DeliveryReady(draft LessonDraft, requestedMinutes int) bool {
+	return len(ContentProblems(draft, requestedMinutes)) == 0
+}
+
+func normalizedLessonMinutes(minutes int) int {
+	if minutes == 30 {
+		return 30
+	}
+	return 15
+}
+
+func nonEmptyItemCount(values []string) int {
+	count := 0
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 func minimumLessonWords(minutes int) int {
@@ -170,10 +222,11 @@ func validateSectionDepth(draft LessonDraft, minutes int) []string {
 		if len(requirement.Values) == 0 {
 			continue
 		}
-		if len(requirement.Values) < requirement.MinimumItems {
+		itemCount := nonEmptyItemCount(requirement.Values)
+		if itemCount < requirement.MinimumItems {
 			problems = append(problems, fmt.Sprintf(
 				"%s needs at least %d developed points for the %d-minute preset; got %d",
-				requirement.Name, requirement.MinimumItems, minutes, len(requirement.Values),
+				requirement.Name, requirement.MinimumItems, minutes, itemCount,
 			))
 		}
 		actual := wordCount(requirement.Values...)
@@ -206,9 +259,4 @@ func wordCount(values ...string) int {
 		count += len(strings.Fields(value))
 	}
 	return count
-}
-
-func Usable(draft LessonDraft) bool {
-	return strings.TrimSpace(draft.Title) != "" && strings.TrimSpace(draft.Motivation) != "" &&
-		strings.TrimSpace(draft.Definition) != "" && len(draft.Mechanics) > 0
 }

@@ -110,13 +110,30 @@ func (service *Service) Tick(ctx context.Context) error {
 	if err := service.store.EnqueueSourcePolls(ctx, now); err != nil {
 		return err
 	}
-	releasedRadar, err := service.store.ReleaseRadarCandidates(ctx, now)
+	radarRelease, err := service.store.ReleaseRadarCandidates(ctx, now)
 	if err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "Radar release evaluated", "released_candidates", releasedRadar)
+	logRadarRelease(ctx, "Radar release evaluated", radarRelease)
 	service.logQueueSummary(ctx)
 	return service.dispatchNextDueJob(ctx)
+}
+
+func logRadarRelease(
+	ctx context.Context,
+	message string,
+	report store.RadarReleaseReport,
+) {
+	slog.InfoContext(
+		ctx,
+		message,
+		"profiles_checked", report.ProfilesChecked,
+		"released_candidates", report.Released,
+		"waiting_for_slot", report.WaitingForSlot,
+		"daily_target_met", report.DailyTargetMet,
+		"weekend_paused", report.WeekendPaused,
+		"no_eligible_content", report.NoEligibleContent,
+	)
 }
 
 func (service *Service) logQueueSummary(ctx context.Context) {
@@ -360,6 +377,9 @@ func (service *Service) generateLesson(ctx context.Context, job store.Job, useOp
 		_ = service.store.RecordProviderRun(ctx, job, provider, "", "", requestKind(job, useOpenAI), state, "generation_failed", 0, 0, started, service.now())
 		return err
 	}
+	if !content.DeliveryReady(generated.Draft, lessonContext.Minutes) {
+		return store.ErrIncompleteLesson
+	}
 	warning := generated.Warning
 	if generated.VerificationState == "unverified_warning" && warning == "" {
 		warning = "Some claims could not be fully verified from the supplied sources. Treat current or changing details as unverified."
@@ -541,6 +561,16 @@ func (service *Service) rankRadar(ctx context.Context, job store.Job) error {
 	}
 	slog.InfoContext(ctx, "Radar ranking completed", "job_id", job.ID,
 		"source_items", len(itemIDs), "pending_candidates", candidateCount)
+	if candidateCount > 0 {
+		releaseReport, releaseErr := service.store.ReleaseRadarCandidates(
+			ctx,
+			service.now(),
+		)
+		if releaseErr != nil {
+			return fmt.Errorf("release newly ranked Radar candidates: %w", releaseErr)
+		}
+		logRadarRelease(ctx, "Radar post-ranking release evaluated", releaseReport)
+	}
 	return nil
 }
 

@@ -25,6 +25,7 @@ type radarReleaseUser struct {
 	ItemsPerDay     int
 	WeekendsEnabled bool
 	TimeZone        string
+	PendingItems    int
 }
 
 type radarReleaseCandidate struct {
@@ -33,11 +34,32 @@ type radarReleaseCandidate struct {
 	Score        float64
 }
 
+type RadarReleaseReport struct {
+	ProfilesChecked   int
+	Released          int
+	WeekendPaused     int
+	DailyTargetMet    int
+	WaitingForSlot    int
+	NoEligibleContent int
+}
+
+const (
+	radarReleaseCompleted       = "released"
+	radarReleaseWeekendPaused   = "weekend_paused"
+	radarReleaseDailyTargetMet  = "daily_target_met"
+	radarReleaseWaitingForSlot  = "waiting_for_slot"
+	radarReleaseNoEligibleItems = "no_eligible_content"
+)
+
 // ReleaseRadarCandidates atomically reserves per-user daily slots and creates
 // durable delivery jobs. Candidate selection and job creation share a
 // transaction so a process failure cannot leave a qualified item without a
 // wakeable job.
-func (store *Store) ReleaseRadarCandidates(ctx context.Context, now time.Time) (int, error) {
+func (store *Store) ReleaseRadarCandidates(
+	ctx context.Context,
+	now time.Time,
+) (RadarReleaseReport, error) {
+	var report RadarReleaseReport
 	if _, err := store.database.ExecContext(ctx, `UPDATE radar_candidates
 		SET status='rejected',rejection_reason=CASE
 			WHEN ranker_version<>? THEN 'superseded_ranking_policy'
@@ -51,38 +73,49 @@ func (store *Store) ReleaseRadarCandidates(ctx context.Context, now time.Time) (
 		)`, radar.RankerVersion, radar.MinimumDeliveryScore, timestamp(now),
 		radar.RankerVersion, radar.MinimumDeliveryScore,
 		timestamp(now.Add(-radarCandidateMaxAge))); err != nil {
-		return 0, err
+		return report, err
 	}
 	users, err := store.radarReleaseUsers(ctx)
 	if err != nil {
-		return 0, err
+		return report, err
 	}
-	released := 0
 	for _, user := range users {
-		if released >= maximumRadarReleasesPerPass {
+		if report.Released >= maximumRadarReleasesPerPass {
 			break
 		}
-		count, releaseErr := store.releaseRadarForUser(
-			ctx, user, now, maximumRadarReleasesPerPass-released,
+		report.ProfilesChecked++
+		count, reason, releaseErr := store.releaseRadarForUser(
+			ctx, user, now, maximumRadarReleasesPerPass-report.Released,
 		)
 		if releaseErr != nil {
-			return released, releaseErr
+			return report, releaseErr
 		}
-		released += count
+		report.Released += count
+		switch reason {
+		case radarReleaseWeekendPaused:
+			report.WeekendPaused++
+		case radarReleaseDailyTargetMet:
+			report.DailyTargetMet++
+		case radarReleaseWaitingForSlot:
+			report.WaitingForSlot++
+		case radarReleaseNoEligibleItems:
+			report.NoEligibleContent++
+		}
 	}
-	return released, nil
+	return report, nil
 }
 
 func (store *Store) radarReleaseUsers(ctx context.Context) ([]radarReleaseUser, error) {
 	rows, err := store.database.QueryContext(ctx, `SELECT lp.user_id,lp.radar_items_per_day,
-		lp.radar_weekends_enabled,lp.time_zone
+		lp.radar_weekends_enabled,lp.time_zone,(
+			SELECT COUNT(*) FROM radar_candidates rc
+			WHERE rc.user_id=lp.user_id AND rc.status='pending'
+		)
 		FROM learning_preferences lp
 		JOIN users u ON u.id=lp.user_id AND u.status='active'
 		JOIN delivery_destinations dd ON dd.user_id=lp.user_id AND dd.channel='telegram'
 			AND dd.enabled=1 AND dd.status='connected'
-		WHERE lp.radar_enabled=1 AND EXISTS (
-			SELECT 1 FROM radar_candidates rc WHERE rc.user_id=lp.user_id AND rc.status='pending'
-		)
+		WHERE lp.radar_enabled=1
 		ORDER BY lp.user_id`)
 	if err != nil {
 		return nil, err
@@ -92,7 +125,13 @@ func (store *Store) radarReleaseUsers(ctx context.Context) ([]radarReleaseUser, 
 	for rows.Next() {
 		var user radarReleaseUser
 		var weekends int
-		if err := rows.Scan(&user.ID, &user.ItemsPerDay, &weekends, &user.TimeZone); err != nil {
+		if err := rows.Scan(
+			&user.ID,
+			&user.ItemsPerDay,
+			&weekends,
+			&user.TimeZone,
+			&user.PendingItems,
+		); err != nil {
 			return nil, err
 		}
 		user.WeekendsEnabled = weekends == 1
@@ -106,14 +145,17 @@ func (store *Store) releaseRadarForUser(
 	user radarReleaseUser,
 	now time.Time,
 	passLimit int,
-) (int, error) {
+) (int, string, error) {
 	location, err := time.LoadLocation(user.TimeZone)
 	if err != nil {
-		return 0, fmt.Errorf("load Radar time zone: %w", err)
+		return 0, "", fmt.Errorf("load Radar time zone: %w", err)
 	}
 	localNow := now.In(location)
 	if !user.WeekendsEnabled && (localNow.Weekday() == time.Saturday || localNow.Weekday() == time.Sunday) {
-		return 0, nil
+		return 0, radarReleaseWeekendPaused, nil
+	}
+	if user.PendingItems == 0 {
+		return 0, radarReleaseNoEligibleItems, nil
 	}
 	localDate := localNow.Format("2006-01-02")
 	localDayStart := time.Date(
@@ -130,17 +172,17 @@ func (store *Store) releaseRadarForUser(
 		limit = user.ItemsPerDay
 	}
 	if limit <= 0 {
-		return 0, nil
+		return 0, radarReleaseNoEligibleItems, nil
 	}
 
 	tx, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO radar_daily_usage (user_id,local_date)
 		VALUES (?,?) ON CONFLICT(user_id,local_date) DO NOTHING`, user.ID, localDate); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if user.ItemsPerDay > 0 {
 		var releasedCount int
@@ -148,18 +190,18 @@ func (store *Store) releaseRadarForUser(
 		if err := tx.QueryRowContext(ctx, `SELECT released_count,last_released_at
 			FROM radar_daily_usage WHERE user_id=? AND local_date=?`, user.ID, localDate).
 			Scan(&releasedCount, &lastReleased); err != nil {
-			return 0, err
+			return 0, "", err
 		}
 		if releasedCount >= user.ItemsPerDay {
-			return 0, tx.Commit()
+			return 0, radarReleaseDailyTargetMet, tx.Commit()
 		}
 		if lastReleased.Valid {
 			last, parseErr := parseTimestamp(lastReleased.String)
 			if parseErr != nil {
-				return 0, parseErr
+				return 0, "", parseErr
 			}
-			if last.Add(radarReleaseInterval(user.ItemsPerDay)).After(now) {
-				return 0, tx.Commit()
+			if !radarReleaseSlotDue(last, localNow, user.ItemsPerDay) {
+				return 0, radarReleaseWaitingForSlot, tx.Commit()
 			}
 		}
 		limit = 1
@@ -176,7 +218,7 @@ func (store *Store) releaseRadarForUser(
 		user.ID, radar.RankerVersion, radar.MinimumDeliveryScore,
 		timestamp(now.Add(-radarCandidateMaxAge)), candidatePoolLimit)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	var candidatePool []radarReleaseCandidate
 	for rows.Next() {
@@ -188,7 +230,7 @@ func (store *Store) releaseRadarForUser(
 			&candidate.Score,
 		); err != nil {
 			rows.Close()
-			return 0, err
+			return 0, "", err
 		}
 		if _, err := radar.CanonicalURL(candidate.URL); err != nil {
 			continue
@@ -196,21 +238,21 @@ func (store *Store) releaseRadarForUser(
 		candidatePool = append(candidatePool, candidate)
 	}
 	if err := rows.Close(); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	sourceUsage, err := radarSourceUsage(
 		ctx, tx, user.ID, localDayStart, localDayEnd,
 	)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
 	candidateIDs := diverseRadarCandidates(candidatePool, sourceUsage, limit)
 	if len(candidateIDs) == 0 {
-		return 0, tx.Commit()
+		return 0, radarReleaseNoEligibleItems, tx.Commit()
 	}
 	if err := reserveRadarUsage(ctx, tx, user, localDate, len(candidateIDs), now); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	arguments := make([]any, 0, len(candidateIDs)+3)
 	arguments = append(arguments, timestamp(now), timestamp(now), user.ID)
@@ -222,22 +264,22 @@ func (store *Store) releaseRadarForUser(
 		SET status='qualified',released_at=?,updated_at=?
 		WHERE user_id=? AND status='pending' AND id IN (`+placeholders+`)`, arguments...)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if changed != int64(len(candidateIDs)) {
-		return 0, fmt.Errorf("reserve Radar candidates: %w", sql.ErrNoRows)
+		return 0, "", fmt.Errorf("reserve Radar candidates: %w", sql.ErrNoRows)
 	}
 	if err := insertRadarDeliveryJobs(ctx, tx, user.ID, candidateIDs, now); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return len(candidateIDs), nil
+	return len(candidateIDs), radarReleaseCompleted, nil
 }
 
 func reserveRadarUsage(
@@ -299,11 +341,21 @@ func insertRadarDeliveryJobs(
 	return err
 }
 
-func radarReleaseInterval(itemsPerDay int) time.Duration {
+// radarReleaseSlotDue anchors finite Radar delivery to stable local-day slots.
+// Comparing with the current slot boundary avoids cadence drift when the cron
+// tick runs a few minutes late and prevents catch-up bursts for missed slots.
+func radarReleaseSlotDue(lastReleased, localNow time.Time, itemsPerDay int) bool {
 	if itemsPerDay <= 0 {
-		return 0
+		return true
 	}
-	return 24 * time.Hour / time.Duration(itemsPerDay)
+	dayStart := time.Date(
+		localNow.Year(), localNow.Month(), localNow.Day(),
+		0, 0, 0, 0, localNow.Location(),
+	)
+	interval := 24 * time.Hour / time.Duration(itemsPerDay)
+	elapsed := localNow.Sub(dayStart)
+	currentSlot := dayStart.Add(elapsed / interval * interval)
+	return lastReleased.Before(currentSlot)
 }
 
 func radarSourceUsage(

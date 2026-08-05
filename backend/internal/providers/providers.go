@@ -187,14 +187,14 @@ func generateWithCorrection(ctx context.Context, provider Provider, lessonContex
 	for attempt := 0; attempt < 2; attempt++ {
 		system, input, err := content.Compile(lessonContext, correction)
 		if err != nil {
-			if usableWithCorrectionWarning(&best) {
+			if usableWithCorrectionWarning(&best, lessonContext.Minutes) {
 				return best, nil
 			}
 			return content.Generated{}, err
 		}
 		response, err := provider.Generate(ctx, system, input, content.JSONSchema(), content.OutputBudget(lessonContext.Minutes))
 		if err != nil {
-			if usableWithCorrectionWarning(&best) {
+			if usableWithCorrectionWarning(&best, lessonContext.Minutes) {
 				return best, nil
 			}
 			return content.Generated{}, err
@@ -212,7 +212,7 @@ func generateWithCorrection(ctx context.Context, provider Provider, lessonContex
 		problems = append(groundingProblems, problems...)
 		last = content.Generated{Draft: draft, Provider: provider.Name(), Model: provider.Model(), RequestID: response.RequestID,
 			InputTokens: response.InputTokens, OutputTokens: response.OutputTokens, ValidationErrors: problems, VerificationState: verification}
-		if content.Usable(draft) {
+		if content.DeliveryReady(draft, lessonContext.Minutes) {
 			best = last
 		}
 		if len(problems) == 0 {
@@ -222,19 +222,22 @@ func generateWithCorrection(ctx context.Context, provider Provider, lessonContex
 			correction = problems
 			continue
 		}
-		if content.Usable(draft) {
-			usableWithCorrectionWarning(&last)
+		if content.DeliveryReady(draft, lessonContext.Minutes) {
+			usableWithCorrectionWarning(&last, lessonContext.Minutes)
 			return last, nil
 		}
 	}
-	if usableWithCorrectionWarning(&best) {
+	if usableWithCorrectionWarning(&best, lessonContext.Minutes) {
 		return best, nil
 	}
-	return content.Generated{}, &Error{Provider: provider.Name(), Kind: FailureInvalid, Message: "two responses were unusable"}
+	return content.Generated{}, &Error{
+		Provider: provider.Name(), Kind: FailureInvalid,
+		Message: "two responses failed lesson completeness requirements",
+	}
 }
 
-func usableWithCorrectionWarning(generated *content.Generated) bool {
-	if !content.Usable(generated.Draft) {
+func usableWithCorrectionWarning(generated *content.Generated, requestedMinutes int) bool {
+	if !content.DeliveryReady(generated.Draft, requestedMinutes) {
 		return false
 	}
 	generated.Warning = "The lesson did not fully pass structural or source verification after one correction attempt. The information is delivered with this warning so you can judge it directly."

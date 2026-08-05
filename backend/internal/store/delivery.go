@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"coreloop/backend/internal/content"
 	"coreloop/backend/internal/ids"
 )
 
@@ -32,6 +34,9 @@ func (store *Store) PrepareDelivery(ctx context.Context, userID, assignmentID, j
 		return DeliveryBundle{}, err
 	}
 	defer tx.Rollback()
+	if err := ensureAssignmentLessonReady(ctx, tx, userID, assignmentID); err != nil {
+		return DeliveryBundle{}, err
+	}
 	var destinationID, chatID string
 	if err := tx.QueryRowContext(ctx, `SELECT id,telegram_chat_id FROM delivery_destinations WHERE user_id=? AND enabled=1 AND status='connected'`, userID).Scan(&destinationID, &chatID); err != nil {
 		return DeliveryBundle{}, err
@@ -90,6 +95,29 @@ func (store *Store) PrepareDelivery(ctx context.Context, userID, assignmentID, j
 		return DeliveryBundle{}, err
 	}
 	return DeliveryBundle{ID: deliveryID, UserID: userID, AssignmentID: assignmentID, ChatID: chatID, State: state, Parts: parts}, nil
+}
+
+func ensureAssignmentLessonReady(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	assignmentID string,
+) error {
+	var encoded string
+	var minutes int
+	err := tx.QueryRowContext(ctx, `SELECT l.normalized_content_json,
+		l.estimated_reading_minutes FROM lesson_assignments la
+		JOIN lessons l ON l.id=la.lesson_id
+		WHERE la.id=? AND la.user_id=?`, assignmentID, userID).Scan(&encoded, &minutes)
+	if err != nil {
+		return err
+	}
+	var draft content.LessonDraft
+	if json.Unmarshal([]byte(encoded), &draft) != nil ||
+		!content.DeliveryReady(draft, minutes) {
+		return ErrIncompleteLesson
+	}
+	return nil
 }
 
 func insertDeliveryParts(

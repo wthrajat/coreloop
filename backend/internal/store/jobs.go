@@ -126,7 +126,12 @@ func (store *Store) DueOccurrences(ctx context.Context, now time.Time, tolerance
 }
 
 func (store *Store) EnqueueSourcePolls(ctx context.Context, now time.Time) error {
-	rows, err := store.database.QueryContext(ctx, `SELECT id,polling_interval_minutes,last_polled_at FROM sources WHERE enabled=1`)
+	rows, err := store.database.QueryContext(ctx, `SELECT s.id,s.polling_interval_minutes,
+		s.last_polled_at FROM sources s WHERE s.enabled=1 AND NOT EXISTS (
+			SELECT 1 FROM job_queue jq WHERE jq.job_type='ingest_source'
+			AND jq.state IN ('queued','leased')
+			AND json_extract(jq.payload_json,'$.source_id')=s.id
+		)`)
 	if err != nil {
 		return err
 	}
@@ -190,7 +195,7 @@ func (store *Store) EnqueueSourcePolls(ctx context.Context, now time.Time) error
 	}
 	_, err = store.database.ExecContext(ctx, `INSERT INTO job_queue
 		(id,job_type,due_at,idempotency_key,payload_json) VALUES `+values+`
-		ON CONFLICT(idempotency_key) DO NOTHING`, arguments...)
+		ON CONFLICT DO NOTHING`, arguments...)
 	return err
 }
 

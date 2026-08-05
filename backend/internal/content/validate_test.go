@@ -44,6 +44,63 @@ func TestLessonWordMinimumScalesWithDuration(t *testing.T) {
 	}
 }
 
+func TestDeliveryReadyRejectsHeadingOnlyTailSections(t *testing.T) {
+	draft := validDraft()
+	draft.ProductionExample = ""
+	draft.Tradeoffs = []string{"", "", ""}
+	draft.FailureModes = nil
+	draft.Security = ""
+
+	if DeliveryReady(draft, 15) {
+		t.Fatal("heading-only lesson was considered ready for delivery")
+	}
+	problems := ContentProblems(draft, 15)
+	for _, expected := range []string{
+		"production_example is empty",
+		"tradeoffs is empty",
+		"tradeoffs contains empty points",
+		"failure_modes is empty",
+		"security is empty",
+	} {
+		if !containsValidationProblem(problems, expected) {
+			t.Fatalf("validation problems are missing %q: %v", expected, problems)
+		}
+	}
+}
+
+func TestDeliveryReadyEnforcesThirtyMinuteReadingDepth(t *testing.T) {
+	short := strings.Repeat("detail ", 100)
+	developedList := []string{short, short, short, short}
+	draft := LessonDraft{
+		Title: "Title", EstimatedMinutes: 30, Motivation: short,
+		PriorApproaches: developedList, Definition: short, Mechanics: developedList,
+		ProductionExample: short, Tradeoffs: developedList, FailureModes: developedList,
+		WhenNotToUse: developedList, Alternatives: developedList, Security: short,
+		Reliability: short, Performance: short, Cost: short, PresentMaturity: short,
+		FutureDirection: short, CareerRelevance: short, InterviewAnswer: short,
+		RecallQuestion: "Question",
+	}
+	if DeliveryReady(draft, 30) {
+		t.Fatal("a short draft was considered a complete 30-minute lesson")
+	}
+	if !containsValidationProblem(ContentProblems(draft, 30), "lesson is too short") {
+		t.Fatal("30-minute lesson did not report its total word-count failure")
+	}
+}
+
+func TestRenderSectionsNeverCreatesHeadingOnlyMessages(t *testing.T) {
+	draft := LessonDraft{
+		Title: "Partial lesson", EstimatedMinutes: 15,
+		Motivation: "A developed opening.",
+	}
+	sections := RenderSections(draft)
+	for _, forbidden := range []string{"Production scenario", "Trade-offs", "Failure modes"} {
+		if containsString(sections, forbidden) {
+			t.Fatalf("empty %q heading reached rendering: %v", forbidden, sections)
+		}
+	}
+}
+
 func containsValidationProblem(problems []string, expected string) bool {
 	for _, problem := range problems {
 		if strings.Contains(problem, expected) {

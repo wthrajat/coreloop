@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -190,6 +191,81 @@ func TestGroundedSourceMigrationRegistersVersionedPrompt(t *testing.T) {
 		if !strings.Contains(text, required) {
 			t.Errorf("grounded source migration is missing %q", required)
 		}
+	}
+}
+
+func TestDeliveryQualityMigrationRegistersStrictPrompt(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	migration, err := os.ReadFile(filepath.Join(
+		projectRoot,
+		"migrations",
+		"0009_delivery_quality.sql",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToLower(string(migration))
+	for _, required := range []string{
+		"superseded_duplicate_source_poll",
+		"job_queue_one_active_source_poll_idx",
+		"prompt_lesson_v4",
+		"lesson-v4",
+		"lesson-draft-v1",
+		"compiler-v4",
+		"values (9, 'delivery_quality')",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("delivery quality migration is missing %q", required)
+		}
+	}
+}
+
+func TestDeliveryQualityMigrationCollapsesDuplicateSourcePolls(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	var script strings.Builder
+	for version := 1; version <= 8; version++ {
+		matches, err := filepath.Glob(filepath.Join(
+			projectRoot,
+			"migrations",
+			fmt.Sprintf("%04d_*.sql", version),
+		))
+		if err != nil || len(matches) != 1 {
+			t.Fatalf("resolve migration %d: %v, matches=%v", version, err, matches)
+		}
+		script.WriteString(".read " + matches[0] + "\n")
+	}
+	for _, id := range []string{"poll-1", "poll-2", "poll-3", "poll-4"} {
+		script.WriteString(fmt.Sprintf(
+			`INSERT INTO job_queue(id,job_type,due_at,idempotency_key,payload_json) VALUES('%s','ingest_source','2026-08-05T10:00:00Z','%s','{"source_id":"source_openai"}');`+"\n",
+			id,
+			id,
+		))
+	}
+	script.WriteString(`UPDATE job_queue SET state='leased',lease_owner='worker',lease_expires_at='2026-08-05T10:05:00Z' WHERE id IN ('poll-3','poll-4');` + "\n")
+	script.WriteString(".read " + filepath.Join(
+		projectRoot,
+		"migrations",
+		"0009_delivery_quality.sql",
+	) + "\n")
+	script.WriteString(`INSERT INTO job_queue(id,job_type,due_at,idempotency_key,payload_json) VALUES('poll-5','ingest_source','2026-08-05T10:00:00Z','poll-5','{"source_id":"source_openai"}') ON CONFLICT DO NOTHING;` + "\n")
+	script.WriteString(`SELECT SUM(state IN ('queued','leased')) || ',' || SUM(state='cancelled') FROM job_queue WHERE job_type='ingest_source';` + "\n")
+
+	command := exec.Command("sqlite3", ":memory:")
+	command.Stdin = strings.NewReader(script.String())
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run populated delivery-quality migration: %v: %s", err, output)
+	}
+	if strings.TrimSpace(string(output)) != "1,3" {
+		t.Fatalf("source poll migration state = %s, want 1 active and 3 cancelled", output)
 	}
 }
 

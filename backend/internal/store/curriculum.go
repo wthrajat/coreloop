@@ -13,6 +13,8 @@ import (
 	"coreloop/backend/internal/securehash"
 )
 
+var ErrIncompleteLesson = errors.New("lesson content is incomplete")
+
 type LessonPlan struct {
 	UserID        string
 	ThemeBlockID  string
@@ -141,6 +143,10 @@ func (plan LessonPlan) Context() content.LessonContext {
 }
 
 func (store *Store) SaveGeneratedLesson(ctx context.Context, plan LessonPlan, generated content.Generated, parts []string, cacheKey string, now time.Time) (string, string, error) {
+	if !content.DeliveryReady(generated.Draft, plan.Preferences.LessonMinutes) ||
+		!lessonPartsReady(parts) {
+		return "", "", ErrIncompleteLesson
+	}
 	encoded, err := json.Marshal(generated.Draft)
 	if err != nil {
 		return "", "", err
@@ -196,6 +202,19 @@ func (store *Store) SaveGeneratedLesson(ctx context.Context, plan LessonPlan, ge
 		return "", "", err
 	}
 	return lessonID, storedAssignment, nil
+}
+
+func lessonPartsReady(parts []string) bool {
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		count := len([]rune(strings.TrimSpace(part)))
+		if count == 0 || count > 4096 {
+			return false
+		}
+	}
+	return true
 }
 
 func attachDueRecall(
