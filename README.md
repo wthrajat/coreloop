@@ -1,38 +1,30 @@
 # Coreloop
 
-Coreloop is a private, Telegram-first learning system for working software
-engineers. Choose what you want to learn and when you have time. Coreloop builds
-a connected curriculum, generates detailed lessons, and delivers the complete
-material to Telegram.
+Coreloop is a private, invite-only learning system for working software
+engineers. It builds a connected curriculum, generates clear and detailed
+lessons, and delivers everything through Telegram. The web app is only for
+configuration, progress, and operations—not another feed to keep open.
 
-The web app stays focused on configuration and progress. It is not another feed
-to keep open.
+## Lessons
 
-## What Coreloop does
-
-- Sends clear, detailed 15- or 30-minute engineering lessons on your schedule.
-- Continues a topic across lessons instead of jumping between random subjects.
-- Explains why a concept exists, how it works, where it fails, and when to use
+- Choose 15- or 30-minute lessons, delivery times, weekends, topics, level, and
+  depth.
+- Continue a theme across lessons instead of jumping between unrelated topics.
+- Learn why something exists, how it works, where it fails, and when to choose
   an alternative.
-- Delivers ranked technology news from official engineering sources, Hacker
-  News, trusted technical blogs, and Bitcoin/Lightning communities.
-- Keeps Radar news flowing from RSS and public feeds even when AI is
-  unavailable.
-- Sends one sourced news item per Telegram message and filters weak, stale, or
-  repetitive updates.
-- Lets each learner configure topics, depth, delivery times, weekends, spaced
-  recall, and Radar frequency independently.
-- Uses private invitations and Telegram sign-in—there is no public signup or
-  password database.
+- Receive the complete lesson in Telegram and use lightweight **Read** and
+  **Skip** feedback.
 
-## How it feels to use
+## Current-tech Radar
 
-1. Configure your learning goals and delivery rhythm in the web app.
-2. Receive complete lessons and current-tech Radar updates in Telegram.
-3. Tap **Read** or **Skip** to shape future delivery without blocking the queue.
-
-The owner also has an Operations page for queue health, private invitations, and
-immediate Telegram acceptance tests for lessons and Radar.
+- Ranks recent developer news from official engineering feeds, Hacker News,
+  trusted technical blogs, and Bitcoin/Lightning communities.
+- Sends one news item per Telegram message with its real source.
+- Prioritizes useful releases, incidents, security developments, research, and
+  engineering ideas over routine marketing.
+- Keeps sending from RSS and public feeds when AI providers are unavailable.
+- Lets every learner choose their own delivery frequency; the owner can trigger
+  an immediate Radar delivery from Operations.
 
 ## Screenshots
 
@@ -40,15 +32,14 @@ immediate Telegram acceptance tests for lessons and Radar.
 
 ![Learning overview and delivery state](assets/images/dashboard.png)
 
-## Documentation
+### Personal setup
 
-- [Local development](docs/local-development.md)
-- [Production deployment](docs/deployment.md)
-- [Operations runbook](docs/runbook.md)
-- [Security policy](docs/SECURITY.md)
-- [External API contracts](docs/external-contracts.md)
-- [Contributing](docs/contributing.md)
+![Lesson and delivery configuration](assets/images/onboarding.png)
 
-Coreloop is designed for self-hosting on free service tiers. Scheduled work uses
-Groq first and Gemini second. OpenAI is never an automatic fallback and can only
-be used through an explicit owner action.
+## Run locally
+
+See the [local development guide](docs/local-development.md).
+
+Coreloop is designed to self-host on free service tiers using Next.js, Go,
+Turso, QStash, Telegram, Groq, and Gemini. OpenAI is never an automatic
+fallback; only the owner can explicitly use it for one blocked job.
