@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -93,6 +93,7 @@ func NewRouter(configuration Config) http.Handler {
 		mux.Handle("PUT /api/app/profile", configuration.withSession(configuration.withCSRF(http.HandlerFunc(configuration.updateProfile))))
 		mux.Handle("GET /api/app/preferences", configuration.withSession(http.HandlerFunc(configuration.getPreferences)))
 		mux.Handle("PUT /api/app/preferences", configuration.withSession(configuration.withCSRF(http.HandlerFunc(configuration.updatePreferences))))
+		mux.Handle("PUT /api/app/configuration", configuration.withSession(configuration.withCSRF(http.HandlerFunc(configuration.updateConfiguration))))
 		mux.Handle("GET /api/app/progress", configuration.withSession(http.HandlerFunc(configuration.progress)))
 		mux.Handle("POST /api/app/interactions", configuration.withSession(configuration.withCSRF(http.HandlerFunc(configuration.interaction))))
 		mux.Handle("GET /api/app/export", configuration.withSession(http.HandlerFunc(configuration.export)))
@@ -109,12 +110,43 @@ func NewRouter(configuration Config) http.Handler {
 }
 
 func (configuration Config) startAuth(w http.ResponseWriter, r *http.Request) {
+	clientAddress := requestClientAddress(r)
+	bucketKey := "auth-start:" + securehash.Keyed(clientAddress, configuration.Runtime.SessionSecret)
+	allowed, err := configuration.Store.AllowRateLimit(
+		r.Context(), bucketKey, time.Now(), 10*time.Minute, 20,
+	)
+	if err != nil {
+		writeInternal(w, err)
+		return
+	}
+	if !allowed {
+		WriteProblem(w, apperror.New(
+			apperror.CodeRateLimited,
+			"too many login attempts; try again in a few minutes",
+			http.StatusTooManyRequests,
+		))
+		return
+	}
 	loginURL, err := configuration.Auth.Start(r.Context(), r.URL.Query().Get("invite"), r.URL.Query().Get("return"))
 	if err != nil {
 		WriteProblem(w, apperror.Wrap(apperror.CodeInvalidRequest, err.Error(), http.StatusBadRequest, err))
 		return
 	}
 	http.Redirect(w, r, loginURL, http.StatusFound)
+}
+
+func requestClientAddress(r *http.Request) string {
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		if address := net.ParseIP(strings.TrimSpace(forwarded[index])); address != nil {
+			return address.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 func (configuration Config) authCallback(w http.ResponseWriter, r *http.Request) {
@@ -124,7 +156,7 @@ func (configuration Config) authCallback(w http.ResponseWriter, r *http.Request)
 		http.Redirect(w, r, "/access-required?error=login_failed", http.StatusFound)
 		return
 	}
-	secure := configuration.Runtime.IsProduction()
+	secure := configuration.Runtime.SecureCookies()
 	http.SetCookie(w, &http.Cookie{Name: auth.SessionCookieName, Value: result.SessionToken, Path: "/", Expires: result.SessionExpiry, MaxAge: int(time.Until(result.SessionExpiry).Seconds()), HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode})
 	http.SetCookie(w, &http.Cookie{Name: auth.CSRFCookieName, Value: result.CSRFToken, Path: "/", Expires: result.SessionExpiry, MaxAge: int(time.Until(result.SessionExpiry).Seconds()), HttpOnly: false, Secure: secure, SameSite: http.SameSiteStrictMode})
 	if configuration.Telegram != nil {
@@ -263,6 +295,37 @@ func (configuration Config) updatePreferences(w http.ResponseWriter, r *http.Req
 	}
 	WriteJSON(w, http.StatusOK, preferences)
 }
+
+func (configuration Config) updateConfiguration(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Profile     store.LearningProfile `json:"profile"`
+		Preferences store.Preferences     `json:"preferences"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		WriteProblem(w, apperror.New(apperror.CodeInvalidRequest, err.Error(), http.StatusBadRequest))
+		return
+	}
+	if err := validateProfile(&input.Profile); err != nil {
+		WriteProblem(w, apperror.New(apperror.CodeInvalidRequest, err.Error(), http.StatusBadRequest))
+		return
+	}
+	if err := validatePreferences(input.Preferences); err != nil {
+		WriteProblem(w, apperror.New(apperror.CodeInvalidRequest, err.Error(), http.StatusBadRequest))
+		return
+	}
+	if err := configuration.Store.UpdateConfiguration(
+		r.Context(), sessionFrom(r).User.ID, input.Profile, input.Preferences,
+	); err != nil {
+		WriteProblem(w, apperror.Wrap(
+			apperror.CodeInvalidRequest,
+			"configuration could not be saved",
+			http.StatusBadRequest,
+			err,
+		))
+		return
+	}
+	WriteJSON(w, http.StatusOK, input)
+}
 func (configuration Config) progress(w http.ResponseWriter, r *http.Request) {
 	userID := sessionFrom(r).User.ID
 	items, err := configuration.Store.Assignments(r.Context(), userID, 100)
@@ -270,12 +333,7 @@ func (configuration Config) progress(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, err)
 		return
 	}
-	dueRecall, err := configuration.Store.DueRecallCount(r.Context(), userID, time.Now())
-	if err != nil {
-		writeInternal(w, err)
-		return
-	}
-	WriteJSON(w, http.StatusOK, map[string]any{"assignments": items, "due_recall": dueRecall})
+	WriteJSON(w, http.StatusOK, map[string]any{"assignments": items})
 }
 func (configuration Config) interaction(w http.ResponseWriter, r *http.Request) {
 	var input struct {
@@ -291,6 +349,14 @@ func (configuration Config) interaction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := configuration.Store.MarkAssignment(r.Context(), sessionFrom(r).User.ID, input.AssignmentID, input.Action, time.Now()); err != nil {
+		if errors.Is(err, store.ErrAssignmentAlreadyMarked) {
+			WriteProblem(w, apperror.New(
+				apperror.CodeConflict,
+				"this lesson was already marked with a different action",
+				http.StatusConflict,
+			))
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}
@@ -457,7 +523,7 @@ func (configuration Config) openAI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (configuration Config) clearCookies(w http.ResponseWriter) {
-	secure := configuration.Runtime.IsProduction()
+	secure := configuration.Runtime.SecureCookies()
 	for _, name := range []string{auth.SessionCookieName, auth.CSRFCookieName} {
 		http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), HttpOnly: name == auth.SessionCookieName, Secure: secure, SameSite: http.SameSiteLaxMode})
 	}
@@ -477,10 +543,20 @@ func validateProfile(profile *store.LearningProfile) error {
 		if len(list) > 20 {
 			return errors.New("profile lists can contain at most 20 items")
 		}
+		seen := make(map[string]struct{}, len(list))
 		for _, value := range list {
-			if len([]rune(strings.TrimSpace(value))) > 120 {
+			normalized := strings.TrimSpace(value)
+			if normalized == "" {
+				return errors.New("profile items cannot be empty")
+			}
+			if len([]rune(normalized)) > 120 {
 				return errors.New("profile items can contain at most 120 characters")
 			}
+			key := strings.ToLower(normalized)
+			if _, exists := seen[key]; exists {
+				return errors.New("profile items must be unique")
+			}
+			seen[key] = struct{}{}
 		}
 	}
 	return nil
@@ -512,6 +588,19 @@ func validatePreferences(value store.Preferences) error {
 	}
 	if len(value.TopicIDs) == 0 {
 		return errors.New("choose at least one topic")
+	}
+	if len(value.TopicIDs) > 100 {
+		return errors.New("choose at most 100 topics")
+	}
+	seenTopics := make(map[string]struct{}, len(value.TopicIDs))
+	for _, topicID := range value.TopicIDs {
+		if strings.TrimSpace(topicID) == "" {
+			return errors.New("topic IDs cannot be empty")
+		}
+		if _, exists := seenTopics[topicID]; exists {
+			return errors.New("topics must be unique")
+		}
+		seenTopics[topicID] = struct{}{}
 	}
 	seen := map[string]bool{}
 	for _, timeValue := range value.DeliveryTimes {
@@ -580,5 +669,3 @@ func NewNotReadyHandler(component string) http.Handler {
 		WriteProblem(w, apperror.New(apperror.CodeNotReady, message, http.StatusNotImplemented))
 	})
 }
-
-var _ = strconv.Itoa

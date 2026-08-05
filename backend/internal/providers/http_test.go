@@ -171,3 +171,21 @@ func jsonResponse(request *http.Request, body string) *http.Response {
 		Request:    request,
 	}
 }
+
+func TestClassifyHTTPDoesNotExposeGeneratedContent(t *testing.T) {
+	errorValue := classifyHTTP("groq", 400, []byte(`{
+		"error": {
+			"message": "Generated JSON does not match the schema",
+			"type": "invalid_request_error",
+			"code": "json_validate_failed",
+			"failed_generation": "private generated lesson text"
+		}
+	}`))
+	message := errorValue.Error()
+	if strings.Contains(message, "private generated lesson text") {
+		t.Fatalf("provider output leaked into the error: %s", message)
+	}
+	if !strings.Contains(message, "json_validate_failed") {
+		t.Fatalf("safe provider code was lost: %s", message)
+	}
+}

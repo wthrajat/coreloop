@@ -20,7 +20,11 @@ export function AppNavigation({ owner = false }: { owner?: boolean }) {
     : navigationItems;
 
   return (
-    <nav aria-label="Primary navigation" className="app-navigation">
+    <nav
+      aria-label="Primary navigation"
+      className="app-navigation"
+      data-owner={owner ? "true" : "false"}
+    >
       {items.map((item) => {
         const isCurrent = isCurrentPath(pathname, item.href);
 

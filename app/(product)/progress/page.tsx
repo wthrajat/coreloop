@@ -1,24 +1,71 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/page-header";
 import { StatusPill } from "@/components/status-pill";
 import { api } from "@/lib/api-client";
 import type { Assignment } from "@/lib/api-types";
+import { formatIndiaDateTime } from "@/lib/date-time";
+
+async function fetchProgress() {
+  return api<{ assignments: Assignment[] }>("/progress");
+}
 
 export default function ProgressPage() {
   const [assignments, setAssignments] = useState<Assignment[] | null>(null);
-  const [dueRecall, setDueRecall] = useState(0);
-  const [error, setError] = useState("");
-  useEffect(() => {
-    api<{ assignments: Assignment[]; due_recall: number }>("/progress")
-      .then((value) => {
-        setAssignments(value.assignments ?? []);
-        setDueRecall(value.due_recall ?? 0);
-      })
-      .catch((reason: Error) => setError(reason.message));
+  const [loadState, setLoadState] = useState<"loading" | "ready" | "error">(
+    "loading",
+  );
+  const [loadError, setLoadError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [pendingActions, setPendingActions] = useState<
+    Record<string, "read" | "skip">
+  >({});
+  const pendingAssignmentIDs = useRef(new Set<string>());
+
+  const loadProgress = useCallback(async () => {
+    try {
+      const value = await fetchProgress();
+      setAssignments(value.assignments ?? []);
+      setLoadState("ready");
+    } catch (reason) {
+      setLoadError(
+        reason instanceof Error
+          ? reason.message
+          : "Learning history could not be loaded.",
+      );
+      setLoadState("error");
+    }
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    fetchProgress()
+      .then((value) => {
+        if (!active) return;
+        setAssignments(value.assignments ?? []);
+        setLoadState("ready");
+      })
+      .catch((reason: unknown) => {
+        if (!active) return;
+        setLoadError(
+          reason instanceof Error
+            ? reason.message
+            : "Learning history could not be loaded.",
+        );
+        setLoadState("error");
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  function retryProgress() {
+    setLoadState("loading");
+    setLoadError("");
+    void loadProgress();
+  }
   const read = useMemo(
     () => assignments?.filter((item) => item.state === "read").length ?? 0,
     [assignments],
@@ -32,53 +79,87 @@ export default function ProgressPage() {
   );
 
   async function mark(item: Assignment, action: "read" | "skip") {
+    if (pendingAssignmentIDs.current.has(item.id)) return;
+    pendingAssignmentIDs.current.add(item.id);
+    setPendingActions((current) => ({ ...current, [item.id]: action }));
     try {
-      setError("");
+      setActionError("");
       await api<void>("/interactions", {
         method: "POST",
         body: JSON.stringify({ assignment_id: item.id, action }),
       });
+      setAssignments(
+        (current) =>
+          current?.map((value) =>
+            value.id === item.id
+              ? {
+                  ...value,
+                  state: action === "read" ? "read" : "skipped",
+                  read_at:
+                    action === "read"
+                      ? new Date().toISOString()
+                      : value.read_at,
+                }
+              : value,
+          ) ?? [],
+      );
     } catch (reason) {
-      setError(
+      setActionError(
         reason instanceof Error
           ? reason.message
           : "Progress could not be saved.",
       );
-      return;
+    } finally {
+      pendingAssignmentIDs.current.delete(item.id);
+      setPendingActions((current) => {
+        const next = { ...current };
+        delete next[item.id];
+        return next;
+      });
     }
-    setAssignments(
-      (current) =>
-        current?.map((value) =>
-          value.id === item.id
-            ? {
-                ...value,
-                state: action === "read" ? "read" : "skipped",
-                read_at:
-                  action === "read" ? new Date().toISOString() : value.read_at,
-              }
-            : value,
-        ) ?? [],
-    );
   }
 
-  if (!assignments && !error)
+  if (loadState === "loading")
     return (
-      <div className="page-stack">
-        <span className="loading-line" />
+      <div className="page-stack" role="status">
+        <span aria-hidden="true" className="loading-line" />
         <p className="muted-copy">Loading learning history…</p>
       </div>
     );
+  if (loadState === "error" || !assignments) {
+    return (
+      <div className="page-stack">
+        <PageHeader
+          title="Progress"
+          description="Your saved learning history has not been changed."
+        />
+        <section className="notice notice-error" role="alert">
+          <div>
+            <strong>History unavailable</strong>
+            <p>{loadError || "Learning history could not be loaded."}</p>
+          </div>
+          <button
+            className="button button-secondary"
+            onClick={retryProgress}
+            type="button"
+          >
+            Try again
+          </button>
+        </section>
+      </div>
+    );
+  }
   return (
     <div className="page-stack">
       <PageHeader
         title="Progress"
         description="Evidence of what you have read, skipped, and still have available—without points or streak pressure."
       />
-      {error ? (
+      {actionError ? (
         <section className="notice notice-error" role="alert">
           <div>
-            <strong>History unavailable</strong>
-            <p>{error}</p>
+            <strong>Progress could not be saved</strong>
+            <p>{actionError}</p>
           </div>
         </section>
       ) : null}
@@ -102,10 +183,6 @@ export default function ProgressPage() {
             <dt>Still available</dt>
             <dd>{waiting}</dd>
           </div>
-          <div>
-            <dt>Due recall</dt>
-            <dd>{dueRecall}</dd>
-          </div>
         </dl>
       </section>
       <section className="section-block">
@@ -122,13 +199,7 @@ export default function ProgressPage() {
                 <div>
                   <span className="history-topic">{item.topic}</span>
                   <h3>{item.title}</h3>
-                  <p>
-                    {new Intl.DateTimeFormat("en-IN", {
-                      dateStyle: "medium",
-                      timeStyle: "short",
-                      timeZone: "Asia/Kolkata",
-                    }).format(new Date(item.assigned_at))}
-                  </p>
+                  <p>{formatIndiaDateTime(item.assigned_at)}</p>
                 </div>
                 <div className="history-action">
                   <StatusPill
@@ -146,15 +217,23 @@ export default function ProgressPage() {
                     <span className="inline-actions">
                       <button
                         className="text-button"
+                        disabled={Boolean(pendingActions[item.id])}
                         onClick={() => void mark(item, "read")}
+                        type="button"
                       >
-                        Read
+                        {pendingActions[item.id] === "read"
+                          ? "Saving…"
+                          : "Read"}
                       </button>
                       <button
                         className="text-button"
+                        disabled={Boolean(pendingActions[item.id])}
                         onClick={() => void mark(item, "skip")}
+                        type="button"
                       >
-                        Skip
+                        {pendingActions[item.id] === "skip"
+                          ? "Saving…"
+                          : "Skip"}
                       </button>
                     </span>
                   ) : null}

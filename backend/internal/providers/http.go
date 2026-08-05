@@ -233,10 +233,7 @@ func (provider *Gemini) Generate(ctx context.Context, system, input string, sche
 }
 
 func classifyHTTP(provider string, status int, body []byte) error {
-	message := strings.TrimSpace(string(body))
-	if len(message) > 500 {
-		message = message[:500]
-	}
+	message := safeProviderError(body)
 	kind := FailurePermanent
 	if status == http.StatusTooManyRequests || status == http.StatusPaymentRequired || strings.Contains(strings.ToLower(message), "quota") {
 		kind = FailureQuota
@@ -244,4 +241,35 @@ func classifyHTTP(provider string, status int, body []byte) error {
 		kind = FailureTransient
 	}
 	return &Error{Provider: provider, Kind: kind, Status: status, Message: fmt.Sprintf("HTTP %d: %s", status, message)}
+}
+
+func safeProviderError(body []byte) string {
+	var response struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "provider request failed"
+	}
+	parts := make([]string, 0, 3)
+	if message := strings.TrimSpace(response.Error.Message); message != "" {
+		message = strings.Join(strings.Fields(message), " ")
+		if len(message) > 300 {
+			message = message[:300]
+		}
+		parts = append(parts, message)
+	}
+	if response.Error.Type != "" {
+		parts = append(parts, "type="+response.Error.Type)
+	}
+	if response.Error.Code != nil {
+		parts = append(parts, fmt.Sprintf("code=%v", response.Error.Code))
+	}
+	if len(parts) == 0 {
+		return "provider request failed"
+	}
+	return strings.Join(parts, "; ")
 }

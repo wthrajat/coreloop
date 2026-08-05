@@ -20,8 +20,8 @@ to keep open.
   unavailable.
 - Sends one sourced news item per Telegram message and filters weak, stale, or
   repetitive updates.
-- Lets each learner configure topics, depth, delivery times, weekends, recall,
-  and Radar frequency independently.
+- Lets each learner configure topics, depth, delivery times, weekends, spaced
+  recall, and Radar frequency independently.
 - Uses private invitations and Telegram sign-in—there is no public signup or
   password database.
 
@@ -43,6 +43,11 @@ immediate Telegram acceptance tests for lessons and Radar.
 ## Documentation
 
 - [Local development](docs/local-development.md)
+- [Production deployment](docs/deployment.md)
+- [Operations runbook](docs/runbook.md)
+- [Security policy](docs/SECURITY.md)
+- [External API contracts](docs/external-contracts.md)
+- [Contributing](docs/contributing.md)
 
 Coreloop is designed for self-hosting on free service tiers. Scheduled work uses
 Groq first and Gemini second. OpenAI is never an automatic fallback and can only

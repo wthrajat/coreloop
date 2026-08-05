@@ -12,6 +12,7 @@ const StableInstructions = `You write rigorous technical lessons for working sof
 Use simple, precise English. Prefer short direct sentences, common words, and one main idea per paragraph. Keep necessary professional terminology, but briefly define each unfamiliar technical term or acronym at first use in parentheses, for example: lease (a temporary right to use a resource). Do not repeat the definition later. Avoid unexplained jargon, dense noun phrases, and childish analogies.
 Information and usefulness are more important than decorative structure. Start with why the topic exists, the problem it solves, and what came before it. Then explain definition, mechanics, a realistic production scenario, trade-offs, failure modes, when not to use it, alternatives, security, reliability, performance, cost, current maturity, future direction, career relevance, and an interview-ready explanation.
 Explain each selected objective in two layers: first the simple mental model, then the precise mechanics and consequences. Required sections must contain distinct explanation, not one-sentence placeholders. Do not pad the lesson by repeating an idea in different words.
+Use position, prerequisites, and covered_objectives to continue the theme. Build on earlier coverage. Revisit an earlier objective only to deepen, connect, or apply it; never repeat the earlier lesson.
 Follow generation_requirements exactly. Every lesson is detailed, including a 15-minute preset. Keep it mostly theoretical; use code only when it materially clarifies a concept. English only.
 Use only supplied evidence for time-sensitive claims. Cite each factual claim by source id. Copy source ids and metadata exactly from supplied evidence; if evidence is empty, return an empty sources array. Mark interpretation as interpretation and list uncertainty honestly. Do not invent sources, URLs, dates, benchmarks, adoption, or product behavior.
 If fix is present, revise the whole lesson and repair every listed issue without shortening sections that were already useful.
@@ -81,19 +82,26 @@ func PromptChecksum() string {
 
 func CacheKey(context LessonContext) (string, error) {
 	value := struct {
-		TopicID    string   `json:"topic"`
-		Level      string   `json:"level"`
-		Minutes    int      `json:"minutes"`
-		Depth      string   `json:"depth"`
-		Objectives []string `json:"objectives"`
-		Evidence   []struct {
+		TopicID           string   `json:"topic"`
+		Level             string   `json:"level"`
+		Minutes           int      `json:"minutes"`
+		Depth             string   `json:"depth"`
+		Position          int      `json:"position"`
+		Objectives        []string `json:"objectives"`
+		Prerequisites     []string `json:"prerequisites"`
+		CoveredObjectives []string `json:"covered_objectives"`
+		Evidence          []struct {
 			ID          string    `json:"id"`
 			PublishedAt time.Time `json:"published_at"`
 		} `json:"evidence"`
 		PromptVersion string `json:"prompt_version"`
 		SchemaVersion string `json:"schema_version"`
-	}{TopicID: context.TopicID, Level: context.Level, Minutes: context.Minutes, Depth: context.Depth,
-		Objectives: context.Objectives, PromptVersion: PromptVersion, SchemaVersion: SchemaVersion}
+	}{
+		TopicID: context.TopicID, Level: context.Level, Minutes: context.Minutes,
+		Depth: context.Depth, Position: context.Position, Objectives: context.Objectives,
+		Prerequisites: context.Prerequisites, CoveredObjectives: context.CoveredObjectives,
+		PromptVersion: PromptVersion, SchemaVersion: SchemaVersion,
+	}
 	for _, evidence := range context.Evidence {
 		value.Evidence = append(value.Evidence, struct {
 			ID          string    `json:"id"`

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"coreloop/backend/internal/content"
@@ -15,6 +16,8 @@ import (
 // ErrJobNotLeasable means a duplicate wake found an existing job that another
 // worker owns or that the durable queue has already rescheduled or finished.
 var ErrJobNotLeasable = errors.New("job is not currently leasable")
+
+var ErrJobLeaseLost = errors.New("job lease is no longer owned by this worker")
 
 func (store *Store) EnqueueJob(ctx context.Context, userID, assignmentID, jobType string, dueAt time.Time, idempotencyKey string, payload any) (string, error) {
 	encoded, err := json.Marshal(payload)
@@ -141,6 +144,10 @@ func (store *Store) EnqueueSourcePolls(ctx context.Context, now time.Time) error
 		}
 		sources = append(sources, value)
 	}
+	type pollJob struct {
+		id, key, payload string
+	}
+	var jobs []pollJob
 	for _, source := range sources {
 		due := true
 		if source.last.Valid {
@@ -151,13 +158,40 @@ func (store *Store) EnqueueSourcePolls(ctx context.Context, now time.Time) error
 		}
 		if due {
 			bucket := now.UTC().Truncate(time.Duration(source.interval) * time.Minute).Format(time.RFC3339)
-			_, err := store.EnqueueJob(ctx, "", "", "ingest_source", now, "source:"+source.id+":"+bucket, map[string]string{"source_id": source.id})
+			jobID, err := ids.New("job")
 			if err != nil {
 				return err
 			}
+			payload, err := json.Marshal(map[string]string{"source_id": source.id})
+			if err != nil {
+				return err
+			}
+			jobs = append(jobs, pollJob{
+				id: jobID, key: "source:" + source.id + ":" + bucket,
+				payload: string(payload),
+			})
 		}
 	}
-	return nil
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+	values := strings.TrimSuffix(strings.Repeat("(?,?,?,?,?),", len(jobs)), ",")
+	arguments := make([]any, 0, len(jobs)*5)
+	for _, job := range jobs {
+		arguments = append(
+			arguments, job.id, "ingest_source", timestamp(now), job.key, job.payload,
+		)
+	}
+	_, err = store.database.ExecContext(ctx, `INSERT INTO job_queue
+		(id,job_type,due_at,idempotency_key,payload_json) VALUES `+values+`
+		ON CONFLICT(idempotency_key) DO NOTHING`, arguments...)
+	return err
 }
 
 func (store *Store) RecoverJobs(ctx context.Context, now time.Time) error {
@@ -182,6 +216,7 @@ func (store *Store) RecoverJobs(ctx context.Context, now time.Time) error {
 	}
 	_, _ = store.database.ExecContext(ctx, `DELETE FROM auth_flows WHERE expires_at<?`, timestamp(now.Add(-24*time.Hour)))
 	_, _ = store.database.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at<? OR revoked_at<?`, timestamp(now.Add(-24*time.Hour)), timestamp(now.Add(-30*24*time.Hour)))
+	_, _ = store.database.ExecContext(ctx, `DELETE FROM rate_limits WHERE updated_at<?`, timestamp(now.Add(-48*time.Hour)))
 	return nil
 }
 
@@ -254,9 +289,34 @@ func (store *Store) LeaseJob(ctx context.Context, jobID, owner string, now time.
 	return Job{ID: jobID, State: state}, ErrJobNotLeasable
 }
 
-func (store *Store) CompleteJob(ctx context.Context, jobID string, now time.Time) error {
-	_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state='completed',lease_owner=NULL,lease_expires_at=NULL,completed_at=?,updated_at=? WHERE id=?`, timestamp(now), timestamp(now), jobID)
-	return err
+func (store *Store) ClaimBlockedJob(ctx context.Context, jobID, owner string, now time.Time) (Job, error) {
+	job, err := scanJob(store.database.QueryRowContext(ctx, `UPDATE job_queue
+		SET state='leased',lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=?
+		WHERE id=? AND job_type='generate_lesson' AND state='blocked_quota' AND attempt_count<max_attempts
+		RETURNING id,sequence,COALESCE(user_id,''),COALESCE(assignment_id,''),job_type,state,due_at,
+			attempt_count,max_attempts,idempotency_key,payload_json`,
+		owner, timestamp(now.Add(4*time.Minute)), timestamp(now), jobID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, ErrJobNotLeasable
+	}
+	return job, err
+}
+
+func (store *Store) CompleteJob(ctx context.Context, jobID, owner string, now time.Time) error {
+	result, err := store.database.ExecContext(ctx, `UPDATE job_queue
+		SET state='completed',lease_owner=NULL,lease_expires_at=NULL,completed_at=?,updated_at=?
+		WHERE id=? AND state='leased' AND lease_owner=?`, timestamp(now), timestamp(now), jobID, owner)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrJobLeaseLost
+	}
+	return nil
 }
 
 func (store *Store) LinkJobAssignment(ctx context.Context, jobID, assignmentID string, now time.Time) error {
@@ -274,23 +334,37 @@ func (store *Store) AssignmentDeliveryState(ctx context.Context, userID, assignm
 	return assignmentState, deliveryState, err
 }
 
-func (store *Store) FailJob(ctx context.Context, job Job, code string, quota bool, now time.Time) error {
+func (store *Store) FailJob(ctx context.Context, job Job, owner, code string, quota bool, now time.Time) error {
+	var result sql.Result
+	var err error
 	if quota {
-		_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state='blocked_quota',due_at=?,
+		result, err = store.database.ExecContext(ctx, `UPDATE job_queue SET state='blocked_quota',due_at=?,
 			lease_owner=NULL,lease_expires_at=NULL,attempt_count=MAX(attempt_count-1,0),
-			last_error_code=?,last_error_at=?,updated_at=? WHERE id=?`,
-			timestamp(now.Add(time.Hour)), code, timestamp(now), timestamp(now), job.ID)
+			last_error_code=?,last_error_at=?,updated_at=?
+			WHERE id=? AND state='leased' AND lease_owner=?`,
+			timestamp(now.Add(time.Hour)), code, timestamp(now), timestamp(now), job.ID, owner)
+	} else {
+		state := "queued"
+		due := now.Add(time.Duration(job.AttemptCount*job.AttemptCount) * time.Minute)
+		if job.AttemptCount >= job.MaxAttempts {
+			state = "failed"
+		}
+		result, err = store.database.ExecContext(ctx, `UPDATE job_queue SET state=?,due_at=?,lease_owner=NULL,lease_expires_at=NULL,
+			last_error_code=?,last_error_at=?,updated_at=?
+			WHERE id=? AND state='leased' AND lease_owner=?`,
+			state, timestamp(due), code, timestamp(now), timestamp(now), job.ID, owner)
+	}
+	if err != nil {
 		return err
 	}
-	state := "queued"
-	due := now.Add(time.Duration(job.AttemptCount*job.AttemptCount) * time.Minute)
-	if job.AttemptCount >= job.MaxAttempts {
-		state = "failed"
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
 	}
-	_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state=?,due_at=?,lease_owner=NULL,lease_expires_at=NULL,
-		last_error_code=?,last_error_at=?,updated_at=? WHERE id=?`,
-		state, timestamp(due), code, timestamp(now), timestamp(now), job.ID)
-	return err
+	if changed != 1 {
+		return ErrJobLeaseLost
+	}
+	return nil
 }
 
 func (store *Store) Job(ctx context.Context, jobID string) (Job, error) {

@@ -20,7 +20,56 @@ import (
 type jobRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function jobRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
-	return function(request)
+	if request.Body == nil {
+		return function(request)
+	}
+	requestBody, _ := io.ReadAll(request.Body)
+	request.Body = io.NopCloser(bytes.NewReader(requestBody))
+	response, err := function(request)
+	if err != nil || response == nil || !startsFreshTursoStream(requestBody) {
+		return response, err
+	}
+	return prependForeignKeyResult(response)
+}
+
+func startsFreshTursoStream(body []byte) bool {
+	var payload struct {
+		Baton    string `json:"baton"`
+		Requests []struct {
+			Statement *struct {
+				SQL string `json:"sql"`
+			} `json:"stmt"`
+		} `json:"requests"`
+	}
+	if json.Unmarshal(body, &payload) != nil || payload.Baton != "" ||
+		len(payload.Requests) == 0 || payload.Requests[0].Statement == nil {
+		return false
+	}
+	return payload.Requests[0].Statement.SQL == "PRAGMA foreign_keys=ON"
+}
+
+func prependForeignKeyResult(response *http.Response) (*http.Response, error) {
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	response.Body.Close()
+	var payload struct {
+		Results []json.RawMessage `json:"results"`
+		Baton   string            `json:"baton,omitempty"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		return response, nil
+	}
+	foreignKeys := json.RawMessage(`{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}`)
+	payload.Results = append([]json.RawMessage{foreignKeys}, payload.Results...)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	response.Body = io.NopCloser(bytes.NewReader(encoded))
+	return response, nil
 }
 
 func TestRunAcknowledgesAJobThatIsNotCurrentlyLeasable(t *testing.T) {
@@ -361,8 +410,8 @@ func TestRecoveryTerminalizesExhaustedJobsAndPreservesQuotaRetries(t *testing.T)
 	if err := store.New(database).RecoverJobs(context.Background(), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(requests) != 5 {
-		t.Fatalf("recovery request count = %d, want 5", len(requests))
+	if len(requests) != 6 {
+		t.Fatalf("recovery request count = %d, want 6", len(requests))
 	}
 	exhaustedSQL := firstTursoSQL(t, requests[0])
 	if !strings.Contains(exhaustedSQL, "state='failed'") || !strings.Contains(exhaustedSQL, "attempt_count>=max_attempts") {
@@ -424,7 +473,7 @@ func TestQuotaFailureDoesNotConsumeTheOrdinaryAttemptBudget(t *testing.T) {
 	defer database.Close()
 
 	job := store.Job{ID: "job_quota", AttemptCount: 5, MaxAttempts: 5}
-	if err := store.New(database).FailJob(context.Background(), job, "ai_quota_exhausted", true, time.Now()); err != nil {
+	if err := store.New(database).FailJob(context.Background(), job, "worker", "ai_quota_exhausted", true, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	quotaFailureSQL := firstTursoSQL(t, requestBody)
@@ -455,7 +504,7 @@ func TestCompletedJobDispatchesTheNextDueJob(t *testing.T) {
 		switch databaseRequestCount {
 		case 1:
 			body = tursoJobResult("job_current", "recover", "leased")
-		case 8:
+		case 9:
 			body = tursoJobResult("job_next", "generate_lesson", "queued")
 		}
 		return &http.Response{
@@ -484,8 +533,8 @@ func TestCompletedJobDispatchesTheNextDueJob(t *testing.T) {
 	if err := service.Run(context.Background(), "job_current", "qstash:test"); err != nil {
 		t.Fatal(err)
 	}
-	if databaseRequestCount != 8 {
-		t.Fatalf("database request count = %d, want 8", databaseRequestCount)
+	if databaseRequestCount != 9 {
+		t.Fatalf("database request count = %d, want 9", databaseRequestCount)
 	}
 	if publishedBody != `{"job_id":"job_next"}` {
 		t.Fatalf("published body = %q, want next job", publishedBody)
@@ -509,6 +558,20 @@ func TestJobExecutionDeadlinePreservesFinalizationTime(t *testing.T) {
 	}
 }
 
+func TestLessonDeliveryTextAddsOneEscapedRecallPrompt(t *testing.T) {
+	message, err := lessonDeliveryText("<b>Part 1/2</b>\nLesson", "What does A < B mean?", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(message, "Quick recall") || !strings.Contains(message, "A &lt; B") {
+		t.Fatalf("recall prompt was not safely added: %s", message)
+	}
+	second, err := lessonDeliveryText("<b>Part 2/2</b>\nLesson", "Question", false)
+	if err != nil || strings.Contains(second, "Quick recall") {
+		t.Fatalf("recall prompt leaked into a later part: %q, %v", second, err)
+	}
+}
+
 func emptyTursoResult() string {
 	return `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":1,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}`
 }
@@ -528,7 +591,14 @@ func firstTursoSQL(t *testing.T, body []byte) string {
 	if len(payload.Requests) == 0 || payload.Requests[0].Statement == nil {
 		t.Fatalf("Turso request has no SQL statement: %s", body)
 	}
-	return payload.Requests[0].Statement.SQL
+	index := 0
+	if payload.Requests[0].Statement.SQL == "PRAGMA foreign_keys=ON" {
+		index = 1
+	}
+	if len(payload.Requests) <= index || payload.Requests[index].Statement == nil {
+		t.Fatalf("Turso request has no application SQL statement: %s", body)
+	}
+	return payload.Requests[index].Statement.SQL
 }
 
 func tursoJobResult(jobID, jobType, state string) string {

@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -17,7 +18,47 @@ type radarManualRoundTripFunc func(*http.Request) (*http.Response, error)
 func (function radarManualRoundTripFunc) RoundTrip(
 	request *http.Request,
 ) (*http.Response, error) {
-	return function(request)
+	requestBody, _ := io.ReadAll(request.Body)
+	request.Body = io.NopCloser(bytes.NewReader(requestBody))
+	response, err := function(request)
+	if err != nil || response == nil || !manualTestStartsFreshStream(requestBody) {
+		return response, err
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	response.Body.Close()
+	var payload struct {
+		Results []json.RawMessage `json:"results"`
+		Baton   string            `json:"baton,omitempty"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		return response, nil
+	}
+	foreignKeys := json.RawMessage(`{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}`)
+	payload.Results = append([]json.RawMessage{foreignKeys}, payload.Results...)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	response.Body = io.NopCloser(bytes.NewReader(encoded))
+	return response, nil
+}
+
+func manualTestStartsFreshStream(body []byte) bool {
+	var payload struct {
+		Baton    string `json:"baton"`
+		Requests []struct {
+			Statement *struct {
+				SQL string `json:"sql"`
+			} `json:"stmt"`
+		} `json:"requests"`
+	}
+	return json.Unmarshal(body, &payload) == nil && payload.Baton == "" &&
+		len(payload.Requests) > 0 && payload.Requests[0].Statement != nil &&
+		payload.Requests[0].Statement.SQL == "PRAGMA foreign_keys=ON"
 }
 
 func TestEnqueueManualRadarBatchUsesSavedTargetWithoutDailyUsage(t *testing.T) {

@@ -27,11 +27,44 @@ function isThemeMode(value: string | null): value is ThemeMode {
 }
 
 function applyTheme(mode: ThemeMode) {
-  if (mode === "system") {
-    document.documentElement.removeAttribute("data-theme");
+  const persistedMode = window.localStorage.getItem(THEME_STORAGE_KEY);
+  if (
+    mode === "system" &&
+    (persistedMode === "light" || persistedMode === "dark")
+  ) {
     return;
   }
-  document.documentElement.setAttribute("data-theme", mode);
+  if (mode === "system") {
+    document.documentElement.removeAttribute("data-theme");
+  } else {
+    document.documentElement.setAttribute("data-theme", mode);
+  }
+
+  const resolvedMode =
+    mode === "system"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light"
+      : mode;
+  if (mode === "system") {
+    document.documentElement.style.removeProperty("color-scheme");
+  } else {
+    document.documentElement.style.colorScheme = resolvedMode;
+  }
+  const themeColor = resolvedMode === "dark" ? "#0f172a" : "#ffffff";
+  document
+    .querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')
+    .forEach((element) => {
+      if (mode !== "system") {
+        element.content = themeColor;
+        return;
+      }
+      element.content = element.media.includes("dark")
+        ? "#0f172a"
+        : element.media.includes("light")
+          ? "#ffffff"
+          : themeColor;
+    });
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {

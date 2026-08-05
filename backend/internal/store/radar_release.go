@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
+	"coreloop/backend/internal/ids"
 	"coreloop/backend/internal/radar"
 )
 
@@ -37,22 +39,18 @@ type radarReleaseCandidate struct {
 // wakeable job.
 func (store *Store) ReleaseRadarCandidates(ctx context.Context, now time.Time) (int, error) {
 	if _, err := store.database.ExecContext(ctx, `UPDATE radar_candidates
-		SET status='rejected',rejection_reason='superseded_ranking_policy',updated_at=?
-		WHERE status='pending' AND ranker_version<>?`,
-		timestamp(now), radar.RankerVersion); err != nil {
-		return 0, err
-	}
-	if _, err := store.database.ExecContext(ctx, `UPDATE radar_candidates
-		SET status='rejected',rejection_reason='below_editorial_threshold',updated_at=?
-		WHERE status='pending' AND ranker_version=? AND relevance_score<?`,
-		timestamp(now), radar.RankerVersion, radar.MinimumDeliveryScore); err != nil {
-		return 0, err
-	}
-	if _, err := store.database.ExecContext(ctx, `UPDATE radar_candidates
-		SET status='rejected',rejection_reason='expired_before_release',updated_at=?
-		WHERE status='pending' AND source_item_id IN (
-			SELECT id FROM source_items WHERE COALESCE(published_at,retrieved_at)<?
-		)`, timestamp(now), timestamp(now.Add(-radarCandidateMaxAge))); err != nil {
+		SET status='rejected',rejection_reason=CASE
+			WHEN ranker_version<>? THEN 'superseded_ranking_policy'
+			WHEN relevance_score<? THEN 'below_editorial_threshold'
+			ELSE 'expired_before_release' END,
+			updated_at=?
+		WHERE status='pending' AND (
+			ranker_version<>? OR relevance_score<? OR source_item_id IN (
+				SELECT id FROM source_items WHERE COALESCE(published_at,retrieved_at)<?
+			)
+		)`, radar.RankerVersion, radar.MinimumDeliveryScore, timestamp(now),
+		radar.RankerVersion, radar.MinimumDeliveryScore,
+		timestamp(now.Add(-radarCandidateMaxAge))); err != nil {
 		return 0, err
 	}
 	users, err := store.radarReleaseUsers(ctx)
@@ -208,62 +206,97 @@ func (store *Store) releaseRadarForUser(
 	}
 
 	candidateIDs := diverseRadarCandidates(candidatePool, sourceUsage, limit)
-	released := 0
+	if len(candidateIDs) == 0 {
+		return 0, tx.Commit()
+	}
+	if err := reserveRadarUsage(ctx, tx, user, localDate, len(candidateIDs), now); err != nil {
+		return 0, err
+	}
+	arguments := make([]any, 0, len(candidateIDs)+3)
+	arguments = append(arguments, timestamp(now), timestamp(now), user.ID)
 	for _, candidateID := range candidateIDs {
-		if user.ItemsPerDay > 0 {
-			result, updateErr := tx.ExecContext(ctx, `UPDATE radar_daily_usage
-				SET released_count=released_count+1,last_released_at=?,updated_at=?
-				WHERE user_id=? AND local_date=? AND released_count<?`,
-				timestamp(now), timestamp(now), user.ID, localDate, user.ItemsPerDay)
-			if updateErr != nil {
-				return 0, updateErr
-			}
-			changed, updateErr := result.RowsAffected()
-			if updateErr != nil {
-				return 0, updateErr
-			}
-			if changed == 0 {
-				break
-			}
-		} else {
-			if _, err := tx.ExecContext(ctx, `UPDATE radar_daily_usage
-				SET released_count=released_count+1,last_released_at=?,updated_at=?
-				WHERE user_id=? AND local_date=?`,
-				timestamp(now), timestamp(now), user.ID, localDate); err != nil {
-				return 0, err
-			}
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE radar_candidates
-			SET status='qualified',released_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'`,
-			timestamp(now), timestamp(now), candidateID, user.ID)
-		if err != nil {
-			return 0, err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return 0, err
-		}
-		if changed == 0 {
-			return 0, fmt.Errorf("reserve Radar candidate %s: %w", candidateID, sql.ErrNoRows)
-		}
-		payload, err := json.Marshal(map[string]string{"candidate_id": candidateID})
-		if err != nil {
-			return 0, err
-		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO job_queue
-			(id,user_id,job_type,due_at,idempotency_key,payload_json)
-			VALUES (?,?,?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING`,
-			mustID("job"), user.ID, "deliver_radar", timestamp(now),
-			"radar-deliver:"+candidateID, string(payload))
-		if err != nil {
-			return 0, err
-		}
-		released++
+		arguments = append(arguments, candidateID)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(candidateIDs)), ",")
+	result, err := tx.ExecContext(ctx, `UPDATE radar_candidates
+		SET status='qualified',released_at=?,updated_at=?
+		WHERE user_id=? AND status='pending' AND id IN (`+placeholders+`)`, arguments...)
+	if err != nil {
+		return 0, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if changed != int64(len(candidateIDs)) {
+		return 0, fmt.Errorf("reserve Radar candidates: %w", sql.ErrNoRows)
+	}
+	if err := insertRadarDeliveryJobs(ctx, tx, user.ID, candidateIDs, now); err != nil {
+		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return released, nil
+	return len(candidateIDs), nil
+}
+
+func reserveRadarUsage(
+	ctx context.Context,
+	tx *sql.Tx,
+	user radarReleaseUser,
+	localDate string,
+	count int,
+	now time.Time,
+) error {
+	statement := `UPDATE radar_daily_usage
+		SET released_count=released_count+?,last_released_at=?,updated_at=?
+		WHERE user_id=? AND local_date=?`
+	arguments := []any{count, timestamp(now), timestamp(now), user.ID, localDate}
+	if user.ItemsPerDay > 0 {
+		statement += " AND released_count+?<=?"
+		arguments = append(arguments, count, user.ItemsPerDay)
+	}
+	result, err := tx.ExecContext(ctx, statement, arguments...)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("reserve Radar daily usage: %w", sql.ErrNoRows)
+	}
+	return nil
+}
+
+func insertRadarDeliveryJobs(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	candidateIDs []string,
+	now time.Time,
+) error {
+	values := strings.TrimSuffix(strings.Repeat("(?,?,?,?,?,?),", len(candidateIDs)), ",")
+	arguments := make([]any, 0, len(candidateIDs)*6)
+	for _, candidateID := range candidateIDs {
+		jobID, err := ids.New("job")
+		if err != nil {
+			return err
+		}
+		payload, err := json.Marshal(map[string]string{"candidate_id": candidateID})
+		if err != nil {
+			return err
+		}
+		arguments = append(
+			arguments, jobID, userID, "deliver_radar", timestamp(now),
+			"radar-deliver:"+candidateID, string(payload),
+		)
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO job_queue
+		(id,user_id,job_type,due_at,idempotency_key,payload_json) VALUES `+values+`
+		ON CONFLICT(idempotency_key) DO NOTHING`, arguments...)
+	return err
 }
 
 func radarReleaseInterval(itemsPerDay int) time.Duration {

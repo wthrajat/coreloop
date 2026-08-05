@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,22 @@ func TestFetchGitHubReleasesUsesOfficialReleaseMetadata(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(item.Summary), "excited") || strings.Contains(strings.ToLower(item.Summary), "register") {
 		t.Fatalf("release summary was not neutralized: %q", item.Summary)
+	}
+}
+
+func TestSourceURLRejectsNonPublicLiteralAddresses(t *testing.T) {
+	for _, rawURL := range []string{
+		"https://127.0.0.1/feed", "https://10.0.0.2/feed",
+		"https://0.0.0.0/feed", "https://100.64.0.1/feed",
+		"https://192.0.2.1/feed", "https://224.0.0.1/feed", "https://[::1]/feed",
+	} {
+		parsed, err := url.Parse(rawURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateSourceURL(parsed); err == nil {
+			t.Fatalf("non-public source was accepted: %s", rawURL)
+		}
 	}
 }
 

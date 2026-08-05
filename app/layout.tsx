@@ -5,6 +5,16 @@ import { ThemeProvider } from "@/components/theme-provider";
 
 import "./globals.css";
 
+const themeBootstrapScript = `(() => {
+  try {
+    const saved = localStorage.getItem("coreloop-theme");
+    if (saved === "light" || saved === "dark") {
+      document.documentElement.setAttribute("data-theme", saved);
+      document.documentElement.style.colorScheme = saved;
+    }
+  } catch {}
+})();`;
+
 export const metadata: Metadata = {
   title: {
     default: "Coreloop",
@@ -24,7 +34,10 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeBootstrapScript }} />
+      </head>
       <body>
         <ThemeProvider>{children}</ThemeProvider>
       </body>

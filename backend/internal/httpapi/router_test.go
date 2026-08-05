@@ -71,6 +71,14 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestRequestClientAddressUsesLastForwardedAddress(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("X-Forwarded-For", "203.0.113.7, 198.51.100.9")
+	if address := requestClientAddress(request); address != "198.51.100.9" {
+		t.Fatalf("client address = %q", address)
+	}
+}
+
 func TestNotReadyHandlerRejectsGet(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/api/jobs", nil)
 	response := httptest.NewRecorder()

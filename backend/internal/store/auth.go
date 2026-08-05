@@ -60,6 +60,34 @@ func (store *Store) CreateAuthFlow(ctx context.Context, flow AuthFlow, stateHash
 	return err
 }
 
+func (store *Store) AllowRateLimit(
+	ctx context.Context,
+	bucketKey string,
+	now time.Time,
+	window time.Duration,
+	limit int,
+) (bool, error) {
+	if limit <= 0 {
+		return false, nil
+	}
+	var requestCount int
+	err := store.database.QueryRowContext(ctx, `INSERT INTO rate_limits
+		(bucket_key,window_started_at,request_count,updated_at) VALUES (?,?,1,?)
+		ON CONFLICT(bucket_key) DO UPDATE SET
+			window_started_at=CASE WHEN rate_limits.window_started_at<=? THEN excluded.window_started_at ELSE rate_limits.window_started_at END,
+			request_count=CASE WHEN rate_limits.window_started_at<=? THEN 1 ELSE rate_limits.request_count+1 END,
+			updated_at=excluded.updated_at
+		WHERE rate_limits.window_started_at<=? OR rate_limits.request_count<?
+		RETURNING request_count`,
+		bucketKey, timestamp(now), timestamp(now), timestamp(now.Add(-window)),
+		timestamp(now.Add(-window)), timestamp(now.Add(-window)), limit,
+	).Scan(&requestCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil && requestCount <= limit, err
+}
+
 func (store *Store) ConsumeAuthFlow(ctx context.Context, stateHash string, now time.Time) (AuthFlow, error) {
 	tx, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
@@ -149,11 +177,15 @@ func (store *Store) UpsertUserFromTelegram(ctx context.Context, identity Identit
 		}
 		user.DisplayName, user.Username, user.AvatarURL = identity.DisplayName, identity.Username, identity.AvatarURL
 	}
+	destinationID, err := ids.New("dst")
+	if err != nil {
+		return User{}, false, err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_destinations
 		(id, user_id, telegram_chat_id) VALUES (?, ?, ?)
 		ON CONFLICT(user_id, channel) DO UPDATE SET telegram_chat_id=excluded.telegram_chat_id,
 		status='connected', enabled=1, connected_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`, mustID("dst"), user.ID, identity.TelegramChatID); err != nil {
+		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`, destinationID, user.ID, identity.TelegramChatID); err != nil {
 		return User{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -173,34 +205,14 @@ func createUserDefaults(ctx context.Context, tx *sql.Tx, userID string) error {
 	if _, err := tx.ExecContext(ctx, "INSERT INTO learning_preferences (user_id) VALUES (?)", userID); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT id FROM topics WHERE status = 'active'")
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_topic_preferences (user_id,topic_id)
+		SELECT ?,id FROM topics WHERE status='active'`, userID); err != nil {
 		return err
 	}
-	var topicIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		topicIDs = append(topicIDs, id)
-	}
-	rows.Close()
-	for _, topicID := range topicIDs {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO user_topic_preferences (user_id, topic_id) VALUES (?, ?)`, userID, topicID); err != nil {
-			return err
-		}
-	}
-	for day := 1; day <= 5; day++ {
-		for _, localTime := range []string{"08:30", "13:00", "20:30"} {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_schedules
-				(id, user_id, day_of_week, local_time) VALUES (?, ?, ?, ?)`, mustID("sch"), userID, day, localTime); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return insertDeliverySchedules(
+		ctx, tx, userID, []string{"08:30", "13:00", "20:30"},
+		"Asia/Kolkata", false,
+	)
 }
 
 type queryRower interface {
@@ -308,19 +320,14 @@ func (store *Store) DeleteUser(ctx context.Context, userID string, now time.Time
 	if err != nil {
 		return err
 	}
-	changed, _ := result.RowsAffected()
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if changed != 1 {
 		return sql.ErrNoRows
 	}
 	return tx.Commit()
-}
-
-func mustID(prefix string) string {
-	value, err := ids.New(prefix)
-	if err != nil {
-		panic(err)
-	}
-	return value
 }
 
 func timestamp(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) }

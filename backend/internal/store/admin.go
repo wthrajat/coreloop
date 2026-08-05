@@ -21,14 +21,17 @@ type Operations struct {
 
 func (store *Store) Operations(ctx context.Context) (Operations, error) {
 	var value Operations
-	queries := []struct {
-		destination *int
-		query       string
-	}{{&value.Queued, "SELECT COUNT(*) FROM job_queue WHERE state='queued'"}, {&value.Leased, "SELECT COUNT(*) FROM job_queue WHERE state='leased'"}, {&value.Failed, "SELECT COUNT(*) FROM job_queue WHERE state='failed'"}, {&value.BlockedQuota, "SELECT COUNT(*) FROM job_queue WHERE state='blocked_quota'"}, {&value.Users, "SELECT COUNT(*) FROM users WHERE status='active'"}, {&value.Sources, "SELECT COUNT(*) FROM sources WHERE enabled=1"}}
-	for _, item := range queries {
-		if err := store.database.QueryRowContext(ctx, item.query).Scan(item.destination); err != nil {
-			return value, err
-		}
+	if err := store.database.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM job_queue WHERE state='queued'),
+		(SELECT COUNT(*) FROM job_queue WHERE state='leased'),
+		(SELECT COUNT(*) FROM job_queue WHERE state='failed'),
+		(SELECT COUNT(*) FROM job_queue WHERE state='blocked_quota'),
+		(SELECT COUNT(*) FROM users WHERE status='active'),
+		(SELECT COUNT(*) FROM sources WHERE enabled=1)`).Scan(
+		&value.Queued, &value.Leased, &value.Failed, &value.BlockedQuota,
+		&value.Users, &value.Sources,
+	); err != nil {
+		return value, err
 	}
 	rows, err := store.database.QueryContext(ctx, `SELECT id,created_at,attempt_count FROM job_queue WHERE state='blocked_quota' ORDER BY sequence LIMIT 50`)
 	if err != nil {
@@ -42,7 +45,7 @@ func (store *Store) Operations(ctx context.Context) (Operations, error) {
 		}
 		value.BlockedJobs = append(value.BlockedJobs, job)
 	}
-	return value, nil
+	return value, rows.Err()
 }
 
 func (store *Store) ExportUser(ctx context.Context, userID string) (map[string]any, error) {

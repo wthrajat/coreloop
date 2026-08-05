@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"strings"
 	"time"
 
 	"coreloop/backend/internal/content"
@@ -12,12 +14,13 @@ import (
 )
 
 type LessonPlan struct {
-	UserID       string
-	ThemeBlockID string
-	Topic        Topic
-	Position     int
-	Profile      LearningProfile
-	Preferences  Preferences
+	UserID        string
+	ThemeBlockID  string
+	Topic         Topic
+	Position      int
+	Prerequisites []string
+	Profile       LearningProfile
+	Preferences   Preferences
 }
 
 func (store *Store) PlanNextLesson(ctx context.Context, userID string, now time.Time) (LessonPlan, error) {
@@ -85,10 +88,17 @@ func (store *Store) PlanNextLesson(ctx context.Context, userID string, now time.
 	if err := json.Unmarshal([]byte(objectives), &topic.Objectives); err != nil {
 		return LessonPlan{}, err
 	}
+	var prerequisiteList []string
+	if err := json.Unmarshal([]byte(prerequisites), &prerequisiteList); err != nil {
+		return LessonPlan{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return LessonPlan{}, err
 	}
-	return LessonPlan{UserID: userID, ThemeBlockID: themeID, Topic: topic, Position: position, Profile: profile, Preferences: preferences}, nil
+	return LessonPlan{
+		UserID: userID, ThemeBlockID: themeID, Topic: topic, Position: position,
+		Prerequisites: prerequisiteList, Profile: profile, Preferences: preferences,
+	}, nil
 }
 
 func activePath(ctx context.Context, tx *sql.Tx, userID string) (string, error) {
@@ -109,13 +119,25 @@ func activePath(ctx context.Context, tx *sql.Tx, userID string) (string, error) 
 }
 
 func (plan LessonPlan) Context() content.LessonContext {
-	objectives := plan.Topic.Objectives
+	allObjectives := append([]string(nil), plan.Topic.Objectives...)
+	objectives := allObjectives
 	if len(objectives) > 0 {
 		objectives = []string{objectives[(plan.Position-1)%len(objectives)]}
 	}
+	covered := make([]string, 0, len(allObjectives))
+	seen := make(map[string]struct{}, len(allObjectives))
+	for position := 1; position < plan.Position && len(allObjectives) > 0; position++ {
+		objective := allObjectives[(position-1)%len(allObjectives)]
+		if _, exists := seen[objective]; exists {
+			continue
+		}
+		seen[objective] = struct{}{}
+		covered = append(covered, objective)
+	}
 	return content.LessonContext{TopicID: plan.Topic.ID, Topic: plan.Topic.Title, Level: plan.Profile.CurrentLevel,
 		Minutes: plan.Preferences.LessonMinutes, Depth: plan.Preferences.ExplanationDepth, ThemeID: plan.ThemeBlockID,
-		Position: plan.Position, Objectives: objectives}
+		Position: plan.Position, Objectives: objectives,
+		Prerequisites: append([]string(nil), plan.Prerequisites...), CoveredObjectives: covered}
 }
 
 func (store *Store) SaveGeneratedLesson(ctx context.Context, plan LessonPlan, generated content.Generated, parts []string, cacheKey string, now time.Time) (string, string, error) {
@@ -146,19 +168,16 @@ func (store *Store) SaveGeneratedLesson(ctx context.Context, plan LessonPlan, ge
 		if err != nil {
 			return "", "", err
 		}
-		for index, part := range parts {
-			partID := mustID("part")
-			_, err = tx.ExecContext(ctx, `INSERT INTO lesson_parts
-			(id,lesson_id,sequence_number,total_parts,rendered_text,character_count,renderer_version) VALUES (?,?,?,?,?,?,?)`,
-				partID, lessonID, index+1, len(parts), part, len([]rune(part)), "telegram-html-v1")
-			if err != nil {
-				return "", "", err
-			}
+		if err := insertLessonParts(ctx, tx, lessonID, parts); err != nil {
+			return "", "", err
 		}
 	} else if err != nil {
 		return "", "", err
 	}
-	assignmentID := mustID("asn")
+	assignmentID, err := ids.New("asn")
+	if err != nil {
+		return "", "", err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO lesson_assignments
 		(id,user_id,lesson_id,theme_block_id,schedule_position,assignment_reason,state,assigned_at)
 		VALUES (?,?,?,?,?,'new','queued',?) ON CONFLICT(user_id,theme_block_id,schedule_position) DO NOTHING`,
@@ -170,10 +189,53 @@ func (store *Store) SaveGeneratedLesson(ctx context.Context, plan LessonPlan, ge
 	if err := tx.QueryRowContext(ctx, `SELECT id FROM lesson_assignments WHERE user_id=? AND theme_block_id=? AND schedule_position=?`, plan.UserID, plan.ThemeBlockID, plan.Position).Scan(&storedAssignment); err != nil {
 		return "", "", err
 	}
+	if err := attachDueRecall(ctx, tx, plan.UserID, storedAssignment, now); err != nil {
+		return "", "", err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", "", err
 	}
 	return lessonID, storedAssignment, nil
+}
+
+func attachDueRecall(
+	ctx context.Context,
+	execer sqlExecer,
+	userID string,
+	assignmentID string,
+	now time.Time,
+) error {
+	_, err := execer.ExecContext(ctx, `UPDATE lesson_assignments
+		SET recall_review_id=(SELECT r.id FROM reviews r
+			WHERE r.user_id=? AND r.state IN ('scheduled','due') AND r.due_at<=?
+			AND NOT EXISTS (SELECT 1 FROM lesson_assignments used
+				WHERE used.recall_review_id=r.id)
+			ORDER BY r.due_at,r.id LIMIT 1)
+		WHERE id=? AND user_id=? AND recall_review_id IS NULL`,
+		userID, timestamp(now), assignmentID, userID)
+	return err
+}
+
+func insertLessonParts(ctx context.Context, tx *sql.Tx, lessonID string, parts []string) error {
+	if len(parts) == 0 {
+		return nil
+	}
+	values := strings.TrimSuffix(strings.Repeat("(?,?,?,?,?,?,?),", len(parts)), ",")
+	arguments := make([]any, 0, len(parts)*7)
+	for index, part := range parts {
+		partID, err := ids.New("part")
+		if err != nil {
+			return err
+		}
+		arguments = append(
+			arguments, partID, lessonID, index+1, len(parts), part,
+			len([]rune(part)), "telegram-html-v1",
+		)
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO lesson_parts
+		(id,lesson_id,sequence_number,total_parts,rendered_text,character_count,renderer_version)
+		VALUES `+values, arguments...)
+	return err
 }
 
 func (store *Store) CachedLesson(ctx context.Context, cacheKey string) (content.LessonDraft, string, []string, error) {
@@ -203,8 +265,11 @@ func (store *Store) CachedLesson(ctx context.Context, cacheKey string) (content.
 }
 
 func (store *Store) AssignCachedLesson(ctx context.Context, plan LessonPlan, lessonID string, now time.Time) (string, error) {
-	id := mustID("asn")
-	_, err := store.database.ExecContext(ctx, `INSERT INTO lesson_assignments
+	id, err := ids.New("asn")
+	if err != nil {
+		return "", err
+	}
+	_, err = store.database.ExecContext(ctx, `INSERT INTO lesson_assignments
 		(id,user_id,lesson_id,theme_block_id,schedule_position,assignment_reason,state,assigned_at)
 		VALUES (?,?,?,?,?,'new','queued',?) ON CONFLICT(user_id,theme_block_id,schedule_position) DO NOTHING`,
 		id, plan.UserID, lessonID, plan.ThemeBlockID, plan.Position, timestamp(now))
@@ -212,5 +277,26 @@ func (store *Store) AssignCachedLesson(ctx context.Context, plan LessonPlan, les
 		return "", err
 	}
 	err = store.database.QueryRowContext(ctx, `SELECT id FROM lesson_assignments WHERE user_id=? AND theme_block_id=? AND schedule_position=?`, plan.UserID, plan.ThemeBlockID, plan.Position).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	if err := attachDueRecall(ctx, store.database, plan.UserID, id, now); err != nil {
+		return "", err
+	}
 	return id, err
+}
+
+func (store *Store) AssignmentRecallQuestion(
+	ctx context.Context,
+	userID string,
+	assignmentID string,
+) (string, error) {
+	var question string
+	err := store.database.QueryRowContext(ctx, `SELECT r.question_text
+		FROM lesson_assignments la JOIN reviews r ON r.id=la.recall_review_id
+		WHERE la.id=? AND la.user_id=?`, assignmentID, userID).Scan(&question)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return question, err
 }

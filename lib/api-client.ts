@@ -1,12 +1,20 @@
 export class APIError extends Error {
-  constructor(
-    public status: number,
-    public code: string,
-    message: string,
-  ) {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
     super(message);
+    this.name = "APIError";
+    this.status = status;
+    this.code = code;
   }
 }
+
+export type APIRequestInit = RequestInit & {
+  timeoutMs?: number;
+};
+
+const defaultRequestTimeoutMs = 20_000;
 
 function cookie(name: string): string {
   if (typeof document === "undefined") return "";
@@ -18,20 +26,50 @@ function cookie(name: string): string {
 
 export async function api<T>(
   path: string,
-  options: RequestInit = {},
+  options: APIRequestInit = {},
 ): Promise<T> {
-  const method = options.method?.toUpperCase() ?? "GET";
-  const headers = new Headers(options.headers);
-  if (options.body) headers.set("Content-Type", "application/json");
+  const { timeoutMs = defaultRequestTimeoutMs, ...requestOptions } = options;
+  const method = requestOptions.method?.toUpperCase() ?? "GET";
+  const headers = new Headers(requestOptions.headers);
+  if (requestOptions.body) headers.set("Content-Type", "application/json");
   if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
     headers.set("X-CSRF-Token", cookie("coreloop_csrf"));
   }
-  const response = await fetch(`/api/app${path}`, {
-    ...options,
-    headers,
-    credentials: "same-origin",
-    cache: "no-store",
-  });
+
+  const requestController = new AbortController();
+  const sourceSignal = requestOptions.signal;
+  const abortFromSource = () => requestController.abort(sourceSignal?.reason);
+  if (sourceSignal?.aborted) abortFromSource();
+  else sourceSignal?.addEventListener("abort", abortFromSource, { once: true });
+
+  let timedOut = false;
+  const timeoutID = globalThis.setTimeout(() => {
+    timedOut = true;
+    requestController.abort();
+  }, timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(`/api/app${path}`, {
+      ...requestOptions,
+      headers,
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: requestController.signal,
+    });
+  } catch (error) {
+    if (timedOut) {
+      throw new APIError(
+        408,
+        "request_timeout",
+        "The request took too long. Please try again.",
+      );
+    }
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timeoutID);
+    sourceSignal?.removeEventListener("abort", abortFromSource);
+  }
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as {
       error?: { code?: string; message?: string };

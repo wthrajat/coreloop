@@ -1,13 +1,22 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { PageHeader } from "@/components/page-header";
 import { api } from "@/lib/api-client";
 
 export default function ProfilePage() {
   const [message, setMessage] = useState("");
+  const [messageIsError, setMessageIsError] = useState(false);
+  const [pendingAction, setPendingAction] = useState<"export" | "delete" | "">(
+    "",
+  );
+  const actionActive = useRef(false);
   async function exportData() {
+    if (actionActive.current) return;
+    actionActive.current = true;
+    setPendingAction("export");
+    setMessage("");
     try {
       const value = await api<Record<string, unknown>>("/export");
       const blob = new Blob([JSON.stringify(value, null, 2)], {
@@ -17,25 +26,39 @@ export default function ProfilePage() {
       const link = document.createElement("a");
       link.href = href;
       link.download = "coreloop-export.json";
+      document.body.append(link);
       link.click();
-      URL.revokeObjectURL(href);
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(href), 0);
+      setMessageIsError(false);
       setMessage("Export downloaded.");
     } catch (error) {
+      setMessageIsError(true);
       setMessage(error instanceof Error ? error.message : "Export failed.");
+    } finally {
+      actionActive.current = false;
+      setPendingAction("");
     }
   }
   async function deleteAccount() {
+    if (actionActive.current) return;
     if (
       !window.confirm(
         "Permanently delete this profile, preferences, progress, delivery history, and Telegram connection? This cannot be undone.",
       )
     )
       return;
+    actionActive.current = true;
+    setPendingAction("delete");
+    setMessage("");
     try {
       await api<void>("/account", { method: "DELETE" });
       window.location.assign("/");
     } catch (error) {
+      setMessageIsError(true);
       setMessage(error instanceof Error ? error.message : "Deletion failed.");
+      actionActive.current = false;
+      setPendingAction("");
     }
   }
   return (
@@ -44,6 +67,19 @@ export default function ProfilePage() {
         title="Profile and privacy"
         description="Export the information owned by your profile or permanently remove it from this instance."
       />
+      {message ? (
+        <section
+          className={`notice ${messageIsError ? "notice-error" : "notice-success"}`}
+          role={messageIsError ? "alert" : "status"}
+        >
+          <div>
+            <strong>
+              {messageIsError ? "Action failed" : "Action complete"}
+            </strong>
+            <p>{message}</p>
+          </div>
+        </section>
+      ) : null}
       <section className="settings-section">
         <div className="settings-heading">
           <h2>Portable data</h2>
@@ -56,11 +92,14 @@ export default function ProfilePage() {
         <div className="action-panel">
           <button
             className="button button-secondary"
+            disabled={Boolean(pendingAction)}
             onClick={() => void exportData()}
+            type="button"
           >
-            Download JSON export
+            {pendingAction === "export"
+              ? "Preparing export…"
+              : "Download JSON export"}
           </button>
-          {message ? <p role="status">{message}</p> : null}
         </div>
       </section>
       <section className="settings-section danger-section">
@@ -75,9 +114,13 @@ export default function ProfilePage() {
         <div className="action-panel">
           <button
             className="button button-danger"
+            disabled={Boolean(pendingAction)}
             onClick={() => void deleteAccount()}
+            type="button"
           >
-            Delete my profile
+            {pendingAction === "delete"
+              ? "Deleting profile…"
+              : "Delete my profile"}
           </button>
         </div>
       </section>

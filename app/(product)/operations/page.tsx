@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/page-header";
 import { StatusPill } from "@/components/status-pill";
 import { api } from "@/lib/api-client";
 import type { ManualLesson, ManualRadar, Operations } from "@/lib/api-types";
+import { formatIndiaDateTime } from "@/lib/date-time";
 
 const ACTIVE_LESSON_STATES = new Set<ManualLesson["state"]>([
   "queued",
@@ -22,17 +23,41 @@ export default function OperationsPage() {
   const [operations, setOperations] = useState<Operations | null>(null);
   const [inviteURL, setInviteURL] = useState("");
   const [message, setMessage] = useState("");
+  const [messageTitle, setMessageTitle] = useState("");
   const [messageIsError, setMessageIsError] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [invitePending, setInvitePending] = useState(false);
+  const [copyPending, setCopyPending] = useState(false);
+  const [openAIPendingJob, setOpenAIPendingJob] = useState("");
   const [lesson, setLesson] = useState<ManualLesson | null>(null);
   const [lessonStarting, setLessonStarting] = useState(false);
   const [lessonError, setLessonError] = useState("");
   const [radar, setRadar] = useState<ManualRadar | null>(null);
   const [radarStarting, setRadarStarting] = useState(false);
   const [radarError, setRadarError] = useState("");
+  const lessonRequestID = useRef("");
+  const radarRequestID = useRef("");
+  const inviteRequestActive = useRef(false);
+  const openAIRequestActive = useRef(false);
 
   const refresh = useCallback(async () => {
-    setOperations(await api<Operations>("/operations"));
+    const value = await api<Operations>("/operations");
+    setOperations(value);
+    setLoadError("");
   }, []);
+
+  const retryLoad = useCallback(async () => {
+    setLoadError("");
+    try {
+      await refresh();
+    } catch (reason) {
+      setLoadError(
+        reason instanceof Error
+          ? reason.message
+          : "Operational state could not be loaded.",
+      );
+    }
+  }, [refresh]);
 
   useEffect(() => {
     let active = true;
@@ -41,7 +66,7 @@ export default function OperationsPage() {
         if (active) setOperations(value);
       })
       .catch((reason: Error) => {
-        if (active) setMessage(reason.message);
+        if (active) setLoadError(reason.message);
       });
     return () => {
       active = false;
@@ -54,16 +79,28 @@ export default function OperationsPage() {
     const currentJobID = jobID;
 
     let active = true;
+    let pollTimer: number | undefined;
+    let requestController: AbortController | undefined;
     async function pollLesson() {
       try {
+        requestController = new AbortController();
         const value = await api<ManualLesson>(
           `/operations/lessons/${encodeURIComponent(currentJobID)}`,
+          { signal: requestController.signal, timeoutMs: 10_000 },
         );
         if (!active) return;
         setLesson(value);
         setLessonError("");
         if (!ACTIVE_LESSON_STATES.has(value.state)) {
-          await refresh();
+          void refresh().catch(() => {
+            if (!active) return;
+            setMessageIsError(true);
+            setMessageTitle("Queue summary unavailable");
+            setMessage(
+              "Lesson status is complete, but the queue summary could not be refreshed.",
+            );
+          });
+          return;
         }
       } catch (error) {
         if (!active) return;
@@ -73,14 +110,14 @@ export default function OperationsPage() {
             : "Lesson status could not be refreshed.",
         );
       }
+      if (active) pollTimer = window.setTimeout(() => void pollLesson(), 2000);
     }
 
-    const firstPoll = window.setTimeout(() => void pollLesson(), 800);
-    const pollInterval = window.setInterval(() => void pollLesson(), 2000);
+    pollTimer = window.setTimeout(() => void pollLesson(), 800);
     return () => {
       active = false;
-      window.clearTimeout(firstPoll);
-      window.clearInterval(pollInterval);
+      requestController?.abort();
+      if (pollTimer !== undefined) window.clearTimeout(pollTimer);
     };
   }, [lesson?.job_id, lesson?.state, refresh]);
 
@@ -90,16 +127,28 @@ export default function OperationsPage() {
     const currentBatchID = batchID;
 
     let active = true;
+    let pollTimer: number | undefined;
+    let requestController: AbortController | undefined;
     async function pollRadar() {
       try {
+        requestController = new AbortController();
         const value = await api<ManualRadar>(
           `/operations/radar/${encodeURIComponent(currentBatchID)}`,
+          { signal: requestController.signal, timeoutMs: 10_000 },
         );
         if (!active) return;
         setRadar(value);
         setRadarError("");
         if (!ACTIVE_RADAR_STATES.has(value.state)) {
-          await refresh();
+          void refresh().catch(() => {
+            if (!active) return;
+            setMessageIsError(true);
+            setMessageTitle("Queue summary unavailable");
+            setMessage(
+              "Radar delivery is complete, but the queue summary could not be refreshed.",
+            );
+          });
+          return;
         }
       } catch (error) {
         if (!active) return;
@@ -109,56 +158,85 @@ export default function OperationsPage() {
             : "Radar status could not be refreshed.",
         );
       }
+      if (active) pollTimer = window.setTimeout(() => void pollRadar(), 2000);
     }
 
-    const firstPoll = window.setTimeout(() => void pollRadar(), 800);
-    const pollInterval = window.setInterval(() => void pollRadar(), 2000);
+    pollTimer = window.setTimeout(() => void pollRadar(), 800);
     return () => {
       active = false;
-      window.clearTimeout(firstPoll);
-      window.clearInterval(pollInterval);
+      requestController?.abort();
+      if (pollTimer !== undefined) window.clearTimeout(pollTimer);
     };
   }, [radar?.batch_id, radar?.state, refresh]);
 
   async function sendLessonNow() {
+    if (lessonStarting) return;
+    const requestID = lessonRequestID.current || crypto.randomUUID();
+    lessonRequestID.current = requestID;
     setLessonStarting(true);
     setLessonError("");
     try {
       const value = await api<ManualLesson>("/operations/lessons", {
         method: "POST",
-        body: JSON.stringify({ request_id: crypto.randomUUID() }),
+        body: JSON.stringify({ request_id: requestID }),
       });
+      lessonRequestID.current = "";
       setLesson(value);
-      await refresh();
     } catch (error) {
       setLessonError(
         error instanceof Error ? error.message : "Lesson creation failed.",
       );
+      return;
     } finally {
       setLessonStarting(false);
+    }
+    try {
+      await refresh();
+    } catch {
+      setMessageIsError(true);
+      setMessageTitle("Queue summary unavailable");
+      setMessage(
+        "The lesson job was accepted, but the queue summary could not be refreshed.",
+      );
     }
   }
 
   async function sendRadarNow() {
+    if (radarStarting) return;
+    const requestID = radarRequestID.current || crypto.randomUUID();
+    radarRequestID.current = requestID;
     setRadarStarting(true);
     setRadarError("");
     try {
       const value = await api<ManualRadar>("/operations/radar", {
         method: "POST",
-        body: JSON.stringify({ request_id: crypto.randomUUID() }),
+        body: JSON.stringify({ request_id: requestID }),
       });
+      radarRequestID.current = "";
       setRadar(value);
-      await refresh();
     } catch (error) {
       setRadarError(
         error instanceof Error ? error.message : "Radar delivery failed.",
       );
+      return;
     } finally {
       setRadarStarting(false);
+    }
+    try {
+      await refresh();
+    } catch {
+      setMessageIsError(true);
+      setMessageTitle("Queue summary unavailable");
+      setMessage(
+        "The Radar batch was accepted, but the queue summary could not be refreshed.",
+      );
     }
   }
 
   async function createInvite() {
+    if (inviteRequestActive.current) return;
+    inviteRequestActive.current = true;
+    setInvitePending(true);
     try {
       const value = await api<{ url: string }>("/invites", {
         method: "POST",
@@ -166,28 +244,61 @@ export default function OperationsPage() {
       });
       setInviteURL(value.url);
       setMessageIsError(false);
+      setMessageTitle("Invite ready");
       setMessage("A single-use seven-day invite is ready.");
     } catch (error) {
       setMessageIsError(true);
+      setMessageTitle("Invite creation failed");
       setMessage(
         error instanceof Error ? error.message : "Invite creation failed.",
       );
+    } finally {
+      inviteRequestActive.current = false;
+      setInvitePending(false);
+    }
+  }
+
+  async function copyInvite() {
+    if (copyPending || !inviteURL) return;
+    setCopyPending(true);
+    try {
+      await navigator.clipboard.writeText(inviteURL);
+      setMessageIsError(false);
+      setMessageTitle("Invite copied");
+      setMessage("Invite link copied.");
+    } catch (error) {
+      setMessageIsError(true);
+      setMessageTitle("Copy failed");
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Invite link could not be copied.",
+      );
+    } finally {
+      setCopyPending(false);
     }
   }
 
   async function runOpenAI(jobID: string) {
+    if (openAIRequestActive.current) return;
     if (
       !window.confirm(
         "Run this one blocked lesson with paid OpenAI credits? This is the only paid-provider path.",
       )
     )
       return;
+    openAIRequestActive.current = true;
+    setOpenAIPendingJob(jobID);
+    let openAICompleted = false;
     try {
       await api<void>("/operations/openai", {
         method: "POST",
         body: JSON.stringify({ job_id: jobID }),
+        timeoutMs: 55_000,
       });
+      openAICompleted = true;
       setMessageIsError(false);
+      setMessageTitle("OpenAI run complete");
       setMessage(
         "The explicit OpenAI run completed and its delivery is queued.",
       );
@@ -207,19 +318,54 @@ export default function OperationsPage() {
           );
         }
       }
-      await refresh();
     } catch (error) {
       setMessageIsError(true);
+      setMessageTitle("OpenAI run failed");
       setMessage(error instanceof Error ? error.message : "OpenAI run failed.");
+    } finally {
+      openAIRequestActive.current = false;
+      setOpenAIPendingJob("");
+    }
+    if (!openAICompleted) return;
+    try {
+      await refresh();
+    } catch {
+      setMessageIsError(true);
+      setMessageTitle("Queue summary unavailable");
+      setMessage(
+        "The OpenAI run completed, but the queue summary could not be refreshed.",
+      );
     }
   }
 
   if (!operations) {
+    if (loadError) {
+      return (
+        <div className="page-stack">
+          <PageHeader
+            title="Operations"
+            description="Owner-only queue and delivery controls."
+          />
+          <section className="notice notice-error" role="alert">
+            <div>
+              <strong>Operational state unavailable</strong>
+              <p>{loadError}</p>
+            </div>
+            <button
+              className="button button-secondary"
+              onClick={() => void retryLoad()}
+              type="button"
+            >
+              Try again
+            </button>
+          </section>
+        </div>
+      );
+    }
     return (
-      <div className="page-stack">
-        <span className="loading-line" />
+      <div className="page-stack" role="status">
+        <span aria-hidden="true" className="loading-line" />
         <p className="muted-copy">Loading operational state…</p>
-        {message ? <p className="field-error">{message}</p> : null}
       </div>
     );
   }
@@ -232,9 +378,11 @@ export default function OperationsPage() {
         action={
           <button
             className="button button-secondary"
+            disabled={invitePending}
             onClick={() => void createInvite()}
+            type="button"
           >
-            Create invite
+            {invitePending ? "Creating invite…" : "Create invite"}
           </button>
         }
       />
@@ -256,9 +404,7 @@ export default function OperationsPage() {
           role={messageIsError ? "alert" : "status"}
         >
           <div>
-            <strong>
-              {messageIsError ? "Owner action failed" : "Owner action complete"}
-            </strong>
+            <strong>{messageTitle}</strong>
             <p>{message}</p>
           </div>
         </section>
@@ -279,9 +425,11 @@ export default function OperationsPage() {
           </label>
           <button
             className="button button-secondary"
-            onClick={() => void navigator.clipboard.writeText(inviteURL)}
+            disabled={copyPending}
+            onClick={() => void copyInvite()}
+            type="button"
           >
-            Copy link
+            {copyPending ? "Copying…" : "Copy link"}
           </button>
         </section>
       ) : null}
@@ -320,18 +468,17 @@ export default function OperationsPage() {
                     Attempt {job.attempt_count}
                   </span>
                   <h3>{job.id}</h3>
-                  <p>
-                    {new Intl.DateTimeFormat("en-IN", {
-                      dateStyle: "medium",
-                      timeStyle: "short",
-                    }).format(new Date(job.created_at))}
-                  </p>
+                  <p>{formatIndiaDateTime(job.created_at)}</p>
                 </div>
                 <button
                   className="button button-secondary"
+                  disabled={Boolean(openAIPendingJob)}
                   onClick={() => void runOpenAI(job.id)}
+                  type="button"
                 >
-                  Use OpenAI once
+                  {openAIPendingJob === job.id
+                    ? "Running with OpenAI…"
+                    : "Use OpenAI once"}
                 </button>
               </li>
             ))}
@@ -456,6 +603,7 @@ function OwnerDeliveryPanel({
         className="button button-primary lesson-now-action"
         disabled={disabled}
         onClick={onSend}
+        type="button"
       >
         {actionLabel}
       </button>

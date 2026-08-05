@@ -1,6 +1,11 @@
 .impeccable/
 docs/*
 !docs/local-development.md
+!docs/deployment.md
+!docs/runbook.md
+!docs/SECURITY.md
+!docs/external-contracts.md
+!docs/contributing.md
 .DS_Store
 .env
 .env.local

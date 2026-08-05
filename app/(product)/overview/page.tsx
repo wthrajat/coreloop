@@ -7,6 +7,7 @@ import { PageHeader } from "@/components/page-header";
 import { StatusPill } from "@/components/status-pill";
 import { api } from "@/lib/api-client";
 import type { Overview } from "@/lib/api-types";
+import { formatIndiaDateTime } from "@/lib/date-time";
 
 export default function OverviewPage() {
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -24,11 +25,7 @@ export default function OverviewPage() {
   if (!overview) return null;
 
   const nextDelivery = overview.next_delivery_at
-    ? new Intl.DateTimeFormat("en-IN", {
-        dateStyle: "medium",
-        timeStyle: "short",
-        timeZone: "Asia/Kolkata",
-      }).format(new Date(overview.next_delivery_at))
+    ? formatIndiaDateTime(overview.next_delivery_at)
     : "Waiting for schedule";
   const quotaBlocked = overview.queue_state === "quota_exhausted";
 
@@ -166,8 +163,8 @@ export default function OverviewPage() {
 
 function PageLoading({ label }: { label: string }) {
   return (
-    <div className="page-stack">
-      <span className="loading-line" />
+    <div className="page-stack" role="status">
+      <span aria-hidden="true" className="loading-line" />
       <p className="muted-copy">{label}</p>
     </div>
   );
@@ -183,6 +180,7 @@ function PageError({ message }: { message: string }) {
         <button
           className="button button-secondary"
           onClick={() => window.location.reload()}
+          type="button"
         >
           Try again
         </button>

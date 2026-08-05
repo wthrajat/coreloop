@@ -6,6 +6,28 @@ import (
 	"testing"
 )
 
+func TestCacheKeyIncludesThemeProgression(t *testing.T) {
+	first := LessonContext{
+		TopicID: "topic_databases", Position: 1,
+		Objectives: []string{"Explain replication"},
+	}
+	fifth := first
+	fifth.Position = 5
+	fifth.CoveredObjectives = []string{"Explain replication", "Compare consistency models"}
+
+	firstKey, err := CacheKey(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fifthKey, err := CacheKey(fifth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstKey == fifthKey {
+		t.Fatal("different theme positions must not reuse the same cached lesson")
+	}
+}
+
 func TestCompileRequiresSimpleLanguageAndInlineDefinitions(t *testing.T) {
 	system, input, err := Compile(LessonContext{
 		Topic: "Database replication", Minutes: 30, Depth: "detailed",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"coreloop/backend/internal/content"
 	"coreloop/backend/internal/ids"
 )
+
+var ErrAssignmentAlreadyMarked = errors.New("assignment already has a different final state")
 
 func (store *Store) Topics(ctx context.Context) ([]Topic, error) {
 	rows, err := store.database.QueryContext(ctx, `SELECT id, slug, title, lane, difficulty, objectives_json
@@ -113,12 +116,35 @@ func (store *Store) Preferences(ctx context.Context, userID string) (Preferences
 }
 
 func (store *Store) UpdateProfile(ctx context.Context, userID string, profile LearningProfile) error {
-	_, err := store.database.ExecContext(ctx, `UPDATE learning_profiles SET current_level=?, goals_json=?,
+	return updateProfile(ctx, store.database, userID, profile)
+}
+
+type sqlExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func updateProfile(
+	ctx context.Context,
+	execer sqlExecer,
+	userID string,
+	profile LearningProfile,
+) error {
+	result, err := execer.ExecContext(ctx, `UPDATE learning_profiles SET current_level=?, goals_json=?,
 		target_roles_json=?, current_technologies_json=?, target_technologies_json=?,
 		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE user_id=?`, profile.CurrentLevel,
 		encodeStrings(profile.Goals), encodeStrings(profile.TargetRoles), encodeStrings(profile.CurrentTechnologies),
 		encodeStrings(profile.TargetTechnologies), userID)
-	return err
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (store *Store) UpdatePreferences(ctx context.Context, userID string, preferences Preferences) error {
@@ -127,11 +153,43 @@ func (store *Store) UpdatePreferences(ctx context.Context, userID string, prefer
 		return err
 	}
 	defer tx.Rollback()
+	if err := updatePreferences(ctx, tx, userID, preferences); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (store *Store) UpdateConfiguration(
+	ctx context.Context,
+	userID string,
+	profile LearningProfile,
+	preferences Preferences,
+) error {
+	tx, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := updateProfile(ctx, tx, userID, profile); err != nil {
+		return err
+	}
+	if err := updatePreferences(ctx, tx, userID, preferences); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func updatePreferences(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	preferences Preferences,
+) error {
 	var paused any
 	if preferences.PausedUntil != nil {
 		paused = timestamp(*preferences.PausedUntil)
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE learning_preferences SET lesson_minutes=?, explanation_depth=?,
+	_, err := tx.ExecContext(ctx, `UPDATE learning_preferences SET lesson_minutes=?, explanation_depth=?,
 		lessons_per_day=?, radar_enabled=?, radar_items_per_day=?, radar_weekends_enabled=?, recall_mode=?,
 		weekends_enabled=?, bundle_mode=?, time_zone=?, paused_until=?,
 		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE user_id=?`,
@@ -145,59 +203,94 @@ func (store *Store) UpdatePreferences(ctx context.Context, userID string, prefer
 	if _, err := tx.ExecContext(ctx, "DELETE FROM delivery_schedules WHERE user_id=?", userID); err != nil {
 		return err
 	}
-	lastDay := 5
-	if preferences.WeekendsEnabled {
-		lastDay = 7
-	}
-	for day := 1; day <= lastDay; day++ {
-		actualDay := day % 7
-		for _, localTime := range preferences.DeliveryTimes {
-			_, err := tx.ExecContext(ctx, `INSERT INTO delivery_schedules
-				(id, user_id, day_of_week, local_time, time_zone) VALUES (?, ?, ?, ?, ?)`,
-				mustID("sch"), userID, actualDay, localTime, preferences.TimeZone)
-			if err != nil {
-				return err
-			}
-		}
+	if err := insertDeliverySchedules(
+		ctx, tx, userID, preferences.DeliveryTimes, preferences.TimeZone,
+		preferences.WeekendsEnabled,
+	); err != nil {
+		return err
 	}
 	if len(preferences.TopicIDs) > 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE user_topic_preferences SET excluded=1,
 			updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE user_id=?`, userID); err != nil {
 			return err
 		}
+		arguments := make([]any, 0, len(preferences.TopicIDs)+1)
+		arguments = append(arguments, userID)
 		for _, topicID := range preferences.TopicIDs {
-			result, err := tx.ExecContext(ctx, `UPDATE user_topic_preferences SET excluded=0,
-				updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE user_id=? AND topic_id=?`, userID, topicID)
+			arguments = append(arguments, topicID)
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(preferences.TopicIDs)), ",")
+		result, err := tx.ExecContext(ctx, `UPDATE user_topic_preferences SET excluded=0,
+			updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+			WHERE user_id=? AND topic_id IN (`+placeholders+`)`, arguments...)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != int64(len(preferences.TopicIDs)) {
+			return fmt.Errorf("one or more selected topics are unknown")
+		}
+	}
+	return nil
+}
+
+func insertDeliverySchedules(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	deliveryTimes []string,
+	timeZone string,
+	weekendsEnabled bool,
+) error {
+	lastDay := 5
+	if weekendsEnabled {
+		lastDay = 7
+	}
+	rowCount := lastDay * len(deliveryTimes)
+	if rowCount == 0 {
+		return nil
+	}
+	values := strings.TrimSuffix(strings.Repeat("(?,?,?,?,?),", rowCount), ",")
+	arguments := make([]any, 0, rowCount*5)
+	for day := 1; day <= lastDay; day++ {
+		for _, localTime := range deliveryTimes {
+			scheduleID, err := ids.New("sch")
 			if err != nil {
 				return err
 			}
-			changed, _ := result.RowsAffected()
-			if changed != 1 {
-				return fmt.Errorf("unknown topic %q", topicID)
-			}
+			arguments = append(
+				arguments, scheduleID, userID, day%7, localTime, timeZone,
+			)
 		}
 	}
-	return tx.Commit()
+	_, err := tx.ExecContext(ctx, `INSERT INTO delivery_schedules
+		(id,user_id,day_of_week,local_time,time_zone) VALUES `+values, arguments...)
+	return err
 }
 
 func (store *Store) Overview(ctx context.Context, userID string, now time.Time) (Overview, error) {
 	var overview Overview
-	var theme, topic sql.NullString
-	err := store.database.QueryRowContext(ctx, `SELECT tb.title, t.title FROM theme_blocks tb
-		JOIN topics t ON t.id=tb.topic_id WHERE tb.user_id=? AND tb.status='active' LIMIT 1`, userID).Scan(&theme, &topic)
-	if err != nil && err != sql.ErrNoRows {
+	var connected int
+	err := store.database.QueryRowContext(ctx, `SELECT
+		COALESCE((SELECT tb.title FROM theme_blocks tb
+			WHERE tb.user_id=? AND tb.status='active' ORDER BY tb.sequence_number DESC LIMIT 1),''),
+		COALESCE((SELECT t.title FROM theme_blocks tb JOIN topics t ON t.id=tb.topic_id
+			WHERE tb.user_id=? AND tb.status='active' ORDER BY tb.sequence_number DESC LIMIT 1),''),
+		(SELECT COUNT(*) FROM lesson_assignments WHERE user_id=? AND state IN ('queued','delivered')),
+		(SELECT COUNT(*) FROM lesson_assignments WHERE user_id=? AND state='read'),
+		(SELECT COUNT(*) FROM delivery_destinations WHERE user_id=? AND enabled=1 AND status='connected'),
+		(SELECT COUNT(*) FROM job_queue WHERE user_id=? AND state='blocked_quota')`,
+		userID, userID, userID, userID, userID, userID).Scan(
+		&overview.ActiveTheme, &overview.ActiveTopic, &overview.UnreadLessons,
+		&overview.ReadLessons, &connected, &overview.QuotaBlockedCount,
+	)
+	if err != nil {
 		return Overview{}, err
 	}
-	overview.ActiveTheme, overview.ActiveTopic = theme.String, topic.String
-	_ = store.database.QueryRowContext(ctx, `SELECT COUNT(*) FROM lesson_assignments
-		WHERE user_id=? AND state IN ('queued','delivered')`, userID).Scan(&overview.UnreadLessons)
-	_ = store.database.QueryRowContext(ctx, `SELECT COUNT(*) FROM lesson_assignments
-		WHERE user_id=? AND state='read'`, userID).Scan(&overview.ReadLessons)
-	var connected int
-	_ = store.database.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_destinations
-		WHERE user_id=? AND enabled=1 AND status='connected'`, userID).Scan(&connected)
 	overview.TelegramConnected = connected > 0
-	_ = store.database.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_queue WHERE user_id=? AND state='blocked_quota'`, userID).Scan(&overview.QuotaBlockedCount)
 	if overview.QuotaBlockedCount > 0 {
 		overview.QueueState = "quota_exhausted"
 	} else {
@@ -302,19 +395,32 @@ func (store *Store) MarkAssignment(ctx context.Context, userID, assignmentID, ac
 		return err
 	}
 	defer tx.Rollback()
-	query := "UPDATE lesson_assignments SET state='skipped' WHERE id=? AND user_id=?"
+	targetState := "skipped"
+	query := "UPDATE lesson_assignments SET state='skipped' WHERE id=? AND user_id=? AND state NOT IN ('read','skipped')"
 	arguments := []any{assignmentID, userID}
 	if action == "read" {
-		query = "UPDATE lesson_assignments SET state='read',read_at=COALESCE(read_at,?) WHERE id=? AND user_id=?"
+		targetState = "read"
+		query = "UPDATE lesson_assignments SET state='read',read_at=COALESCE(read_at,?) WHERE id=? AND user_id=? AND state NOT IN ('read','skipped')"
 		arguments = []any{timestamp(now), assignmentID, userID}
 	}
 	result, err := tx.ExecContext(ctx, query, arguments...)
 	if err != nil {
 		return err
 	}
-	changed, _ := result.RowsAffected()
-	if changed != 1 {
-		return sql.ErrNoRows
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		var currentState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM lesson_assignments
+			WHERE id=? AND user_id=?`, assignmentID, userID).Scan(&currentState); err != nil {
+			return err
+		}
+		if currentState == targetState {
+			return tx.Commit()
+		}
+		return ErrAssignmentAlreadyMarked
 	}
 	interactionID, err := ids.New("act")
 	if err != nil {
@@ -326,39 +432,51 @@ func (store *Store) MarkAssignment(ctx context.Context, userID, assignmentID, ac
 	if err != nil {
 		return err
 	}
-	inserted, _ := interactionResult.RowsAffected()
+	inserted, err := interactionResult.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if action == "read" && inserted == 1 {
-		var mode, encoded string
-		err := tx.QueryRowContext(ctx, `SELECT lp.recall_mode,l.normalized_content_json
-			FROM learning_preferences lp JOIN lesson_assignments la ON la.user_id=lp.user_id
-			JOIN lessons l ON l.id=la.lesson_id WHERE la.id=? AND la.user_id=?`, assignmentID, userID).Scan(&mode, &encoded)
-		if err != nil {
+		if err := store.scheduleRecall(ctx, tx, userID, assignmentID, now); err != nil {
 			return err
-		}
-		if mode != "off" {
-			var draft content.LessonDraft
-			if json.Unmarshal([]byte(encoded), &draft) == nil && strings.TrimSpace(draft.RecallQuestion) != "" {
-				delay := 72 * time.Hour
-				if mode == "standard" {
-					delay = 24 * time.Hour
-				}
-				_, err = tx.ExecContext(ctx, `INSERT INTO reviews
-					(id,user_id,assignment_id,question_text,expected_answer_json,due_at,state)
-					VALUES (?,?,?,?,?,?,'scheduled')`, mustID("rev"), userID, assignmentID,
-					draft.RecallQuestion, `{"evaluation":"self_assessed"}`, timestamp(now.Add(delay)))
-				if err != nil {
-					return err
-				}
-			}
 		}
 	}
 	return tx.Commit()
 }
 
-func (store *Store) DueRecallCount(ctx context.Context, userID string, now time.Time) (int, error) {
-	var count int
-	err := store.database.QueryRowContext(ctx, `SELECT COUNT(*) FROM reviews WHERE user_id=? AND state IN ('scheduled','due') AND due_at<=?`, userID, timestamp(now)).Scan(&count)
-	return count, err
+func (store *Store) scheduleRecall(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	assignmentID string,
+	now time.Time,
+) error {
+	var mode, encoded string
+	err := tx.QueryRowContext(ctx, `SELECT lp.recall_mode,l.normalized_content_json
+		FROM learning_preferences lp JOIN lesson_assignments la ON la.user_id=lp.user_id
+		JOIN lessons l ON l.id=la.lesson_id WHERE la.id=? AND la.user_id=?`,
+		assignmentID, userID,
+	).Scan(&mode, &encoded)
+	if err != nil || mode == "off" {
+		return err
+	}
+	var draft content.LessonDraft
+	if json.Unmarshal([]byte(encoded), &draft) != nil || strings.TrimSpace(draft.RecallQuestion) == "" {
+		return nil
+	}
+	delay := 72 * time.Hour
+	if mode == "standard" {
+		delay = 24 * time.Hour
+	}
+	reviewID, err := ids.New("rev")
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO reviews
+		(id,user_id,assignment_id,question_text,expected_answer_json,due_at,state)
+		VALUES (?,?,?,?,?,?,'scheduled')`, reviewID, userID, assignmentID,
+		draft.RecallQuestion, `{"evaluation":"self_assessed"}`, timestamp(now.Add(delay)))
+	return err
 }
 
 func boolInt(value bool) int {

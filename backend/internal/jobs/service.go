@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -42,13 +43,48 @@ const (
 )
 
 func New(dataStore *store.Store, providerRouter *providers.Router, telegramClient *telegram.Client, publisher *qstash.Publisher, alertService *alerts.Service, appOrigin string) *Service {
-	sourceClient := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(request *http.Request, via []*http.Request) error {
+	sourceClient := &http.Client{Timeout: 20 * time.Second, Transport: sourceTransport(), CheckRedirect: func(request *http.Request, via []*http.Request) error {
 		if len(via) >= 4 {
 			return errors.New("too many source redirects")
 		}
 		return validateSourceURL(request.URL)
 	}}
 	return &Service{store: dataStore, providers: providerRouter, telegram: telegramClient, publisher: publisher, alerts: alertService, appOrigin: strings.TrimRight(appOrigin, "/"), http: sourceClient, now: time.Now}
+}
+
+func sourceTransport() *http.Transport {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("parse source address: %w", err)
+		}
+		addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("resolve source host: %w", err)
+		}
+		var failures []error
+		for _, resolved := range addresses {
+			if !isPublicSourceIP(resolved.IP) {
+				failures = append(failures, fmt.Errorf("resolved address %s is not public", resolved.IP))
+				continue
+			}
+			connection, err := dialer.DialContext(
+				ctx, network, net.JoinHostPort(resolved.IP.String(), port),
+			)
+			if err == nil {
+				return connection, nil
+			}
+			failures = append(failures, err)
+		}
+		if len(failures) == 0 {
+			return nil, errors.New("source host resolved to no addresses")
+		}
+		return nil, fmt.Errorf("connect to public source: %w", errors.Join(failures...))
+	}
+	return transport
 }
 
 func (service *Service) Tick(ctx context.Context) error {
@@ -196,7 +232,7 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	err = service.execute(executionContext, job)
 	cancelExecution()
 	if err == nil {
-		if err := service.store.CompleteJob(ctx, job.ID, service.now()); err != nil {
+		if err := service.store.CompleteJob(ctx, job.ID, workerID, service.now()); err != nil {
 			return err
 		}
 		slog.InfoContext(
@@ -214,7 +250,7 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 	if quota {
 		code = "ai_quota_exhausted"
 	}
-	if failErr := service.store.FailJob(ctx, job, code, quota, service.now()); failErr != nil {
+	if failErr := service.store.FailJob(ctx, job, workerID, code, quota, service.now()); failErr != nil {
 		return errors.Join(err, failErr)
 	}
 	slog.WarnContext(
@@ -366,6 +402,12 @@ func (service *Service) deliverLesson(ctx context.Context, job store.Job) error 
 		slog.InfoContext(ctx, "lesson delivery already completed", "job_id", job.ID)
 		return nil
 	}
+	recallQuestion, err := service.store.AssignmentRecallQuestion(
+		ctx, job.UserID, assignmentID,
+	)
+	if err != nil {
+		return err
+	}
 	slog.InfoContext(ctx, "lesson delivery bundle prepared", "job_id", job.ID, "parts", len(bundle.Parts))
 	for index, part := range bundle.Parts {
 		if part.State == "delivered" {
@@ -375,7 +417,12 @@ func (service *Service) deliverLesson(ctx context.Context, job store.Job) error 
 		if index == len(bundle.Parts)-1 {
 			options.Buttons = [][]telegram.Button{{{Text: "Read", Data: "read:" + assignmentID}, {Text: "Skip", Data: "skip:" + assignmentID}}}
 		}
-		messageText := content.SanitizeRenderedSourceLinks(part.Text)
+		messageText, err := lessonDeliveryText(
+			part.Text, recallQuestion, index == 0,
+		)
+		if err != nil {
+			return err
+		}
 		messageID, err := service.telegram.SendMessage(ctx, bundle.ChatID, messageText, options)
 		if err != nil {
 			_ = service.store.FailDelivery(ctx, bundle.ID, "telegram_send_failed", service.now())
@@ -397,6 +444,19 @@ func (service *Service) deliverLesson(ctx context.Context, job store.Job) error 
 	}
 	slog.InfoContext(ctx, "lesson delivery completed", "job_id", job.ID, "parts", len(bundle.Parts))
 	return nil
+}
+
+func lessonDeliveryText(rendered, recallQuestion string, firstPart bool) (string, error) {
+	message := content.SanitizeRenderedSourceLinks(rendered)
+	if !firstPart || strings.TrimSpace(recallQuestion) == "" {
+		return message, nil
+	}
+	recall := "<b>Quick recall from an earlier lesson</b>\n" +
+		html.EscapeString(strings.TrimSpace(recallQuestion)) + "\n\n"
+	if len([]rune(recall+message)) > 4096 {
+		return "", errors.New("recall question does not fit in the first Telegram lesson part")
+	}
+	return recall + message, nil
 }
 
 func (service *Service) ingestSource(ctx context.Context, job store.Job) error {
@@ -472,13 +532,9 @@ func (service *Service) rankRadar(ctx context.Context, job store.Job) error {
 	if payload.SourceItemID != "" {
 		itemIDs = append(itemIDs, payload.SourceItemID)
 	}
-	candidateCount := 0
-	for _, itemID := range itemIDs {
-		candidates, err := service.store.RankSourceItem(ctx, itemID, service.now())
-		if err != nil {
-			return err
-		}
-		candidateCount += len(candidates)
+	candidateCount, err := service.store.RankSourceItems(ctx, itemIDs, service.now())
+	if err != nil {
+		return err
 	}
 	slog.InfoContext(ctx, "Radar ranking completed", "job_id", job.ID,
 		"source_items", len(itemIDs), "pending_candidates", candidateCount)
@@ -653,20 +709,24 @@ func (service *Service) notifyQuota(ctx context.Context, job store.Job) {
 }
 
 func (service *Service) RunBlockedWithOpenAI(ctx context.Context, jobID string) error {
-	job, err := service.store.Job(ctx, jobID)
+	owner := "manual-openai:" + jobID
+	job, err := service.store.ClaimBlockedJob(ctx, jobID, owner, service.now())
 	if err != nil {
+		if errors.Is(err, store.ErrJobNotLeasable) {
+			return errors.New("job is not available for a manual OpenAI run")
+		}
 		return err
-	}
-	if job.Type != "generate_lesson" || job.State != "blocked_quota" {
-		return errors.New("job is not a quota-blocked lesson generation job")
 	}
 	executionContext, cancelExecution := jobExecutionContext(ctx)
 	err = service.generateLesson(executionContext, job, true)
 	cancelExecution()
 	if err != nil {
+		if failError := service.store.FailJob(ctx, job, owner, "manual_openai_failed", true, service.now()); failError != nil {
+			return errors.Join(err, failError)
+		}
 		return err
 	}
-	return service.store.CompleteJob(ctx, job.ID, service.now())
+	return service.store.CompleteJob(ctx, job.ID, owner, service.now())
 }
 
 func validateSourceURL(value *url.URL) error {
@@ -677,8 +737,37 @@ func validateSourceURL(value *url.URL) error {
 	if host == "localhost" || strings.HasSuffix(host, ".local") {
 		return errors.New("local source hosts are not allowed")
 	}
-	if address := net.ParseIP(host); address != nil && (address.IsLoopback() || address.IsPrivate() || address.IsLinkLocalUnicast()) {
+	if address := net.ParseIP(host); address != nil && !isPublicSourceIP(address) {
 		return errors.New("private source addresses are not allowed")
 	}
 	return nil
+}
+
+func isPublicSourceIP(address net.IP) bool {
+	if address == nil || !address.IsGlobalUnicast() || address.IsPrivate() ||
+		address.IsLoopback() || address.IsLinkLocalUnicast() ||
+		address.IsLinkLocalMulticast() || address.IsUnspecified() {
+		return false
+	}
+	parsed, ok := netip.AddrFromSlice(address)
+	if !ok {
+		return false
+	}
+	parsed = parsed.Unmap()
+	for _, blocked := range nonPublicSourcePrefixes {
+		if blocked.Contains(parsed) {
+			return false
+		}
+	}
+	return true
+}
+
+var nonPublicSourcePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("2001:db8::/32"),
 }

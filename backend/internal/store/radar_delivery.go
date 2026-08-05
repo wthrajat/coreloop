@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
+
+	"coreloop/backend/internal/ids"
 )
 
 type RadarDeliveryPart struct {
@@ -39,7 +42,10 @@ func (store *Store) PrepareRadarDelivery(
 		Scan(&destinationID, &chatID); err != nil {
 		return RadarDeliveryBundle{}, err
 	}
-	deliveryID := mustID("rdel")
+	deliveryID, err := ids.New("rdel")
+	if err != nil {
+		return RadarDeliveryBundle{}, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO radar_deliveries
 		(id,user_id,candidate_id,destination_id,job_id) VALUES (?,?,?,?,?)
 		ON CONFLICT(candidate_id) DO NOTHING`,
@@ -62,13 +68,20 @@ func (store *Store) PrepareRadarDelivery(
 	// after provider availability changes, but must never mix new text with
 	// parts that Telegram already accepted.
 	if persistedParts == 0 {
+		values := strings.TrimSuffix(strings.Repeat("(?,?,?,?,?),", len(parts)), ",")
+		arguments := make([]any, 0, len(parts)*5)
 		for index, part := range parts {
-			_, err := tx.ExecContext(ctx, `INSERT INTO radar_delivery_parts
-				(id,user_id,delivery_id,sequence_number,rendered_text)
-				VALUES (?,?,?,?,?)`, mustID("rdpt"), userID, deliveryID, index+1, part)
+			partID, err := ids.New("rdpt")
 			if err != nil {
 				return RadarDeliveryBundle{}, err
 			}
+			arguments = append(arguments, partID, userID, deliveryID, index+1, part)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO radar_delivery_parts
+			(id,user_id,delivery_id,sequence_number,rendered_text) VALUES `+values,
+			arguments...,
+		); err != nil {
+			return RadarDeliveryBundle{}, err
 		}
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,sequence_number,rendered_text,state

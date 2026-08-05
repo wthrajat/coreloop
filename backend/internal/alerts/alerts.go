@@ -24,7 +24,7 @@ func (service *Service) Send(ctx context.Context, subject, body string) error {
 		return nil
 	}
 	if service.host == "" || service.username == "" || service.password == "" {
-		slog.ErrorContext(ctx, "admin email could not be sent because SMTP is not configured", "subject", subject, "recipient", service.recipient)
+		slog.ErrorContext(ctx, "admin email could not be sent because SMTP is not configured", "subject", sanitize(subject))
 		return fmt.Errorf("SMTP is not configured")
 	}
 	address := net.JoinHostPort(service.host, service.port)
@@ -39,10 +39,11 @@ func (service *Service) Send(ctx context.Context, subject, body string) error {
 		return err
 	}
 	defer client.Close()
-	if ok, _ := client.Extension("STARTTLS"); ok {
-		if err := client.StartTLS(&tls.Config{ServerName: service.host, MinVersion: tls.VersionTLS12}); err != nil {
-			return err
-		}
+	if ok, _ := client.Extension("STARTTLS"); !ok {
+		return fmt.Errorf("SMTP server does not support required STARTTLS")
+	}
+	if err := client.StartTLS(&tls.Config{ServerName: service.host, MinVersion: tls.VersionTLS12}); err != nil {
+		return err
 	}
 	if err := client.Auth(smtp.PlainAuth("", service.username, service.password, service.host)); err != nil {
 		return err
@@ -57,7 +58,7 @@ func (service *Service) Send(ctx context.Context, subject, body string) error {
 	if err != nil {
 		return err
 	}
-	message := "To: " + service.recipient + "\r\nFrom: " + service.from + "\r\nSubject: " + sanitize(subject) + "\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + body
+	message := "To: " + sanitize(service.recipient) + "\r\nFrom: " + sanitize(service.from) + "\r\nSubject: " + sanitize(subject) + "\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + body
 	if _, err := writer.Write([]byte(message)); err != nil {
 		return err
 	}

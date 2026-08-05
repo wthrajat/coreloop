@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -23,7 +24,7 @@ func TestOpenExecutesPipelineWithTypedArguments(t *testing.T) {
 		received, _ = io.ReadAll(request.Body)
 		return &http.Response{
 			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(bytes.NewBufferString(`{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":1,"last_insert_rowid":"4"}}},{"type":"ok","response":{"type":"close"}}]}`)),
+			Body:       io.NopCloser(bytes.NewBufferString(`{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0}}},{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":1,"last_insert_rowid":"4"}}},{"type":"ok","response":{"type":"close"}}]}`)),
 			Header:     make(http.Header),
 		}, nil
 	})}
@@ -45,6 +46,35 @@ func TestOpenExecutesPipelineWithTypedArguments(t *testing.T) {
 	}
 	if !bytes.Contains(received, []byte(`"type":"text","value":""`)) {
 		t.Fatalf("empty text was not encoded: %s", received)
+	}
+	var payload pipelinePayload
+	if err := json.Unmarshal(received, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Requests) != 3 || payload.Requests[0].Statement == nil ||
+		payload.Requests[0].Statement.SQL != "PRAGMA foreign_keys=ON" {
+		t.Fatalf("foreign keys were not enabled first: %s", received)
+	}
+}
+
+func TestOpenFailsWhenForeignKeysCannotBeEnabled(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(bytes.NewBufferString(
+				`{"results":[{"type":"error","error":{"message":"pragma rejected"}}]}`,
+			)),
+			Header: make(http.Header),
+		}, nil
+	})}
+	database, err := Open("libsql://example.turso.io", "secret", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	_, err = database.ExecContext(context.Background(), "DELETE FROM users")
+	if err == nil || !strings.Contains(err.Error(), "enable Turso foreign keys") {
+		t.Fatalf("foreign-key initialization error = %v", err)
 	}
 }
 

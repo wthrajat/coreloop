@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"coreloop/backend/internal/ids"
 	"coreloop/backend/internal/radar"
 )
 
@@ -48,7 +49,10 @@ func (store *Store) SaveSourceItems(
 	valueGroups := make([]string, 0, len(items))
 	arguments := make([]any, 0, len(items)*17)
 	for _, item := range items {
-		values, valid := normalizedSourceItemValues(source, item, etag, lastModified, now)
+		values, valid, err := normalizedSourceItemValues(source, item, etag, lastModified, now)
+		if err != nil {
+			return nil, err
+		}
 		if !valid {
 			continue
 		}
@@ -171,14 +175,14 @@ func normalizedSourceItemValues(
 	etag string,
 	lastModified string,
 	now time.Time,
-) ([]any, bool) {
+) ([]any, bool, error) {
 	normalizedURL, err := radar.CanonicalURL(item.URL)
 	if item.Title == "" || err != nil {
-		return nil, false
+		return nil, false, nil
 	}
 	neutralTitle := radar.NeutralText(item.Title)
 	if neutralTitle == "" {
-		return nil, false
+		return nil, false, nil
 	}
 	neutralSummary := radar.NeutralText(item.Summary)
 	category := radar.Classify(neutralTitle, neutralSummary)
@@ -197,13 +201,17 @@ func normalizedSourceItemValues(
 		"community_signals_available": item.CommunitySignalsAvailable,
 		"discovered_via":              item.DiscoveredVia,
 	})
+	itemID, err := ids.New("srcitem")
+	if err != nil {
+		return nil, false, err
+	}
 	return []any{
-		mustID("srcitem"), source.ID, normalizedURL, normalizedURL, neutralTitle,
+		itemID, source.ID, normalizedURL, normalizedURL, neutralTitle,
 		published, timestamp(now), hex.EncodeToString(contentDigest[:]), string(evidence),
 		radar.ClusterKey(normalizedURL, neutralTitle), etag, lastModified, string(category),
 		item.CommunityPoints, item.CommunityComments, boolInt(item.CommunitySignalsAvailable),
 		string(discovery),
-	}, true
+	}, true, nil
 }
 
 func (store *Store) SourcePollFailed(ctx context.Context, id string, now time.Time) error {
@@ -224,128 +232,207 @@ type radarUser struct {
 	Topics []radarUserTopic
 }
 
-func (store *Store) RankSourceItem(ctx context.Context, itemID string, now time.Time) ([]RadarCandidate, error) {
-	item, tier, communityPoints, communityComments, communityAvailable, err :=
-		store.radarItemForRanking(ctx, itemID, now)
+type radarRankingItem struct {
+	Candidate          RadarCandidate
+	SourceTier         int
+	CommunityPoints    int
+	CommunityComments  int
+	CommunityAvailable bool
+}
+
+type radarCandidateInsert struct {
+	ID, UserID, SourceItemID, TopicID, Breakdown, State string
+	Score                                               float64
+	RejectionReason                                     any
+}
+
+func (store *Store) RankSourceItems(
+	ctx context.Context,
+	itemIDs []string,
+	now time.Time,
+) (int, error) {
+	items, err := store.radarItemsForRanking(ctx, itemIDs, now)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	users, err := store.radarUsers(ctx)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	category := radar.Category(item.Category)
-	var candidates []RadarCandidate
-	for _, user := range users {
-		var selectedTopic radarUserTopic
-		var selectedBreakdown radar.ScoreBreakdown
-		for _, topic := range user.Topics {
-			breakdown := radar.CalculateScore(radar.ScoreInput{
-				Title: item.Title, Summary: item.Summary, TopicTerms: topic.Terms,
-				SourceTier: tier, PublishedAgeHours: now.Sub(item.PublishedAt).Hours(),
-				Category: category, CommunityPoints: communityPoints,
-				CommunityComments:         communityComments,
-				CommunitySignalsAvailable: communityAvailable,
-			})
-			if breakdown.Total > selectedBreakdown.Total {
-				selectedTopic, selectedBreakdown = topic, breakdown
+	inserts := make([]radarCandidateInsert, 0, len(items)*len(users))
+	for _, item := range items {
+		category := radar.Category(item.Candidate.Category)
+		for _, user := range users {
+			var selectedTopic radarUserTopic
+			var selectedBreakdown radar.ScoreBreakdown
+			for _, topic := range user.Topics {
+				breakdown := radar.CalculateScore(radar.ScoreInput{
+					Title: item.Candidate.Title, Summary: item.Candidate.Summary,
+					TopicTerms: topic.Terms, SourceTier: item.SourceTier,
+					PublishedAgeHours: now.Sub(item.Candidate.PublishedAt).Hours(),
+					Category:          category, CommunityPoints: item.CommunityPoints,
+					CommunityComments:         item.CommunityComments,
+					CommunitySignalsAvailable: item.CommunityAvailable,
+				})
+				if breakdown.Total > selectedBreakdown.Total {
+					selectedTopic, selectedBreakdown = topic, breakdown
+				}
 			}
-		}
-		if selectedTopic.TopicID == "" {
-			continue
-		}
-		adjustedScore := math.Max(0, math.Min(1, selectedBreakdown.Total+selectedTopic.FeedbackWeight))
-		selectedBreakdown.Total = math.Round(adjustedScore*1000) / 1000
-		decision := radar.DecideEditorialEligibility(radar.ScoreInput{
-			Title: item.Title, Summary: item.Summary, TopicTerms: selectedTopic.Terms,
-			SourceTier: tier, PublishedAgeHours: now.Sub(item.PublishedAt).Hours(),
-			Category: category, CommunityPoints: communityPoints,
-			CommunityComments:         communityComments,
-			CommunitySignalsAvailable: communityAvailable,
-		}, selectedBreakdown)
-		breakdown, _ := json.Marshal(map[string]any{
-			"ranker": radar.RankerVersion, "category": category,
-			"scores": selectedBreakdown, "editorial_decision": decision,
-		})
-		candidateState := "rejected"
-		var rejectionReason any = decision.Reason
-		if decision.Eligible {
-			candidateState = "pending"
-			rejectionReason = nil
-		}
-		candidateID := mustID("rad")
-		var actualID, status string
-		err := store.database.QueryRowContext(ctx, `INSERT INTO radar_candidates
-			(id,user_id,source_item_id,topic_id,ranker_version,relevance_score,
-			 score_breakdown_json,status,rejection_reason)
-			VALUES (?,?,?,?,?,?,?,CASE
-				WHEN EXISTS (SELECT 1 FROM radar_candidates previous
-					WHERE previous.user_id=? AND previous.source_item_id=? AND previous.status='delivered')
-					THEN 'delivered'
-				WHEN EXISTS (SELECT 1 FROM radar_candidates previous
-					WHERE previous.user_id=? AND previous.source_item_id=? AND previous.status='skipped')
-					THEN 'skipped'
-				ELSE ? END,?)
-			ON CONFLICT(user_id,source_item_id,ranker_version) DO UPDATE SET
-				topic_id=excluded.topic_id,relevance_score=excluded.relevance_score,
-				score_breakdown_json=excluded.score_breakdown_json,
-				status=CASE WHEN radar_candidates.status IN ('delivered','skipped','qualified')
-					THEN radar_candidates.status ELSE excluded.status END,
-				rejection_reason=CASE
-					WHEN radar_candidates.status IN ('delivered','skipped','qualified')
-					THEN radar_candidates.rejection_reason ELSE excluded.rejection_reason END,
-				updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-			RETURNING id,status`,
-			candidateID, user.ID, itemID, selectedTopic.TopicID, radar.RankerVersion,
-			selectedBreakdown.Total, string(breakdown), user.ID, itemID, user.ID, itemID,
-			candidateState, rejectionReason).
-			Scan(&actualID, &status)
-		if err != nil {
-			return nil, err
-		}
-		if status == "pending" {
-			candidate := item
-			candidate.ID, candidate.UserID, candidate.TopicID = actualID, user.ID, selectedTopic.TopicID
-			candidate.Score = selectedBreakdown.Total
-			candidates = append(candidates, candidate)
+			if selectedTopic.TopicID == "" {
+				continue
+			}
+			adjustedScore := math.Max(0, math.Min(1, selectedBreakdown.Total+selectedTopic.FeedbackWeight))
+			selectedBreakdown.Total = math.Round(adjustedScore*1000) / 1000
+			decision := radar.DecideEditorialEligibility(radar.ScoreInput{
+				Title: item.Candidate.Title, Summary: item.Candidate.Summary,
+				TopicTerms: selectedTopic.Terms, SourceTier: item.SourceTier,
+				PublishedAgeHours: now.Sub(item.Candidate.PublishedAt).Hours(),
+				Category:          category, CommunityPoints: item.CommunityPoints,
+				CommunityComments:         item.CommunityComments,
+				CommunitySignalsAvailable: item.CommunityAvailable,
+			}, selectedBreakdown)
+			breakdown, _ := json.Marshal(map[string]any{
+				"ranker": radar.RankerVersion, "category": category,
+				"scores": selectedBreakdown, "editorial_decision": decision,
+			})
+			state := "rejected"
+			var rejectionReason any = decision.Reason
+			if decision.Eligible {
+				state = "pending"
+				rejectionReason = nil
+			}
+			candidateID, err := ids.New("rad")
+			if err != nil {
+				return 0, err
+			}
+			inserts = append(inserts, radarCandidateInsert{
+				ID: candidateID, UserID: user.ID,
+				SourceItemID: item.Candidate.SourceItemID, TopicID: selectedTopic.TopicID,
+				Breakdown: string(breakdown), State: state,
+				Score: selectedBreakdown.Total, RejectionReason: rejectionReason,
+			})
 		}
 	}
-	return candidates, nil
+	return store.upsertRadarCandidates(ctx, inserts)
 }
 
-func (store *Store) radarItemForRanking(
+func (store *Store) radarItemsForRanking(
 	ctx context.Context,
-	itemID string,
+	itemIDs []string,
 	now time.Time,
-) (RadarCandidate, int, int, int, bool, error) {
-	var item RadarCandidate
-	var tier, communityPoints, communityComments, communityAvailable int
-	var published sql.NullString
-	var evidence, discovery string
-	err := store.database.QueryRowContext(ctx, `SELECT si.id,s.publisher,s.source_role,si.title,
+) ([]radarRankingItem, error) {
+	if len(itemIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(itemIDs)), ",")
+	arguments := make([]any, len(itemIDs))
+	for index, itemID := range itemIDs {
+		arguments[index] = itemID
+	}
+	rows, err := store.database.QueryContext(ctx, `SELECT si.id,s.publisher,s.source_role,si.title,
 		si.normalized_url,si.evidence_json,si.category,si.community_score,si.community_comments,
 		si.community_signals_available,
 		si.discovery_json,s.source_tier,si.published_at
-		FROM source_items si JOIN sources s ON s.id=si.source_id WHERE si.id=?`, itemID).
-		Scan(&item.SourceItemID, &item.Publisher, &item.SourceRole, &item.Title, &item.URL,
-			&evidence, &item.Category, &communityPoints, &communityComments, &communityAvailable,
-			&discovery, &tier, &published)
+		FROM source_items si JOIN sources s ON s.id=si.source_id
+		WHERE si.id IN (`+placeholders+`)`, arguments...)
 	if err != nil {
-		return RadarCandidate{}, 0, 0, 0, false, err
+		return nil, err
 	}
-	item.PublishedAt = now
-	if published.Valid {
-		if parsed, parseErr := parseTimestamp(published.String); parseErr == nil {
-			item.PublishedAt = parsed
+	defer rows.Close()
+	byID := make(map[string]radarRankingItem, len(itemIDs))
+	for rows.Next() {
+		var item radarRankingItem
+		var published sql.NullString
+		var evidence, discovery string
+		var communityAvailable int
+		if err := rows.Scan(
+			&item.Candidate.SourceItemID, &item.Candidate.Publisher,
+			&item.Candidate.SourceRole, &item.Candidate.Title, &item.Candidate.URL,
+			&evidence, &item.Candidate.Category, &item.CommunityPoints,
+			&item.CommunityComments, &communityAvailable, &discovery,
+			&item.SourceTier, &published,
+		); err != nil {
+			return nil, err
+		}
+		item.CommunityAvailable = communityAvailable == 1
+		item.Candidate.PublishedAt = now
+		if published.Valid {
+			if parsed, parseErr := parseTimestamp(published.String); parseErr == nil {
+				item.Candidate.PublishedAt = parsed
+			}
+		}
+		var evidenceValue struct {
+			Summary string `json:"summary"`
+		}
+		_ = json.Unmarshal([]byte(evidence), &evidenceValue)
+		item.Candidate.Summary = evidenceValue.Summary
+		_ = json.Unmarshal([]byte(discovery), &item.Candidate.Discovery)
+		byID[item.Candidate.SourceItemID] = item
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	items := make([]radarRankingItem, 0, len(byID))
+	for _, itemID := range itemIDs {
+		if item, exists := byID[itemID]; exists {
+			items = append(items, item)
 		}
 	}
-	var evidenceValue struct {
-		Summary string `json:"summary"`
+	return items, nil
+}
+
+func (store *Store) upsertRadarCandidates(
+	ctx context.Context,
+	candidates []radarCandidateInsert,
+) (int, error) {
+	if len(candidates) == 0 {
+		return 0, nil
 	}
-	_ = json.Unmarshal([]byte(evidence), &evidenceValue)
-	item.Summary = evidenceValue.Summary
-	_ = json.Unmarshal([]byte(discovery), &item.Discovery)
-	return item, tier, communityPoints, communityComments, communityAvailable == 1, nil
+	values := strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?,?,CASE
+		WHEN EXISTS (SELECT 1 FROM radar_candidates previous
+			WHERE previous.user_id=? AND previous.source_item_id=? AND previous.status='delivered')
+			THEN 'delivered'
+		WHEN EXISTS (SELECT 1 FROM radar_candidates previous
+			WHERE previous.user_id=? AND previous.source_item_id=? AND previous.status='skipped')
+			THEN 'skipped'
+		ELSE ? END,?),`, len(candidates)), ",")
+	arguments := make([]any, 0, len(candidates)*13)
+	for _, candidate := range candidates {
+		arguments = append(arguments,
+			candidate.ID, candidate.UserID, candidate.SourceItemID, candidate.TopicID,
+			radar.RankerVersion, candidate.Score, candidate.Breakdown,
+			candidate.UserID, candidate.SourceItemID, candidate.UserID,
+			candidate.SourceItemID, candidate.State, candidate.RejectionReason,
+		)
+	}
+	rows, err := store.database.QueryContext(ctx, `INSERT INTO radar_candidates
+		(id,user_id,source_item_id,topic_id,ranker_version,relevance_score,
+		 score_breakdown_json,status,rejection_reason) VALUES `+values+`
+		ON CONFLICT(user_id,source_item_id,ranker_version) DO UPDATE SET
+			topic_id=excluded.topic_id,relevance_score=excluded.relevance_score,
+			score_breakdown_json=excluded.score_breakdown_json,
+			status=CASE WHEN radar_candidates.status IN ('delivered','skipped','qualified')
+				THEN radar_candidates.status ELSE excluded.status END,
+			rejection_reason=CASE
+				WHEN radar_candidates.status IN ('delivered','skipped','qualified')
+				THEN radar_candidates.rejection_reason ELSE excluded.rejection_reason END,
+			updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		RETURNING status`, arguments...)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	pending := 0
+	for rows.Next() {
+		var status string
+		if err := rows.Scan(&status); err != nil {
+			return 0, err
+		}
+		if status == "pending" {
+			pending++
+		}
+	}
+	return pending, rows.Err()
 }
 
 func (store *Store) radarUsers(ctx context.Context) ([]radarUser, error) {

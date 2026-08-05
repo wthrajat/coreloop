@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 
 import { AppNavigation } from "@/components/app-navigation";
 import { useSession } from "@/components/session-provider";
@@ -13,11 +13,13 @@ export function AppShell({ children }: { children: ReactNode }) {
   const { status, session } = useSession();
   const router = useRouter();
   const [actionError, setActionError] = useState("");
+  const [logoutPending, setLogoutPending] = useState(false);
+  const logoutActive = useRef(false);
 
   if (status === "loading") {
     return (
-      <main className="centered-state">
-        <span className="loading-line" />
+      <main className="centered-state" role="status">
+        <span aria-hidden="true" className="loading-line" />
         <p>Loading your private workspace…</p>
       </main>
     );
@@ -56,6 +58,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <button
           className="button button-secondary"
           onClick={() => window.location.reload()}
+          type="button"
         >
           Try again
         </button>
@@ -64,6 +67,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   }
 
   async function logout() {
+    if (logoutActive.current) return;
+    logoutActive.current = true;
+    setLogoutPending(true);
     try {
       setActionError("");
       await api<void>("/auth/logout", { method: "POST" });
@@ -73,11 +79,16 @@ export function AppShell({ children }: { children: ReactNode }) {
       setActionError(
         error instanceof Error ? error.message : "Sign out failed.",
       );
+      logoutActive.current = false;
+      setLogoutPending(false);
     }
   }
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">
+        Skip to content
+      </a>
       <aside className="navigation-rail">
         <Link className="brand-lockup" href="/overview">
           <span aria-hidden="true" className="brand-mark">
@@ -97,8 +108,13 @@ export function AppShell({ children }: { children: ReactNode }) {
             <small>Private profile connected</small>
           </span>
         </div>
-        <button className="rail-action" onClick={() => void logout()}>
-          Sign out
+        <button
+          className="rail-action"
+          disabled={logoutPending}
+          onClick={() => void logout()}
+          type="button"
+        >
+          {logoutPending ? "Signing out…" : "Sign out"}
         </button>
       </aside>
       <div className="mobile-header">
@@ -107,11 +123,16 @@ export function AppShell({ children }: { children: ReactNode }) {
         </span>
         <strong>Coreloop</strong>
         <ThemeToggle compact />
-        <button className="mobile-signout" onClick={() => void logout()}>
-          Sign out
+        <button
+          className="mobile-signout"
+          disabled={logoutPending}
+          onClick={() => void logout()}
+          type="button"
+        >
+          {logoutPending ? "Signing out…" : "Sign out"}
         </button>
       </div>
-      <main className="content-canvas">
+      <main className="content-canvas" id="main-content" tabIndex={-1}>
         {actionError ? (
           <p className="field-error shell-error" role="alert">
             {actionError}

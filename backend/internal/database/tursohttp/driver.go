@@ -171,7 +171,19 @@ func (connection *connection) execute(ctx context.Context, query string, values 
 		}
 		arguments = append(arguments, argument)
 	}
-	requests := []pipelineRequest{{Type: "execute", Statement: &statement{SQL: query, Arguments: arguments}}}
+	requests := make([]pipelineRequest, 0, 3)
+	resultIndex := 0
+	if connection.baton == "" {
+		requests = append(requests, pipelineRequest{
+			Type:      "execute",
+			Statement: &statement{SQL: "PRAGMA foreign_keys=ON"},
+		})
+		resultIndex = 1
+	}
+	requests = append(requests, pipelineRequest{
+		Type:      "execute",
+		Statement: &statement{SQL: query, Arguments: arguments},
+	})
 	if !keepOpen {
 		requests = append(requests, pipelineRequest{Type: "close"})
 	}
@@ -182,11 +194,20 @@ func (connection *connection) execute(ctx context.Context, query string, values 
 	if len(response.Results) == 0 {
 		return nil, errors.New("Turso returned no pipeline results")
 	}
-	first := response.Results[0]
-	if first.Type != "ok" || first.Response == nil || first.Response.Result == nil {
-		return nil, first.asError()
+	if resultIndex > 0 {
+		pragma := response.Results[0]
+		if pragma.Type != "ok" || pragma.Response == nil || pragma.Response.Result == nil {
+			return nil, fmt.Errorf("enable Turso foreign keys: %w", pragma.asError())
+		}
 	}
-	return first.Response.Result, nil
+	if len(response.Results) <= resultIndex {
+		return nil, errors.New("Turso returned no result for the application statement")
+	}
+	result := response.Results[resultIndex]
+	if result.Type != "ok" || result.Response == nil || result.Response.Result == nil {
+		return nil, result.asError()
+	}
+	return result.Response.Result, nil
 }
 
 func (connection *connection) request(ctx context.Context, requests []pipelineRequest, keepOpen bool) (*pipelineResponse, error) {
@@ -247,7 +268,9 @@ func (transaction *transaction) finish(command string) error {
 		{Type: "execute", Statement: &statement{SQL: command}},
 		{Type: "close"},
 	}
-	_, err := transaction.connection.request(context.Background(), requests, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := transaction.connection.request(ctx, requests, false)
 	transaction.connection.inTx = false
 	transaction.connection.baton = ""
 	return err

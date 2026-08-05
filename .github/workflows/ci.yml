@@ -30,4 +30,13 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --prod --audit-level high
       - run: pnpm run check
+      - run: pnpm run format:check
+      - run:
+          GOCACHE=$PWD/.cache/go-build GOENV=off go vet ./api/... ./backend/...
+          ./cmd/... ./migrations/...
+      - run:
+          GOCACHE=$PWD/.cache/go-build GOENV=off go test -race
+          ./backend/internal/database/... ./backend/internal/jobs/...
+          ./backend/internal/store/... ./backend/internal/telegram/...
       - run: pnpm run build
+      - run: git diff --check

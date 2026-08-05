@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"coreloop/backend/internal/ids"
@@ -36,7 +37,10 @@ func (store *Store) PrepareDelivery(ctx context.Context, userID, assignmentID, j
 		return DeliveryBundle{}, err
 	}
 	idempotency := "delivery:" + assignmentID
-	deliveryID := mustID("del")
+	deliveryID, err := ids.New("del")
+	if err != nil {
+		return DeliveryBundle{}, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO deliveries
 		(id,user_id,assignment_id,destination_id,job_id,intended_at,idempotency_key)
 		VALUES (?,?,?,?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING`, deliveryID, userID, assignmentID, destinationID, jobID, timestamp(now), idempotency)
@@ -62,13 +66,8 @@ func (store *Store) PrepareDelivery(ctx context.Context, userID, assignmentID, j
 		raw = append(raw, part)
 	}
 	rows.Close()
-	for index := range raw {
-		partID := mustID("dpt")
-		_, err = tx.ExecContext(ctx, `INSERT INTO delivery_parts
-		(id,user_id,delivery_id,lesson_part_id,sequence_number,idempotency_key) VALUES (?,?,?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING`, partID, userID, deliveryID, raw[index].LessonPartID, raw[index].Sequence, idempotency+":"+fmt.Sprint(raw[index].Sequence))
-		if err != nil {
-			return DeliveryBundle{}, err
-		}
+	if err := insertDeliveryParts(ctx, tx, userID, deliveryID, idempotency, raw); err != nil {
+		return DeliveryBundle{}, err
 	}
 	partRows, err := tx.QueryContext(ctx, `SELECT dp.id,dp.lesson_part_id,dp.sequence_number,lp.rendered_text,dp.state FROM delivery_parts dp JOIN lesson_parts lp ON lp.id=dp.lesson_part_id WHERE dp.delivery_id=? ORDER BY dp.sequence_number`, deliveryID)
 	if err != nil {
@@ -91,6 +90,35 @@ func (store *Store) PrepareDelivery(ctx context.Context, userID, assignmentID, j
 		return DeliveryBundle{}, err
 	}
 	return DeliveryBundle{ID: deliveryID, UserID: userID, AssignmentID: assignmentID, ChatID: chatID, State: state, Parts: parts}, nil
+}
+
+func insertDeliveryParts(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	deliveryID string,
+	idempotency string,
+	parts []DeliveryPart,
+) error {
+	if len(parts) == 0 {
+		return nil
+	}
+	values := strings.TrimSuffix(strings.Repeat("(?,?,?,?,?,?),", len(parts)), ",")
+	arguments := make([]any, 0, len(parts)*6)
+	for _, part := range parts {
+		partID, err := ids.New("dpt")
+		if err != nil {
+			return err
+		}
+		arguments = append(
+			arguments, partID, userID, deliveryID, part.LessonPartID,
+			part.Sequence, idempotency+":"+fmt.Sprint(part.Sequence),
+		)
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO delivery_parts
+		(id,user_id,delivery_id,lesson_part_id,sequence_number,idempotency_key)
+		VALUES `+values+` ON CONFLICT(idempotency_key) DO NOTHING`, arguments...)
+	return err
 }
 
 func (store *Store) CompleteDeliveryPart(ctx context.Context, deliveryPartID, messageID string, now time.Time) error {

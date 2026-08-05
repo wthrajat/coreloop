@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,9 +14,10 @@ import (
 const defaultTimeZone = "Asia/Kolkata"
 
 type Config struct {
-	Environment  string
-	AppOrigin    string
-	BuildVersion string
+	Environment       string
+	VercelEnvironment string
+	AppOrigin         string
+	BuildVersion      string
 
 	TursoURL   string
 	TursoToken string
@@ -43,9 +45,19 @@ type Config struct {
 }
 
 func FromEnv() Config {
+	environment := strings.TrimSpace(os.Getenv("APP_ENV"))
+	vercelEnvironment := strings.TrimSpace(os.Getenv("VERCEL_ENV"))
+	if environment == "" {
+		if vercelEnvironment == "production" {
+			environment = "production"
+		} else {
+			environment = "development"
+		}
+	}
 	return Config{
-		Environment:             envOr("APP_ENV", "development"),
-		AppOrigin:               strings.TrimRight(envOr("APP_ORIGIN", envOr("NEXT_PUBLIC_APP_ORIGIN", "http://localhost:3000")), "/"),
+		Environment:             environment,
+		VercelEnvironment:       vercelEnvironment,
+		AppOrigin:               strings.TrimRight(envOr("APP_ORIGIN", "http://localhost:3000"), "/"),
 		BuildVersion:            envOr("VERCEL_GIT_COMMIT_SHA", "development"),
 		TursoURL:                os.Getenv("TURSO_DATABASE_URL"),
 		TursoToken:              os.Getenv("TURSO_AUTH_TOKEN"),
@@ -71,6 +83,12 @@ func FromEnv() Config {
 
 func (config Config) ValidateProduction() error {
 	var missing []string
+	if config.Environment != "production" {
+		missing = append(missing, "APP_ENV (must be production)")
+	}
+	if config.VercelEnvironment != "" && config.VercelEnvironment != "production" {
+		missing = append(missing, "VERCEL_ENV (must agree with APP_ENV)")
+	}
 	for name, value := range map[string]string{
 		"APP_ORIGIN":                 config.AppOrigin,
 		"TURSO_DATABASE_URL":         config.TursoURL,
@@ -92,18 +110,21 @@ func (config Config) ValidateProduction() error {
 	if config.GroqAPIKey == "" && config.GeminiAPIKey == "" {
 		missing = append(missing, "GROQ_API_KEY or GEMINI_API_KEY")
 	}
-	if len(config.SessionSecret) < 32 {
+	if config.SessionSecret != "" && len(config.SessionSecret) < 32 {
 		missing = append(missing, "SESSION_SECRET (at least 32 characters)")
 	}
-	if len(config.TelegramWebhookSecret) < 32 {
+	if config.TelegramWebhookSecret != "" && len(config.TelegramWebhookSecret) < 32 {
 		missing = append(missing, "TELEGRAM_WEBHOOK_SECRET (at least 32 characters)")
 	}
-	if _, err := strconv.ParseInt(config.OwnerTelegramSubject, 10, 64); err != nil {
+	ownerSubject, ownerSubjectError := strconv.ParseInt(config.OwnerTelegramSubject, 10, 64)
+	if ownerSubjectError != nil || ownerSubject <= 0 {
 		missing = append(missing, "OWNER_TELEGRAM_SUBJECT (numeric)")
 	}
 	parsedOrigin, err := url.Parse(config.AppOrigin)
-	if err != nil || parsedOrigin.Host == "" || parsedOrigin.Scheme != "https" {
-		missing = append(missing, "APP_ORIGIN (absolute https URL)")
+	if err != nil || parsedOrigin.Host == "" || parsedOrigin.Scheme != "https" ||
+		parsedOrigin.User != nil || parsedOrigin.Path != "" || parsedOrigin.RawQuery != "" ||
+		parsedOrigin.Fragment != "" {
+		missing = append(missing, "APP_ORIGIN (https origin without path, query, or fragment)")
 	}
 	databaseURL := strings.Replace(config.TursoURL, "libsql://", "https://", 1)
 	parsedDatabase, databaseError := url.Parse(databaseURL)
@@ -116,14 +137,27 @@ func (config Config) ValidateProduction() error {
 		}
 	}
 	if len(missing) > 0 {
+		sort.Strings(missing)
 		return fmt.Errorf("invalid production configuration: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
 
-func (config Config) IsProduction() bool { return config.Environment == "production" }
+func (config Config) IsProduction() bool {
+	return config.Environment == "production" || config.VercelEnvironment == "production"
+}
+
+func (config Config) SecureCookies() bool {
+	origin, err := url.Parse(config.AppOrigin)
+	return err == nil && origin.Scheme == "https" && origin.Host != ""
+}
 
 func (config Config) ValidateRuntime() error {
+	switch config.Environment {
+	case "development", "test", "production":
+	default:
+		return fmt.Errorf("APP_ENV must be development, test, or production")
+	}
 	if config.IsProduction() {
 		return config.ValidateProduction()
 	}

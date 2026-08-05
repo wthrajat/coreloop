@@ -10,6 +10,8 @@ type Store struct {
 	database *sql.DB
 }
 
+const RequiredSchemaVersion = 7
+
 func New(database *sql.DB) *Store {
 	return &Store{database: database}
 }
@@ -22,8 +24,8 @@ func (store *Store) Ping(ctx context.Context) error {
 	if err := store.database.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM schema_migrations").Scan(&version); err != nil {
 		return err
 	}
-	if version < 4 {
-		return fmt.Errorf("database schema is at version %d; version 4 is required", version)
+	if version < RequiredSchemaVersion {
+		return fmt.Errorf("database schema is at version %d; version %d is required", version, RequiredSchemaVersion)
 	}
 	return nil
 }
