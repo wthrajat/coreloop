@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -151,6 +152,9 @@ func TestCompletedDuplicateWakeResumesTheQueue(t *testing.T) {
 		}, nil
 	})}
 	service := New(store.New(database), nil, nil, qstash.NewPublisher("secret", publisherClient), nil, "https://coreloop.example")
+	service.now = func() time.Time {
+		return time.Date(2026, time.August, 5, 12, 4, 0, 0, time.UTC)
+	}
 	if err := service.Run(context.Background(), "job_completed", "qstash:duplicate"); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +164,7 @@ func TestCompletedDuplicateWakeResumesTheQueue(t *testing.T) {
 	if publishedBody != `{"job_id":"job_next"}` {
 		t.Fatalf("published body = %q", publishedBody)
 	}
-	if publishedDeduplicationID != "dispatch-job_next-1" {
+	if publishedDeduplicationID != "dispatch-job_next-1-20260805T1200" {
 		t.Fatalf("published deduplication id = %q", publishedDeduplicationID)
 	}
 }
@@ -349,6 +353,86 @@ func TestDispatchDeduplicationIsScopedToTheDurableAttempt(t *testing.T) {
 	}
 	if strings.Contains(first, ":") || strings.Contains(retry, ":") {
 		t.Fatalf("QStash deduplication ids must not contain colons: %q, %q", first, retry)
+	}
+}
+
+func TestScheduledDispatchDeduplicationRetriesAQueuedAttemptOnTheNextTick(t *testing.T) {
+	firstTick := time.Date(2026, time.August, 5, 12, 4, 0, 0, time.UTC)
+	sameWindow := firstTick.Add(5 * time.Minute)
+	nextWindow := firstTick.Add(10 * time.Minute)
+
+	first := scheduledDispatchDeduplicationID("job_radar", 0, firstTick)
+	same := scheduledDispatchDeduplicationID("job_radar", 0, sameWindow)
+	next := scheduledDispatchDeduplicationID("job_radar", 0, nextWindow)
+	if first != "dispatch-job_radar-0-20260805T1200" || same != first {
+		t.Fatalf("same-window IDs = %q and %q", first, same)
+	}
+	if next != "dispatch-job_radar-0-20260805T1210" || next == first {
+		t.Fatalf("next-window ID = %q, first = %q", next, first)
+	}
+	if strings.Contains(first, ":") || strings.Contains(next, ":") {
+		t.Fatalf("QStash deduplication IDs must not contain colons: %q, %q", first, next)
+	}
+}
+
+func TestSchedulerRepublishesTheSameQueuedRadarJobInTheNextWindow(t *testing.T) {
+	databaseClient := &http.Client{Transport: jobRoundTripFunc(func(
+		*http.Request,
+	) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(
+				tursoJobResult("job_radar", "deliver_radar", "queued"),
+			)),
+			Header: make(http.Header),
+		}, nil
+	})}
+	database, err := tursohttp.Open("libsql://example.turso.io", "secret", databaseClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	var publishedIDs []string
+	publisherClient := &http.Client{Transport: jobRoundTripFunc(func(
+		request *http.Request,
+	) (*http.Response, error) {
+		publishedIDs = append(
+			publishedIDs,
+			request.Header.Get("Upstash-Deduplication-Id"),
+		)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(
+				`{"messageId":"msg_radar","deduplicated":false}`,
+			)),
+			Header: make(http.Header),
+		}, nil
+	})}
+	service := New(
+		store.New(database),
+		nil,
+		nil,
+		qstash.NewPublisher("secret", publisherClient),
+		nil,
+		"https://coreloop.example",
+	)
+	now := time.Date(2026, time.August, 5, 12, 4, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	if err := service.dispatchNextDueJob(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(10 * time.Minute)
+	if err := service.dispatchNextDueJob(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"dispatch-job_radar-1-20260805T1200",
+		"dispatch-job_radar-1-20260805T1210",
+	}
+	if !reflect.DeepEqual(publishedIDs, want) {
+		t.Fatalf("published IDs = %#v, want %#v", publishedIDs, want)
 	}
 }
 

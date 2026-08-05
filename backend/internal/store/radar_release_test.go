@@ -15,7 +15,7 @@ func TestDiverseRadarCandidatesPrefersSourceBreadth(t *testing.T) {
 		{ID: "openai-1", SourceID: "openai", Score: 0.78},
 	}
 	got := diverseRadarCandidates(pool, nil, 4)
-	want := []string{"aws-1", "aws-2", "hn-1", "openai-1"}
+	want := []string{"aws-1", "hn-1", "openai-1", "aws-2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("selected = %#v, want %#v", got, want)
 	}
@@ -73,7 +73,7 @@ func TestDiverseRadarCandidatesStillFillsFromOneSource(t *testing.T) {
 	}
 }
 
-func TestDiverseRadarCandidatesAppliesASoftDailySourcePenalty(t *testing.T) {
+func TestDiverseRadarCandidatesPrefersTheLessUsedDailyFamily(t *testing.T) {
 	pool := []radarReleaseCandidate{
 		{ID: "aws", SourceID: "aws", Score: 0.9},
 		{ID: "openai", SourceID: "openai", Score: 0.8},
@@ -82,5 +82,87 @@ func TestDiverseRadarCandidatesAppliesASoftDailySourcePenalty(t *testing.T) {
 	want := []string{"openai"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("selected = %#v, want %#v", got, want)
+	}
+}
+
+func TestDiverseRadarCandidatesBalancesAFullBatchAcrossSourceFamilies(t *testing.T) {
+	pool := []radarReleaseCandidate{
+		{ID: "arxiv-1", SourceID: "source_arxiv_ai", Score: 0.99},
+		{ID: "arxiv-2", SourceID: "source_arxiv_ml", Score: 0.98},
+		{ID: "arxiv-3", SourceID: "source_arxiv_ai", Score: 0.97},
+		{ID: "arxiv-4", SourceID: "source_arxiv_ml", Score: 0.96},
+		{ID: "hn-1", SourceID: "source_hacker_news", Score: 0.89},
+		{ID: "hn-2", SourceID: "source_hacker_news", Score: 0.88},
+		{ID: "hn-3", SourceID: "source_hacker_news", Score: 0.87},
+		{ID: "hn-4", SourceID: "source_hacker_news", Score: 0.86},
+		{ID: "stacker-1", SourceID: "source_stacker_tech", Score: 0.85},
+		{ID: "stacker-2", SourceID: "source_stacker_bitcoin", Score: 0.84},
+		{ID: "stacker-3", SourceID: "source_stacker_lightning", Score: 0.83},
+		{ID: "stacker-4", SourceID: "source_stacker_news", Score: 0.82},
+		{ID: "openai-1", SourceID: "source_openai_news", Score: 0.81},
+		{ID: "openai-2", SourceID: "source_openai_news", Score: 0.80},
+		{ID: "openai-3", SourceID: "source_openai_news", Score: 0.79},
+		{ID: "openai-4", SourceID: "source_openai_news", Score: 0.78},
+		{ID: "cloudflare-1", SourceID: "source_cloudflare_blog", Score: 0.77},
+		{ID: "cloudflare-2", SourceID: "source_cloudflare_blog", Score: 0.76},
+		{ID: "cloudflare-3", SourceID: "source_cloudflare_blog", Score: 0.75},
+		{ID: "cloudflare-4", SourceID: "source_cloudflare_blog", Score: 0.74},
+	}
+
+	got := diverseRadarCandidates(pool, nil, 20)
+	if len(got) != 20 {
+		t.Fatalf("selected = %d, want 20", len(got))
+	}
+	firstRound := got[:5]
+	wantFirstRound := []string{
+		"arxiv-1", "hn-1", "stacker-1", "openai-1", "cloudflare-1",
+	}
+	if !reflect.DeepEqual(firstRound, wantFirstRound) {
+		t.Fatalf("first family round = %#v, want %#v", firstRound, wantFirstRound)
+	}
+	counts := map[string]int{}
+	byID := map[string]radarReleaseCandidate{}
+	for _, candidate := range pool {
+		byID[candidate.ID] = candidate
+	}
+	for _, id := range got {
+		counts[radarSourceFamily(byID[id].SourceID)]++
+	}
+	for _, family := range []string{
+		"arxiv", "hacker_news", "stacker_news",
+		"source_openai_news", "source_cloudflare_blog",
+	} {
+		if counts[family] != 4 {
+			t.Fatalf("family %q count = %d, want 4: %#v", family, counts[family], got)
+		}
+	}
+}
+
+func TestDiverseRadarCandidatesPrioritizesUnusedFamiliesAcrossTheDay(t *testing.T) {
+	pool := []radarReleaseCandidate{
+		{ID: "arxiv", SourceID: "source_arxiv_ai", Score: 0.99},
+		{ID: "hn", SourceID: "source_hacker_news", Score: 0.76},
+		{ID: "stacker", SourceID: "source_stacker_tech", Score: 0.74},
+	}
+	historicalUsage := map[string]int{"arxiv": 1, "hacker_news": 1}
+	got := diverseRadarCandidates(pool, historicalUsage, 1)
+	if !reflect.DeepEqual(got, []string{"stacker"}) {
+		t.Fatalf("selected = %#v, want the unused Stacker News family", got)
+	}
+}
+
+func TestRadarSourceFamilyCombinesHighVolumeSiblings(t *testing.T) {
+	cases := map[string]string{
+		"source_arxiv_ai":          "arxiv",
+		"source_arxiv_ml":          "arxiv",
+		"source_stacker_tech":      "stacker_news",
+		"source_stacker_lightning": "stacker_news",
+		"source_hacker_news":       "hacker_news",
+		"source_openai_news":       "source_openai_news",
+	}
+	for sourceID, want := range cases {
+		if got := radarSourceFamily(sourceID); got != want {
+			t.Fatalf("source family for %q = %q, want %q", sourceID, got, want)
+		}
 	}
 }

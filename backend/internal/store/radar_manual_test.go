@@ -117,6 +117,8 @@ func TestEnqueueManualRadarBatchUsesSavedTargetWithoutDailyUsage(t *testing.T) {
 		[]byte(`json_extract(jq.payload_json,'$.manual_batch_id')`),
 		[]byte(`SELECT lp.radar_items_per_day`),
 		[]byte(`rc.relevance_score\u003e=?`),
+		[]byte(`ROW_NUMBER() OVER`),
+		[]byte(`PARTITION BY si.source_id`),
 		[]byte(`SET status='qualified',updated_at=?`),
 		[]byte(`"value":"deliver_radar"`),
 		[]byte(`"value":"rad_first"`),

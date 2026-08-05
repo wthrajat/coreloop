@@ -159,7 +159,8 @@ func (service *Service) logQueueSummary(ctx context.Context) {
 }
 
 func (service *Service) dispatchNextDueJob(ctx context.Context) error {
-	queued, err := service.store.PublishableJobs(ctx, service.now(), publishableJobsPerTick)
+	now := service.now()
+	queued, err := service.store.PublishableJobs(ctx, now, publishableJobsPerTick)
 	if err != nil {
 		return err
 	}
@@ -172,7 +173,11 @@ func (service *Service) dispatchNextDueJob(ctx context.Context) error {
 	}
 	job := queued[0]
 	destination := service.appOrigin + "/api/jobs/run"
-	deduplicationID := dispatchDeduplicationID(job.ID, job.AttemptCount)
+	deduplicationID := scheduledDispatchDeduplicationID(
+		job.ID,
+		job.AttemptCount,
+		now,
+	)
 	slog.InfoContext(
 		ctx,
 		"job dispatch requested",
@@ -204,6 +209,20 @@ func (service *Service) continueQueue(ctx context.Context) error {
 
 func dispatchDeduplicationID(jobID string, attempt int) string {
 	return fmt.Sprintf("dispatch-%s-%d", jobID, attempt)
+}
+
+// scheduledDispatchDeduplicationID suppresses duplicate publishes within one
+// scheduler window but permits the next tick to wake the same queued attempt.
+// This heals the queue when an earlier QStash message was acknowledged before
+// the job obtained its lease; an attempt-only key would remain deduplicated and
+// strand every newer chronological job behind it.
+func scheduledDispatchDeduplicationID(
+	jobID string,
+	attempt int,
+	now time.Time,
+) string {
+	window := now.UTC().Truncate(10 * time.Minute).Format("20060102T1504")
+	return fmt.Sprintf("dispatch-%s-%d-%s", jobID, attempt, window)
 }
 
 func (service *Service) Run(ctx context.Context, jobID, workerID string) error {

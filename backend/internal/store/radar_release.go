@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -29,9 +28,9 @@ type radarReleaseUser struct {
 }
 
 type radarReleaseCandidate struct {
-	ID, SourceID string
-	URL          string
-	Score        float64
+	ID, SourceID, SourceFamily string
+	URL                        string
+	Score                      float64
 }
 
 type RadarReleaseReport struct {
@@ -206,38 +205,8 @@ func (store *Store) releaseRadarForUser(
 		}
 		limit = 1
 	}
-	candidatePoolLimit := max(limit*8, 40)
-	rows, err := tx.QueryContext(ctx, `SELECT rc.id,si.source_id,si.normalized_url,
-		rc.relevance_score
-		FROM radar_candidates rc
-		JOIN source_items si ON si.id=rc.source_item_id
-		WHERE rc.user_id=? AND rc.status='pending'
-			AND rc.ranker_version=? AND rc.relevance_score>=?
-			AND COALESCE(si.published_at,si.retrieved_at)>=?
-		ORDER BY rc.relevance_score DESC,rc.created_at,rc.id LIMIT ?`,
-		user.ID, radar.RankerVersion, radar.MinimumDeliveryScore,
-		timestamp(now.Add(-radarCandidateMaxAge)), candidatePoolLimit)
+	candidatePool, err := radarCandidatePool(ctx, tx, user.ID, limit, now)
 	if err != nil {
-		return 0, "", err
-	}
-	var candidatePool []radarReleaseCandidate
-	for rows.Next() {
-		var candidate radarReleaseCandidate
-		if err := rows.Scan(
-			&candidate.ID,
-			&candidate.SourceID,
-			&candidate.URL,
-			&candidate.Score,
-		); err != nil {
-			rows.Close()
-			return 0, "", err
-		}
-		if _, err := radar.CanonicalURL(candidate.URL); err != nil {
-			continue
-		}
-		candidatePool = append(candidatePool, candidate)
-	}
-	if err := rows.Close(); err != nil {
 		return 0, "", err
 	}
 	sourceUsage, err := radarSourceUsage(
@@ -380,9 +349,86 @@ func radarSourceUsage(
 		if err := rows.Scan(&sourceID, &count); err != nil {
 			return nil, err
 		}
-		usage[sourceID] = count
+		usage[radarSourceFamily(sourceID)] += count
 	}
 	return usage, rows.Err()
+}
+
+type radarCandidatePoolQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+// radarCandidatePool caps each individual source before applying the global
+// score order. A high-volume feed such as arXiv therefore cannot crowd Hacker
+// News, Stacker News, and lower-volume official engineering blogs out of the
+// in-memory diversity pass.
+func radarCandidatePool(
+	ctx context.Context,
+	queryer radarCandidatePoolQueryer,
+	userID string,
+	requestedCount int,
+	now time.Time,
+) ([]radarReleaseCandidate, error) {
+	perSourceLimit := max(2, min(requestedCount, maximumUnlimitedReleasePass))
+	rows, err := queryer.QueryContext(ctx, `WITH eligible AS (
+		SELECT rc.id,si.source_id,si.normalized_url,rc.relevance_score,
+			COALESCE(si.published_at,si.retrieved_at) AS freshness,
+			rc.created_at,
+			ROW_NUMBER() OVER (
+				PARTITION BY si.source_id
+				ORDER BY rc.relevance_score DESC,
+					COALESCE(si.published_at,si.retrieved_at) DESC,
+					rc.created_at,rc.id
+			) AS source_position
+		FROM radar_candidates rc
+		JOIN source_items si ON si.id=rc.source_item_id
+		WHERE rc.user_id=? AND rc.status='pending'
+			AND rc.ranker_version=? AND rc.relevance_score>=?
+			AND COALESCE(si.published_at,si.retrieved_at)>=?
+	)
+	SELECT id,source_id,normalized_url,relevance_score
+	FROM eligible WHERE source_position<=?
+	ORDER BY relevance_score DESC,freshness DESC,created_at,id`,
+		userID, radar.RankerVersion, radar.MinimumDeliveryScore,
+		timestamp(now.Add(-radarCandidateMaxAge)), perSourceLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pool []radarReleaseCandidate
+	for rows.Next() {
+		var candidate radarReleaseCandidate
+		if err := rows.Scan(
+			&candidate.ID,
+			&candidate.SourceID,
+			&candidate.URL,
+			&candidate.Score,
+		); err != nil {
+			return nil, err
+		}
+		if _, err := radar.CanonicalURL(candidate.URL); err != nil {
+			continue
+		}
+		candidate.SourceFamily = radarSourceFamily(candidate.SourceID)
+		pool = append(pool, candidate)
+	}
+	return pool, rows.Err()
+}
+
+func radarSourceFamily(sourceID string) string {
+	switch {
+	case sourceID == "source_hacker_news":
+		return "hacker_news"
+	case strings.HasPrefix(sourceID, "source_stacker_"):
+		return "stacker_news"
+	case strings.HasPrefix(sourceID, "source_arxiv_"):
+		return "arxiv"
+	case strings.HasSuffix(sourceID, "_bluesky"):
+		return "bluesky"
+	default:
+		return sourceID
+	}
 }
 
 func diverseRadarCandidates(pool []radarReleaseCandidate, historicalUsage map[string]int, limit int) []string {
@@ -390,31 +436,45 @@ func diverseRadarCandidates(pool []radarReleaseCandidate, historicalUsage map[st
 		return nil
 	}
 	ranked := append([]radarReleaseCandidate(nil), pool...)
-	sort.SliceStable(ranked, func(left, right int) bool {
-		leftScore := ranked[left].Score - math.Min(0.24, float64(historicalUsage[ranked[left].SourceID])*0.08)
-		rightScore := ranked[right].Score - math.Min(0.24, float64(historicalUsage[ranked[right].SourceID])*0.08)
-		return leftScore > rightScore
-	})
-	selected := make([]string, 0, min(limit, len(pool)))
-	selectedIDs := make(map[string]bool, len(pool))
-	perSource := make(map[string]int)
-	for _, candidate := range ranked {
-		if perSource[candidate.SourceID] >= 2 {
-			continue
-		}
-		selected = append(selected, candidate.ID)
-		selectedIDs[candidate.ID] = true
-		perSource[candidate.SourceID]++
-		if len(selected) == limit {
-			return selected
+	for index := range ranked {
+		if ranked[index].SourceFamily == "" {
+			ranked[index].SourceFamily = radarSourceFamily(ranked[index].SourceID)
 		}
 	}
-	for _, candidate := range ranked {
-		if selectedIDs[candidate.ID] {
-			continue
+	sort.SliceStable(ranked, func(left, right int) bool {
+		leftUsage := historicalUsage[ranked[left].SourceFamily]
+		rightUsage := historicalUsage[ranked[right].SourceFamily]
+		if leftUsage != rightUsage {
+			return leftUsage < rightUsage
 		}
-		selected = append(selected, candidate.ID)
-		if len(selected) == limit {
+		return ranked[left].Score > ranked[right].Score
+	})
+
+	familyOrder := make([]string, 0, len(ranked))
+	byFamily := make(map[string][]radarReleaseCandidate)
+	for _, candidate := range ranked {
+		family := candidate.SourceFamily
+		if len(byFamily[family]) == 0 {
+			familyOrder = append(familyOrder, family)
+		}
+		byFamily[family] = append(byFamily[family], candidate)
+	}
+
+	selected := make([]string, 0, min(limit, len(pool)))
+	for round := 0; len(selected) < limit; round++ {
+		added := false
+		for _, family := range familyOrder {
+			candidates := byFamily[family]
+			if round >= len(candidates) {
+				continue
+			}
+			selected = append(selected, candidates[round].ID)
+			added = true
+			if len(selected) == limit {
+				return selected
+			}
+		}
+		if !added {
 			break
 		}
 	}

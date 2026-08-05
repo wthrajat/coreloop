@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"coreloop/backend/internal/ids"
-	"coreloop/backend/internal/radar"
 )
 
 type manualRadarJobPayload struct {
@@ -219,40 +218,8 @@ func manualRadarCandidateIDs(
 	limit int,
 	now time.Time,
 ) ([]string, error) {
-	candidatePoolLimit := max(limit*8, 40)
-	rows, err := tx.QueryContext(ctx, `SELECT rc.id,si.source_id,si.normalized_url,
-		rc.relevance_score
-		FROM radar_candidates rc
-		JOIN source_items si ON si.id=rc.source_item_id
-		WHERE rc.user_id=? AND rc.status='pending'
-			AND rc.ranker_version=? AND rc.relevance_score>=?
-			AND COALESCE(si.published_at,si.retrieved_at)>=?
-		ORDER BY rc.relevance_score DESC,
-			COALESCE(si.published_at,si.retrieved_at) DESC,rc.created_at,rc.id
-		LIMIT ?`, userID, radar.RankerVersion, radar.MinimumDeliveryScore,
-		timestamp(now.Add(-radar.MaximumItemAge)), candidatePoolLimit)
+	pool, err := radarCandidatePool(ctx, tx, userID, limit, now)
 	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	pool := make([]radarReleaseCandidate, 0, limit)
-	for rows.Next() {
-		var candidate radarReleaseCandidate
-		if err := rows.Scan(
-			&candidate.ID,
-			&candidate.SourceID,
-			&candidate.URL,
-			&candidate.Score,
-		); err != nil {
-			return nil, err
-		}
-		if _, err := radar.CanonicalURL(candidate.URL); err != nil {
-			continue
-		}
-		pool = append(pool, candidate)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return diverseRadarCandidates(pool, nil, limit), nil
