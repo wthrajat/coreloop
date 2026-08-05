@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"coreloop/backend/internal/urlguard"
 )
 
 var normalizedTitleWords = regexp.MustCompile(`[a-z0-9]+`)
@@ -60,6 +62,9 @@ func CanonicalURL(rawURL string) (string, error) {
 	hostname := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
 	if hostname == "" || strings.ContainsAny(hostname, " \t\r\n") {
 		return "", errors.New("news URL must contain a valid host")
+	}
+	if urlguard.IsPlaceholderHost(hostname) {
+		return "", errors.New("news URL must not use a placeholder host")
 	}
 	port := parsed.Port()
 	if port == "80" || port == "443" {

@@ -159,6 +159,34 @@ func TestRouterDeliversAUsableDraftWhenItsCorrectionRequestFails(t *testing.T) {
 	}
 }
 
+func TestRouterNeverDeliversAModelInventedSourceURL(t *testing.T) {
+	draft := validProviderDraft()
+	draft.Sources = []content.Source{{
+		ID:           "invented",
+		Publisher:    "Example",
+		Title:        "Placeholder source",
+		CanonicalURL: "https://example.com/source",
+	}}
+	groq := &fakeProvider{name: "groq", configured: true, responses: []any{draft, draft}}
+
+	generated, err := NewRouter(groq, nil, nil).Generate(
+		context.Background(),
+		content.LessonContext{Minutes: 15},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groq.calls != 2 {
+		t.Fatalf("provider calls = %d, want one correction", groq.calls)
+	}
+	if len(generated.Draft.Sources) != 0 {
+		t.Fatalf("invented source reached delivery: %#v", generated.Draft.Sources)
+	}
+	if generated.VerificationState != "unverified_warning" || generated.Warning == "" {
+		t.Fatalf("grounding failure was not disclosed: %#v", generated)
+	}
+}
+
 func TestRouterDoesNotReportQuotaForProviderContractFailures(t *testing.T) {
 	groq := &fakeProvider{name: "groq", configured: true, responses: []any{
 		&Error{Provider: "groq", Kind: FailurePermanent, Message: "request exceeds the model TPM limit"},

@@ -71,7 +71,7 @@ func TestCompactBriefingKeepsVersionReleasesShortAndSourced(t *testing.T) {
 		Summary:      detail,
 		WhyItMatters: "Teams using this runtime should review compatibility and migration notes before upgrading.",
 		Source: SourceReference{
-			Name: "Example Runtime", URL: "https://example.com/releases/4.2.1",
+			Name: "Example Runtime", URL: "https://example.co/releases/4.2.1",
 		},
 	}, 3_900)
 	if err != nil {
@@ -80,7 +80,7 @@ func TestCompactBriefingKeepsVersionReleasesShortAndSourced(t *testing.T) {
 	if utf8.RuneCountInString(got) > 1_100 {
 		t.Fatalf("version release is too long: %d runes", utf8.RuneCountInString(got))
 	}
-	if !strings.Contains(got, "https://example.com/releases/4.2.1") {
+	if !strings.Contains(got, "https://example.co/releases/4.2.1") {
 		t.Fatalf("compact briefing lost its source:\n%s", got)
 	}
 }
@@ -92,7 +92,7 @@ func TestCompactBriefingUsesEscapedTelegramLimit(t *testing.T) {
 		Summary:      strings.Repeat("Queues < workers & retries > timeouts. ", 200),
 		WhyItMatters: strings.Repeat("This explains reliability & recovery trade-offs. ", 40),
 		Source: SourceReference{
-			Name: "Engineering & Reliability", URL: "https://example.com/incident",
+			Name: "Engineering & Reliability", URL: "https://example.co/incident",
 		},
 	}, 900)
 	if err != nil {
@@ -102,7 +102,7 @@ func TestCompactBriefingUsesEscapedTelegramLimit(t *testing.T) {
 	if count := utf8.RuneCountInString(escaped); count > 900 {
 		t.Fatalf("escaped briefing has %d runes, want at most 900", count)
 	}
-	for _, required := range []string{"Storage & replication incident", "Engineering & Reliability", "https://example.com/incident"} {
+	for _, required := range []string{"Storage & replication incident", "Engineering & Reliability", "https://example.co/incident"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("compact briefing lost %q:\n%s", required, got)
 		}

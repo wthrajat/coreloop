@@ -375,7 +375,8 @@ func (service *Service) deliverLesson(ctx context.Context, job store.Job) error 
 		if index == len(bundle.Parts)-1 {
 			options.Buttons = [][]telegram.Button{{{Text: "Read", Data: "read:" + assignmentID}, {Text: "Skip", Data: "skip:" + assignmentID}}}
 		}
-		messageID, err := service.telegram.SendMessage(ctx, bundle.ChatID, part.Text, options)
+		messageText := content.SanitizeRenderedSourceLinks(part.Text)
+		messageID, err := service.telegram.SendMessage(ctx, bundle.ChatID, messageText, options)
 		if err != nil {
 			_ = service.store.FailDelivery(ctx, bundle.ID, "telegram_send_failed", service.now())
 			return err
@@ -580,6 +581,8 @@ func radarSourceName(candidate store.RadarCandidate) string {
 
 func radarDeliveryRejectionReason(candidate store.RadarCandidate, now time.Time) string {
 	switch {
+	case !deliverableRadarURL(candidate.URL):
+		return "invalid_source_url"
 	case candidate.RankerVersion != radar.RankerVersion:
 		return "superseded_ranking_policy"
 	case candidate.Score < radar.MinimumDeliveryScore:
@@ -589,6 +592,11 @@ func radarDeliveryRejectionReason(candidate store.RadarCandidate, now time.Time)
 	default:
 		return ""
 	}
+}
+
+func deliverableRadarURL(rawURL string) bool {
+	canonical, err := radar.CanonicalURL(rawURL)
+	return err == nil && canonical != ""
 }
 
 func radarDeveloperContext(category string) string {

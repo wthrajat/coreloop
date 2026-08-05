@@ -25,7 +25,7 @@ func TestDeterministicRadarBriefingAlwaysFitsOneTelegramMessage(t *testing.T) {
 			"Register now.",
 		WhyItMatters: radarDeveloperContext(string(radar.CategoryRelease)),
 		Source: radar.SourceReference{
-			Name: "Runtime project", URL: "https://example.com/releases/2.0",
+			Name: "Runtime project", URL: "https://example.co/releases/2.0",
 		},
 		DiscoveredVia: []radar.SourceReference{{
 			Name: "Hacker News discussion", URL: "https://news.ycombinator.com/item?id=42",
@@ -40,7 +40,7 @@ func TestDeterministicRadarBriefingAlwaysFitsOneTelegramMessage(t *testing.T) {
 			t.Fatalf("briefing retained promotional phrase %q", promotional)
 		}
 	}
-	if !strings.Contains(briefing, "https://example.com/releases/2.0") ||
+	if !strings.Contains(briefing, "https://example.co/releases/2.0") ||
 		!strings.Contains(briefing, "https://news.ycombinator.com/item?id=42") {
 		t.Fatalf("briefing is missing source provenance: %s", briefing)
 	}
@@ -89,6 +89,7 @@ func TestRadarDeliveryRechecksRankingPolicyAndFreshness(t *testing.T) {
 		RankerVersion: radar.RankerVersion,
 		Score:         radar.MinimumDeliveryScore,
 		PublishedAt:   now.Add(-radar.MaximumItemAge),
+		URL:           "https://example.co/current-update",
 	}
 	if reason := radarDeliveryRejectionReason(candidate, now); reason != "" {
 		t.Fatalf("boundary candidate rejected: %s", reason)
@@ -109,5 +110,11 @@ func TestRadarDeliveryRechecksRankingPolicyAndFreshness(t *testing.T) {
 	candidate.Score = radar.MinimumDeliveryScore - 0.001
 	if reason := radarDeliveryRejectionReason(candidate, now); reason != "below_editorial_threshold" {
 		t.Fatalf("low-score candidate reason = %q", reason)
+	}
+
+	candidate.Score = radar.MinimumDeliveryScore
+	candidate.URL = "https://example.com/placeholder"
+	if reason := radarDeliveryRejectionReason(candidate, now); reason != "invalid_source_url" {
+		t.Fatalf("placeholder-source candidate reason = %q", reason)
 	}
 }

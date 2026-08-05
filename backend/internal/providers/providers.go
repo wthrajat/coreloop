@@ -206,7 +206,10 @@ func generateWithCorrection(ctx context.Context, provider Provider, lessonContex
 				InputTokens: response.InputTokens, OutputTokens: response.OutputTokens, ValidationErrors: correction}
 			continue
 		}
+		var groundingProblems []string
+		draft, groundingProblems = content.GroundSources(draft, lessonContext.Evidence)
 		problems, verification := content.Validate(draft, lessonContext.Minutes, lessonContext.Evidence)
+		problems = append(groundingProblems, problems...)
 		last = content.Generated{Draft: draft, Provider: provider.Name(), Model: provider.Model(), RequestID: response.RequestID,
 			InputTokens: response.InputTokens, OutputTokens: response.OutputTokens, ValidationErrors: problems, VerificationState: verification}
 		if content.Usable(draft) {

@@ -5,11 +5,16 @@ import { useCallback, useEffect, useState } from "react";
 import { PageHeader } from "@/components/page-header";
 import { StatusPill } from "@/components/status-pill";
 import { api } from "@/lib/api-client";
-import type { ManualLesson, Operations } from "@/lib/api-types";
+import type { ManualLesson, ManualRadar, Operations } from "@/lib/api-types";
 
 const ACTIVE_LESSON_STATES = new Set<ManualLesson["state"]>([
   "queued",
   "generating",
+  "delivering",
+]);
+
+const ACTIVE_RADAR_STATES = new Set<ManualRadar["state"]>([
+  "queued",
   "delivering",
 ]);
 
@@ -21,6 +26,9 @@ export default function OperationsPage() {
   const [lesson, setLesson] = useState<ManualLesson | null>(null);
   const [lessonStarting, setLessonStarting] = useState(false);
   const [lessonError, setLessonError] = useState("");
+  const [radar, setRadar] = useState<ManualRadar | null>(null);
+  const [radarStarting, setRadarStarting] = useState(false);
+  const [radarError, setRadarError] = useState("");
 
   const refresh = useCallback(async () => {
     setOperations(await api<Operations>("/operations"));
@@ -76,6 +84,42 @@ export default function OperationsPage() {
     };
   }, [lesson?.job_id, lesson?.state, refresh]);
 
+  useEffect(() => {
+    const jobID = radar?.job_id;
+    if (!jobID || !ACTIVE_RADAR_STATES.has(radar.state)) return;
+    const currentJobID = jobID;
+
+    let active = true;
+    async function pollRadar() {
+      try {
+        const value = await api<ManualRadar>(
+          `/operations/radar/${encodeURIComponent(currentJobID)}`,
+        );
+        if (!active) return;
+        setRadar(value);
+        setRadarError("");
+        if (!ACTIVE_RADAR_STATES.has(value.state)) {
+          await refresh();
+        }
+      } catch (error) {
+        if (!active) return;
+        setRadarError(
+          error instanceof Error
+            ? error.message
+            : "Radar status could not be refreshed.",
+        );
+      }
+    }
+
+    const firstPoll = window.setTimeout(() => void pollRadar(), 800);
+    const pollInterval = window.setInterval(() => void pollRadar(), 2000);
+    return () => {
+      active = false;
+      window.clearTimeout(firstPoll);
+      window.clearInterval(pollInterval);
+    };
+  }, [radar?.job_id, radar?.state, refresh]);
+
   async function sendLessonNow() {
     setLessonStarting(true);
     setLessonError("");
@@ -92,6 +136,25 @@ export default function OperationsPage() {
       );
     } finally {
       setLessonStarting(false);
+    }
+  }
+
+  async function sendRadarNow() {
+    setRadarStarting(true);
+    setRadarError("");
+    try {
+      const value = await api<ManualRadar>("/operations/radar", {
+        method: "POST",
+        body: JSON.stringify({ request_id: crypto.randomUUID() }),
+      });
+      setRadar(value);
+      await refresh();
+    } catch (error) {
+      setRadarError(
+        error instanceof Error ? error.message : "Radar delivery failed.",
+      );
+    } finally {
+      setRadarStarting(false);
     }
   }
 
@@ -165,7 +228,7 @@ export default function OperationsPage() {
     <div className="page-stack">
       <PageHeader
         title="Operations"
-        description="Owner-only lesson testing, queue truth, private invitations, and the explicit paid-provider boundary."
+        description="Owner-only Telegram acceptance tests, queue truth, private invitations, and the explicit paid-provider boundary."
         action={
           <button
             className="button button-secondary"
@@ -180,6 +243,12 @@ export default function OperationsPage() {
         starting={lessonStarting}
         error={lessonError}
         onSend={() => void sendLessonNow()}
+      />
+      <RadarNowPanel
+        radar={radar}
+        starting={radarStarting}
+        error={radarError}
+        onSend={() => void sendRadarNow()}
       />
       {message ? (
         <section
@@ -298,32 +367,97 @@ function LessonNowPanel({
   const stateMessage = error || lesson?.message || lessonStateMessage(state);
 
   return (
-    <section className="lesson-now-panel" aria-labelledby="lesson-now-title">
+    <OwnerDeliveryPanel
+      labelledBy="lesson-now-title"
+      title="Send a lesson now"
+      description="Generate the next lesson from your current profile and deliver it to Telegram immediately, with Read and Skip feedback."
+      statusLabel={lessonStateLabel(state, Boolean(error))}
+      statusTone={lessonStateTone(state, Boolean(error))}
+      statusMessage={stateMessage}
+      error={Boolean(error)}
+      actionLabel={lessonActionLabel(state)}
+      disabled={starting || active || quotaBlocked}
+      onSend={onSend}
+    />
+  );
+}
+
+function RadarNowPanel({
+  radar,
+  starting,
+  error,
+  onSend,
+}: {
+  radar: ManualRadar | null;
+  starting: boolean;
+  error: string;
+  onSend: () => void;
+}) {
+  const active = radar ? ACTIVE_RADAR_STATES.has(radar.state) : false;
+  const state = starting ? "starting" : (radar?.state ?? "ready");
+  const stateMessage = error || radar?.message || radarStateMessage(state);
+
+  return (
+    <OwnerDeliveryPanel
+      labelledBy="radar-now-title"
+      title="Send latest Radar now"
+      description="Deliver the highest-ranked eligible update already waiting for your profile. This acceptance test does not consume today's normal Radar target."
+      statusLabel={radarStateLabel(state, Boolean(error))}
+      statusTone={radarStateTone(state, Boolean(error))}
+      statusMessage={stateMessage}
+      error={Boolean(error)}
+      actionLabel={radarActionLabel(state)}
+      disabled={starting || active}
+      onSend={onSend}
+    />
+  );
+}
+
+function OwnerDeliveryPanel({
+  labelledBy,
+  title,
+  description,
+  statusLabel,
+  statusTone,
+  statusMessage,
+  error,
+  actionLabel,
+  disabled,
+  onSend,
+}: {
+  labelledBy: string;
+  title: string;
+  description: string;
+  statusLabel: string;
+  statusTone: "neutral" | "ready" | "attention" | "error";
+  statusMessage: string;
+  error: boolean;
+  actionLabel: string;
+  disabled: boolean;
+  onSend: () => void;
+}) {
+  return (
+    <section className="lesson-now-panel" aria-labelledby={labelledBy}>
       <div className="lesson-now-copy">
         <div>
-          <h2 id="lesson-now-title">Send a lesson now</h2>
-          <p>
-            Generate the next lesson from your current profile and deliver it to
-            Telegram immediately, with Read and Skip feedback.
-          </p>
+          <h2 id={labelledBy}>{title}</h2>
+          <p>{description}</p>
         </div>
         <div
           className="lesson-now-status"
           role={error ? "alert" : "status"}
           aria-live={error ? "assertive" : "polite"}
         >
-          <StatusPill tone={lessonStateTone(state, Boolean(error))}>
-            {lessonStateLabel(state, Boolean(error))}
-          </StatusPill>
-          <p>{stateMessage}</p>
+          <StatusPill tone={statusTone}>{statusLabel}</StatusPill>
+          <p>{statusMessage}</p>
         </div>
       </div>
       <button
         className="button button-primary lesson-now-action"
-        disabled={starting || active || quotaBlocked}
+        disabled={disabled}
         onClick={onSend}
       >
-        {lessonActionLabel(state)}
+        {actionLabel}
       </button>
     </section>
   );
@@ -392,6 +526,63 @@ function lessonActionLabel(state: LessonDisplayState) {
       return "Try again";
     default:
       return "Send lesson now";
+  }
+}
+
+type RadarDisplayState = ManualRadar["state"] | "ready" | "starting";
+
+function radarStateLabel(state: RadarDisplayState, hasError: boolean) {
+  if (hasError) return "Needs attention";
+  switch (state) {
+    case "ready":
+      return "Ready";
+    case "starting":
+      return "Starting";
+    case "queued":
+      return "Queued";
+    case "delivering":
+      return "Delivering";
+    case "delivered":
+      return "Delivered";
+    case "failed":
+      return "Failed";
+  }
+}
+
+function radarStateTone(
+  state: RadarDisplayState,
+  hasError: boolean,
+): "neutral" | "ready" | "attention" | "error" {
+  if (hasError || state === "failed") return "error";
+  if (state === "delivered") return "ready";
+  return "neutral";
+}
+
+function radarStateMessage(state: RadarDisplayState) {
+  switch (state) {
+    case "ready":
+      return "Ready to send the best ranked update currently available.";
+    case "starting":
+      return "Reserving the best eligible Radar update…";
+    default:
+      return "Radar delivery status is updating.";
+  }
+}
+
+function radarActionLabel(state: RadarDisplayState) {
+  switch (state) {
+    case "starting":
+      return "Starting…";
+    case "queued":
+      return "Radar queued";
+    case "delivering":
+      return "Delivering…";
+    case "delivered":
+      return "Send another update";
+    case "failed":
+      return "Try again";
+    default:
+      return "Send latest Radar";
   }
 }
 

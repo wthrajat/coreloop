@@ -6,22 +6,22 @@ import (
 )
 
 func TestCanonicalURLNormalizesHTTPSAndRemovesTracking(t *testing.T) {
-	got, err := CanonicalURL("http://Example.COM:80/posts/runtime/?utm_source=hackernews&id=7&fbclid=ignored#comments")
+	got, err := CanonicalURL("http://Example.CO:80/posts/runtime/?utm_source=hackernews&id=7&fbclid=ignored#comments")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "https://example.com/posts/runtime/?id=7"
+	want := "https://example.co/posts/runtime/?id=7"
 	if got != want {
 		t.Fatalf("CanonicalURL() = %q, want %q", got, want)
 	}
 }
 
 func TestCanonicalURLPreservesContentParameters(t *testing.T) {
-	got, err := CanonicalURL("example.com/story?source=weekly&version=2")
+	got, err := CanonicalURL("example.co/story?source=weekly&version=2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "https://example.com/story?source=weekly&version=2"
+	want := "https://example.co/story?source=weekly&version=2"
 	if got != want {
 		t.Fatalf("CanonicalURL() = %q, want %q", got, want)
 	}
@@ -45,6 +45,19 @@ func TestCanonicalURLRejectsMalformedURLs(t *testing.T) {
 	}
 }
 
+func TestCanonicalURLRejectsPlaceholderHosts(t *testing.T) {
+	for _, value := range []string{
+		"https://example.com/story",
+		"https://news.example.org/story",
+		"https://source.invalid/story",
+		"https://source.test/story",
+	} {
+		if _, err := CanonicalURL(value); err == nil {
+			t.Fatalf("CanonicalURL(%q) unexpectedly accepted a placeholder host", value)
+		}
+	}
+}
+
 func TestClusterKeyFallsBackToNormalizedTitle(t *testing.T) {
 	first := ClusterKey("not a valid URL %", "Go 1.30: Runtime Changes!")
 	second := ClusterKey("", "  GO 1.30 — runtime changes  ")
@@ -57,8 +70,8 @@ func TestClusterKeyFallsBackToNormalizedTitle(t *testing.T) {
 }
 
 func TestClusterKeyDoesNotMergeDifferentValidURLs(t *testing.T) {
-	first := ClusterKey("https://one.example/post", "Same announcement")
-	second := ClusterKey("https://two.example/post", "Same announcement")
+	first := ClusterKey("https://one.example.co/post", "Same announcement")
+	second := ClusterKey("https://two.example.co/post", "Same announcement")
 	if first == second {
 		t.Fatal("valid source URLs should take precedence over duplicate titles")
 	}

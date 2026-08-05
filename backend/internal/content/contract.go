@@ -3,10 +3,10 @@ package content
 import "time"
 
 const (
-	PromptRecordID  = "prompt_lesson_v2"
-	PromptVersion   = "lesson-v2"
+	PromptRecordID  = "prompt_lesson_v3"
+	PromptVersion   = "lesson-v3"
 	SchemaVersion   = "lesson-draft-v1"
-	CompilerVersion = "compiler-v2"
+	CompilerVersion = "compiler-v3"
 )
 
 type Evidence struct {

@@ -86,3 +86,30 @@ func TestLessonClarityMigrationRegistersVersionedPrompt(t *testing.T) {
 		}
 	}
 }
+
+func TestGroundedSourceMigrationRegistersVersionedPrompt(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	migration, err := os.ReadFile(filepath.Join(
+		projectRoot,
+		"migrations",
+		"0006_grounded_lesson_sources.sql",
+	))
+	if err != nil {
+		t.Fatalf("read grounded source migration: %v", err)
+	}
+	text := strings.ToLower(string(migration))
+	for _, required := range []string{
+		"prompt_lesson_v3",
+		"lesson-v3",
+		"lesson-draft-v1",
+		"compiler-v3",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("grounded source migration is missing %q", required)
+		}
+	}
+}

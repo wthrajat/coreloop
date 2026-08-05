@@ -27,6 +27,7 @@ type radarReleaseUser struct {
 
 type radarReleaseCandidate struct {
 	ID, SourceID string
+	URL          string
 	Score        float64
 }
 
@@ -166,7 +167,8 @@ func (store *Store) releaseRadarForUser(
 		limit = 1
 	}
 	candidatePoolLimit := max(limit*8, 40)
-	rows, err := tx.QueryContext(ctx, `SELECT rc.id,si.source_id,rc.relevance_score
+	rows, err := tx.QueryContext(ctx, `SELECT rc.id,si.source_id,si.normalized_url,
+		rc.relevance_score
 		FROM radar_candidates rc
 		JOIN source_items si ON si.id=rc.source_item_id
 		WHERE rc.user_id=? AND rc.status='pending'
@@ -181,9 +183,17 @@ func (store *Store) releaseRadarForUser(
 	var candidatePool []radarReleaseCandidate
 	for rows.Next() {
 		var candidate radarReleaseCandidate
-		if err := rows.Scan(&candidate.ID, &candidate.SourceID, &candidate.Score); err != nil {
+		if err := rows.Scan(
+			&candidate.ID,
+			&candidate.SourceID,
+			&candidate.URL,
+			&candidate.Score,
+		); err != nil {
 			rows.Close()
 			return 0, err
+		}
+		if _, err := radar.CanonicalURL(candidate.URL); err != nil {
+			continue
 		}
 		candidatePool = append(candidatePool, candidate)
 	}

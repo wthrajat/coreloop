@@ -13,8 +13,11 @@ import (
 )
 
 type fakeApplicationJobs struct {
-	userID    string
-	requestID string
+	lessonUserID    string
+	lessonRequestID string
+	radarUserID     string
+	radarRequestID  string
+	radarError      error
 }
 
 func (fake *fakeApplicationJobs) RunBlockedWithOpenAI(context.Context, string) error {
@@ -22,13 +25,26 @@ func (fake *fakeApplicationJobs) RunBlockedWithOpenAI(context.Context, string) e
 }
 
 func (fake *fakeApplicationJobs) TriggerLessonNow(_ context.Context, userID, requestID string) (jobs.ManualLesson, error) {
-	fake.userID = userID
-	fake.requestID = requestID
+	fake.lessonUserID = userID
+	fake.lessonRequestID = requestID
 	return jobs.ManualLesson{JobID: "job_manual", State: "queued", Message: "Queued for immediate generation."}, nil
 }
 
 func (fake *fakeApplicationJobs) ManualLessonStatus(context.Context, string, string) (jobs.ManualLesson, error) {
 	return jobs.ManualLesson{}, nil
+}
+
+func (fake *fakeApplicationJobs) TriggerRadarNow(_ context.Context, userID, requestID string) (jobs.ManualRadar, error) {
+	fake.radarUserID = userID
+	fake.radarRequestID = requestID
+	if fake.radarError != nil {
+		return jobs.ManualRadar{}, fake.radarError
+	}
+	return jobs.ManualRadar{JobID: "job_radar", State: "queued", Message: "Queued for Telegram."}, nil
+}
+
+func (fake *fakeApplicationJobs) ManualRadarStatus(context.Context, string, string) (jobs.ManualRadar, error) {
+	return jobs.ManualRadar{}, nil
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -85,8 +101,63 @@ func TestTriggerLessonNowUsesAuthenticatedUser(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, response.Code, response.Body.String())
 	}
-	if jobService.userID != "usr_owner" || jobService.requestID != "request-123" {
+	if jobService.lessonUserID != "usr_owner" || jobService.lessonRequestID != "request-123" {
 		t.Fatalf("unexpected trigger input: %#v", jobService)
+	}
+}
+
+func TestTriggerRadarNowUsesAuthenticatedUser(t *testing.T) {
+	jobService := &fakeApplicationJobs{}
+	configuration := Config{Jobs: jobService}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/app/operations/radar",
+		bytes.NewBufferString(`{"request_id":"radar-request-123"}`),
+	)
+	request = request.WithContext(context.WithValue(request.Context(), sessionKey, sessionContext{
+		User: store.User{ID: "usr_owner"},
+	}))
+	response := httptest.NewRecorder()
+
+	configuration.triggerRadarNow(response, request)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, response.Code, response.Body.String())
+	}
+	if jobService.radarUserID != "usr_owner" || jobService.radarRequestID != "radar-request-123" {
+		t.Fatalf("unexpected trigger input: %#v", jobService)
+	}
+}
+
+func TestTriggerRadarNowReportsUnavailableCandidate(t *testing.T) {
+	jobService := &fakeApplicationJobs{radarError: jobs.ErrManualRadarUnavailable}
+	configuration := Config{Jobs: jobService}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/app/operations/radar",
+		bytes.NewBufferString(`{"request_id":"radar-request-456"}`),
+	)
+	request = request.WithContext(context.WithValue(request.Context(), sessionKey, sessionContext{
+		User: store.User{ID: "usr_owner"},
+	}))
+	response := httptest.NewRecorder()
+
+	configuration.triggerRadarNow(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusConflict, response.Code, response.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode conflict response: %v", err)
+	}
+	if payload.Error.Code != "conflict" || payload.Error.Message == "" {
+		t.Fatalf("unexpected conflict payload: %#v", payload)
 	}
 }
 

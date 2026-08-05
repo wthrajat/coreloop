@@ -2,7 +2,6 @@ package content
 
 import (
 	"fmt"
-	"net/url"
 	"strings"
 )
 
@@ -52,8 +51,7 @@ func Validate(draft LessonDraft, requestedMinutes int, allowedEvidence []Evidenc
 		if _, exists := allowed[source.ID]; !exists {
 			problems = append(problems, "source "+source.ID+" was not supplied")
 		}
-		parsed, err := url.Parse(source.CanonicalURL)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		if !DeliverableSourceURL(source.CanonicalURL) {
 			problems = append(problems, "source "+source.ID+" has an invalid URL")
 		}
 		sourceIDs[source.ID] = true

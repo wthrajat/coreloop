@@ -35,9 +35,14 @@ func RenderSections(draft LessonDraft) []string {
 	if len(draft.Sources) > 0 {
 		var sources []string
 		for _, source := range draft.Sources {
+			if !DeliverableSourceURL(source.CanonicalURL) {
+				continue
+			}
 			sources = append(sources, fmt.Sprintf(`<a href="%s">%s — %s</a>`, html.EscapeString(source.CanonicalURL), escape(source.Publisher), escape(source.Title)))
 		}
-		sections = append(sections, "<b>Sources</b>\n"+strings.Join(sources, "\n"))
+		if len(sources) > 0 {
+			sections = append(sections, "<b>Sources</b>\n"+strings.Join(sources, "\n"))
+		}
 	}
 	return sections
 }

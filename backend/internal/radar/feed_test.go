@@ -13,7 +13,7 @@ func TestParseAtomFeed(t *testing.T) {
 }
 
 func TestParseRSSUsesDetailedNamespacedContentAndDate(t *testing.T) {
-	items, err := ParseFeed([]byte(`<rss xmlns:content="urn:content" xmlns:dc="urn:dc"><channel><item><title>Runtime update</title><link>https://example.com/runtime</link><description>Short teaser</description><content:encoded><![CDATA[<p>Detailed architecture and migration notes.</p>]]></content:encoded><dc:date>2026-08-05T10:00:00Z</dc:date></item></channel></rss>`))
+	items, err := ParseFeed([]byte(`<rss xmlns:content="urn:content" xmlns:dc="urn:dc"><channel><item><title>Runtime update</title><link>https://example.co/runtime</link><description>Short teaser</description><content:encoded><![CDATA[<p>Detailed architecture and migration notes.</p>]]></content:encoded><dc:date>2026-08-05T10:00:00Z</dc:date></item></channel></rss>`))
 	if err != nil {
 		t.Fatal(err)
 	}

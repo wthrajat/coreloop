@@ -84,3 +84,9 @@ export type ManualLesson = {
     | "failed";
   message: string;
 };
+
+export type ManualRadar = {
+  job_id: string;
+  state: "queued" | "delivering" | "delivered" | "failed";
+  message: string;
+};

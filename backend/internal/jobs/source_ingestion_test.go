@@ -43,7 +43,7 @@ func TestFetchHackerNewsKeepsOriginalAndDiscussionSources(t *testing.T) {
 		case "/v0/beststories.json":
 			return sourceResponse(http.StatusOK, `[42]`), nil
 		case "/v0/item/42.json":
-			return sourceResponse(http.StatusOK, `{"id":42,"type":"story","title":"A useful database paper","url":"https://example.com/paper?utm_source=hn","time":1785913200,"score":321,"descendants":87}`), nil
+			return sourceResponse(http.StatusOK, `{"id":42,"type":"story","title":"A useful database paper","url":"https://example.co/paper?utm_source=hn","time":1785913200,"score":321,"descendants":87}`), nil
 		default:
 			t.Fatalf("unexpected path %q", request.URL.Path)
 			return nil, nil
@@ -60,7 +60,7 @@ func TestFetchHackerNewsKeepsOriginalAndDiscussionSources(t *testing.T) {
 		t.Fatalf("items = %#v", result.Items)
 	}
 	item := result.Items[0]
-	if item.URL != "https://example.com/paper" || item.CommunityPoints != 321 ||
+	if item.URL != "https://example.co/paper" || item.CommunityPoints != 321 ||
 		item.CommunityComments != 87 || !item.CommunitySignalsAvailable {
 		t.Fatalf("HN item = %#v", item)
 	}
@@ -74,10 +74,10 @@ func TestFetchBlueskyAuthorUsesEmbeddedOriginalSource(t *testing.T) {
 		if request.URL.Path != "/xrpc/app.bsky.feed.getAuthorFeed" {
 			t.Fatalf("request path = %q", request.URL.Path)
 		}
-		return sourceResponse(http.StatusOK, `{"feed":[{"post":{"uri":"at://did:plc:test/app.bsky.feed.post/abc123","author":{"handle":"example.com","displayName":"Example Research"},"record":{"text":"Technical details and discussion.","createdAt":"2026-08-05T08:00:00Z"},"embed":{"external":{"uri":"https://example.com/research/new-model?utm_source=bluesky","title":"A new model architecture","description":"The paper describes a sparse runtime."}},"likeCount":90,"repostCount":20,"replyCount":15}}]}`), nil
+		return sourceResponse(http.StatusOK, `{"feed":[{"post":{"uri":"at://did:plc:test/app.bsky.feed.post/abc123","author":{"handle":"example.co","displayName":"Example Research"},"record":{"text":"Technical details and discussion.","createdAt":"2026-08-05T08:00:00Z"},"embed":{"external":{"uri":"https://example.co/research/new-model?utm_source=bluesky","title":"A new model architecture","description":"The paper describes a sparse runtime."}},"likeCount":90,"repostCount":20,"replyCount":15}}]}`), nil
 	})
 	result, err := service.fetchSource(context.Background(), store.SourceRecord{
-		URL:           "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor=example.com&limit=30",
+		URL:           "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor=example.co&limit=30",
 		AdapterConfig: `{"adapter":"bluesky_author","item_limit":10}`,
 	})
 	if err != nil {
@@ -87,11 +87,11 @@ func TestFetchBlueskyAuthorUsesEmbeddedOriginalSource(t *testing.T) {
 		t.Fatalf("items = %#v", result.Items)
 	}
 	item := result.Items[0]
-	if item.URL != "https://example.com/research/new-model" || item.CommunityPoints != 110 ||
+	if item.URL != "https://example.co/research/new-model" || item.CommunityPoints != 110 ||
 		item.CommunityComments != 15 || !item.CommunitySignalsAvailable {
 		t.Fatalf("Bluesky item = %#v", item)
 	}
-	if len(item.DiscoveredVia) != 1 || item.DiscoveredVia[0].URL != "https://bsky.app/profile/example.com/post/abc123" {
+	if len(item.DiscoveredVia) != 1 || item.DiscoveredVia[0].URL != "https://bsky.app/profile/example.co/post/abc123" {
 		t.Fatalf("Bluesky discovery = %#v", item.DiscoveredVia)
 	}
 }
@@ -100,7 +100,7 @@ func TestFetchSitemapFiltersPathsAndReadsNeutralPageMetadata(t *testing.T) {
 	service := sourceTestService(func(request *http.Request) (*http.Response, error) {
 		switch request.URL.Path {
 		case "/sitemap.xml":
-			return sourceResponse(http.StatusOK, `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.com/news/new-runtime</loc><lastmod>2026-08-05</lastmod></url><url><loc>https://example.com/company/careers</loc><lastmod>2026-08-06</lastmod></url></urlset>`), nil
+			return sourceResponse(http.StatusOK, `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.co/news/new-runtime</loc><lastmod>2026-08-05</lastmod></url><url><loc>https://example.co/company/careers</loc><lastmod>2026-08-06</lastmod></url></urlset>`), nil
 		case "/news/new-runtime":
 			return sourceResponse(http.StatusOK, `<html><head><meta property="og:title" content="New runtime released"><meta name="description" content="We are thrilled to announce a cutting-edge runtime. It reduces cold starts by 40%. Read more."><meta property="article:published_time" content="2026-08-05T07:00:00Z"></head></html>`), nil
 		default:
@@ -109,7 +109,7 @@ func TestFetchSitemapFiltersPathsAndReadsNeutralPageMetadata(t *testing.T) {
 		}
 	})
 	result, err := service.fetchSource(context.Background(), store.SourceRecord{
-		URL:           "https://example.com/sitemap.xml",
+		URL:           "https://example.co/sitemap.xml",
 		AdapterConfig: `{"adapter":"sitemap","item_limit":5,"path_prefixes":["/news/"]}`,
 	})
 	if err != nil {
@@ -133,7 +133,7 @@ func TestFetchFeedPreservesConditionalRequestState(t *testing.T) {
 		return response, nil
 	})
 	result, err := service.fetchSource(context.Background(), store.SourceRecord{
-		URL: "https://example.com/feed.xml", ETag: `"feed-v1"`,
+		URL: "https://example.co/feed.xml", ETag: `"feed-v1"`,
 		AdapterConfig: `{"adapter":"feed"}`,
 	})
 	if err != nil {
@@ -149,12 +149,12 @@ func TestFetchFeedResolvesRelativeArticleLinks(t *testing.T) {
 		return sourceResponse(http.StatusOK, `<rss><channel><item><title>Update</title><link>/news/update</link><description>Details</description></item></channel></rss>`), nil
 	})
 	result, err := service.fetchSource(context.Background(), store.SourceRecord{
-		URL: "https://example.com/feed.xml", AdapterConfig: `{"adapter":"feed"}`,
+		URL: "https://example.co/feed.xml", AdapterConfig: `{"adapter":"feed"}`,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Items) != 1 || result.Items[0].URL != "https://example.com/news/update" {
+	if len(result.Items) != 1 || result.Items[0].URL != "https://example.co/news/update" {
 		t.Fatalf("items = %#v", result.Items)
 	}
 }
