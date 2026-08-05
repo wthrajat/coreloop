@@ -87,14 +87,59 @@ func Apply(ctx context.Context, database *sql.DB, migrations []Migration) error 
 	return nil
 }
 
-// SplitStatements handles SQLite strings and comments without accepting a
-// second SQL parser as a production dependency.
+// SplitStatements handles SQLite strings, comments, and trigger bodies without
+// accepting a second SQL parser as a production dependency.
 func SplitStatements(input string) []string {
 	var statements []string
 	var builder strings.Builder
+	var word strings.Builder
 	var quote rune
 	lineComment := false
 	blockComment := false
+	triggerStatement := false
+	triggerBody := false
+	caseDepth := 0
+	leadingWords := make([]string, 0, 3)
+
+	observeWord := func() {
+		if word.Len() == 0 {
+			return
+		}
+		value := strings.ToUpper(word.String())
+		word.Reset()
+		if len(leadingWords) < 3 {
+			leadingWords = append(leadingWords, value)
+			triggerStatement = isCreateTriggerPrefix(leadingWords)
+		}
+		if !triggerStatement {
+			return
+		}
+		if !triggerBody && value == "BEGIN" {
+			triggerBody = true
+			return
+		}
+		if !triggerBody {
+			return
+		}
+		switch value {
+		case "CASE":
+			caseDepth++
+		case "END":
+			if caseDepth > 0 {
+				caseDepth--
+			} else {
+				triggerBody = false
+			}
+		}
+	}
+	resetStatementState := func() {
+		word.Reset()
+		triggerStatement = false
+		triggerBody = false
+		caseDepth = 0
+		leadingWords = leadingWords[:0]
+	}
+
 	runes := []rune(input)
 	for index := 0; index < len(runes); index++ {
 		current := runes[index]
@@ -117,17 +162,20 @@ func SplitStatements(input string) []string {
 			continue
 		}
 		if quote == 0 && current == '-' && next == '-' {
+			observeWord()
 			lineComment = true
 			index++
 			continue
 		}
 		if quote == 0 && current == '/' && next == '*' {
+			observeWord()
 			blockComment = true
 			index++
 			continue
 		}
 		if current == '\'' || current == '"' {
 			if quote == 0 {
+				observeWord()
 				quote = current
 			} else if quote == current {
 				if next == current {
@@ -140,12 +188,25 @@ func SplitStatements(input string) []string {
 			}
 		}
 		if current == ';' && quote == 0 {
+			observeWord()
+			if triggerBody {
+				builder.WriteRune(current)
+				continue
+			}
 			statement := strings.TrimSpace(builder.String())
 			if statement != "" {
 				statements = append(statements, statement)
 			}
 			builder.Reset()
+			resetStatementState()
 			continue
+		}
+		if quote == 0 {
+			if unicode.IsLetter(current) || current == '_' {
+				word.WriteRune(current)
+			} else {
+				observeWord()
+			}
 		}
 		if quote != 0 || !unicode.IsSpace(current) || builder.Len() > 0 {
 			builder.WriteRune(current)
@@ -155,4 +216,13 @@ func SplitStatements(input string) []string {
 		statements = append(statements, statement)
 	}
 	return statements
+}
+
+func isCreateTriggerPrefix(words []string) bool {
+	if len(words) >= 2 && words[0] == "CREATE" && words[1] == "TRIGGER" {
+		return true
+	}
+	return len(words) >= 3 && words[0] == "CREATE" &&
+		(words[1] == "TEMP" || words[1] == "TEMPORARY") &&
+		words[2] == "TRIGGER"
 }
