@@ -64,6 +64,9 @@ func TestDeliverableSourceURLRejectsPlaceholderAndUnsafeURLs(t *testing.T) {
 		"https://docs.example/source",
 		"http://go.dev/blog/source",
 		"https://user:secret@go.dev/blog/source",
+		"https://127.0.0.1/blog/source",
+		"https://service.internal/blog/source",
+		"https://go.dev:8443/blog/source",
 		"javascript:alert(1)",
 	} {
 		if DeliverableSourceURL(rawURL) {

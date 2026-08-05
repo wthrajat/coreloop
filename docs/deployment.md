@@ -124,10 +124,10 @@ Vercel can deploy from its CLI without Git, but a connected GitHub repository is
 simpler for normal updates. Vercel automatically redeploys the production branch
 after a push.
 
-This project currently has no configured remote. Create a **private repository
-under your personal GitHub account**, not a private repository owned by a GitHub
-organization. Vercel's Hobby restrictions can block organization-owned private
-repositories.
+Inspect the configured Git remote before continuing. If it does not point to the
+intended repository, create a **private repository under your personal GitHub
+account** and replace the remote. Vercel's Hobby restrictions can block
+organization-owned private repositories.
 
 ### Option A: GitHub website
 
@@ -312,10 +312,12 @@ person has requested. The exact flow and BotFather screens are documented in
 
 `OWNER_TELEGRAM_SUBJECT` is the verified OIDC `sub` claim, not a bot token or
 username. It is easiest and safest to discover it after the first invited login.
-Use the temporary numeric value `0` for the first deployment. Section 15
-Coreloop separately uses the OIDC `id` claim for Bot API delivery; never copy
-`sub` into `delivery_destinations.telegram_chat_id` manually. replaces it with
-the real subject before the application is considered ready.
+Use the temporary non-user numeric value `9223372036854775807` for the first
+deployment. It passes configuration validation but grants owner access to no
+real account. Section 19 replaces the sentinel with the real subject before the
+application is considered ready. Coreloop separately uses the OIDC `id` claim
+for Bot API delivery; never copy `sub` into
+`delivery_destinations.telegram_chat_id` manually.
 
 ## 8. Create the Groq Free API key
 
@@ -458,7 +460,7 @@ TELEGRAM_CLIENT_ID=YOUR_TELEGRAM_CLIENT_ID
 TELEGRAM_CLIENT_SECRET=YOUR_TELEGRAM_CLIENT_SECRET
 TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
 TELEGRAM_WEBHOOK_SECRET=YOUR_SECOND_OPENSSL_VALUE
-OWNER_TELEGRAM_SUBJECT=0
+OWNER_TELEGRAM_SUBJECT=9223372036854775807
 
 QSTASH_CURRENT_SIGNING_KEY=YOUR_CURRENT_SIGNING_KEY
 QSTASH_NEXT_SIGNING_KEY=YOUR_NEXT_SIGNING_KEY
@@ -503,8 +505,8 @@ fix `.gitignore` before continuing.
 6. Mark secrets as sensitive when Vercel offers that choice.
 7. Confirm:
    - `APP_ENV` is exactly `production`;
-   - both origin variables use `https://` and have no trailing slash;
-   - `OWNER_TELEGRAM_SUBJECT` is temporarily `0`;
+   - `APP_ORIGIN` uses `https://` and has no trailing slash;
+   - `OWNER_TELEGRAM_SUBJECT` is temporarily `9223372036854775807`;
    - the two generated secrets are different and at least 32 characters;
    - no secret was placed in a `NEXT_PUBLIC_*` value.
 
@@ -526,7 +528,7 @@ pnpm run migrate
 Expected output:
 
 ```text
-applied 4 migrations
+applied 8 migrations
 ```
 
 The runner records versions in `schema_migrations` and is safe to run again.
@@ -537,7 +539,7 @@ turso db shell coreloop \
   "SELECT version, name, applied_at FROM schema_migrations ORDER BY version;"
 ```
 
-You should see versions 1, 2, 3, and 4. Replace `coreloop` with your actual
+You should see versions 1 through 8. Replace `coreloop` with your actual
 database name if different.
 
 ## 16. Redeploy with the complete environment
@@ -558,7 +560,7 @@ curl -i https://YOUR_PRODUCTION_DOMAIN/api/app/ready
 Expected results:
 
 - `/health`: HTTP 200;
-- `/ready`: HTTP 200 with `"ready":true` and database schema version 7.
+- `/ready`: HTTP 200 with `"ready":true` and database schema version 8.
 
 If readiness is 503, inspect the JSON response and Vercel Function logs before
 continuing. The most common causes are an incorrect Turso URL/token or a missing
@@ -629,8 +631,8 @@ receiver verifies the contract described in
 
 ## 19. Bootstrap the first owner safely
 
-The temporary owner subject `0` allowed production configuration to start, but
-no real Telegram user has owner rights yet.
+The temporary owner subject `9223372036854775807` allowed production
+configuration to start, but no real Telegram user has owner rights yet.
 
 ### 19.1 Create the first single-use invite
 
@@ -656,7 +658,7 @@ ID, sign out and complete Telegram Login once after deploying the corrected
 revision; the callback repairs the destination automatically.
 
 At this point your account exists, but the Operations route remains unavailable
-because the temporary owner subject is still `0`.
+because the temporary owner subject is still the non-user sentinel.
 
 ### 19.3 Read the verified OIDC subject from Turso
 
@@ -672,8 +674,8 @@ ID, phone number, or an ID from an untrusted Telegram helper bot.
 
 ### 19.4 Promote that subject in Vercel
 
-1. Replace `OWNER_TELEGRAM_SUBJECT=0` in `.env.production.local` with the copied
-   value.
+1. Replace `OWNER_TELEGRAM_SUBJECT=9223372036854775807` in
+   `.env.production.local` with the copied value.
 2. Open **Vercel → Settings → Environment Variables**.
 3. Edit the production `OWNER_TELEGRAM_SUBJECT` to the same value.
 4. Redeploy the latest production deployment.

@@ -33,6 +33,16 @@ func (receiver *Receiver) Verify(signature, expectedURL string, body []byte) err
 	if len(parts) != 3 {
 		return errors.New("invalid QStash signature")
 	}
+	var header struct {
+		Algorithm string `json:"alg"`
+		Type      string `json:"typ"`
+	}
+	headerPayload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil || json.Unmarshal(headerPayload, &header) != nil ||
+		header.Algorithm != "HS256" ||
+		(header.Type != "" && !strings.EqualFold(header.Type, "JWT")) {
+		return errors.New("invalid QStash signature header")
+	}
 	var claims struct {
 		Issuer    string `json:"iss"`
 		Subject   string `json:"sub"`
@@ -52,7 +62,8 @@ func (receiver *Receiver) Verify(signature, expectedURL string, body []byte) err
 		return errors.New("QStash signature does not match configured signing keys")
 	}
 	now := receiver.now().Unix()
-	if claims.Issuer != "Upstash" || claims.Subject != expectedURL || claims.Expires < now || claims.NotBefore > now+30 {
+	if claims.Issuer != "Upstash" || claims.Subject != expectedURL ||
+		claims.Expires <= now || claims.NotBefore > now+30 || claims.Expires < claims.NotBefore {
 		return errors.New("QStash claims do not match the receiver endpoint or clock")
 	}
 	digest := sha256.Sum256(body)

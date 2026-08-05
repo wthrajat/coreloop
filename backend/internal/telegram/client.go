@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"coreloop/backend/internal/urlguard"
 )
 
 const maxMessageCharacters = 4096
@@ -85,6 +87,9 @@ func (client *Client) SendMessage(ctx context.Context, chatID, text string, opti
 		"link_preview_options": map[string]bool{"is_disabled": true},
 	}
 	if len(options.Buttons) > 0 {
+		if err := validateButtons(options.Buttons); err != nil {
+			return "", err
+		}
 		payload["reply_markup"] = map[string]any{"inline_keyboard": options.Buttons}
 	}
 	var response struct {
@@ -133,12 +138,18 @@ func (client *Client) call(ctx context.Context, method string, payload any, dest
 	endpoint := client.baseURL + "/bot" + client.token + "/" + method
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(encoded))
 	if err != nil {
-		return err
+		return fmt.Errorf("create Telegram %s request", method)
 	}
 	request.Header.Set("Content-Type", "application/json")
 	response, err := client.http.Do(request)
 	if err != nil {
-		return fmt.Errorf("call Telegram %s: %w", method, err)
+		if errors.Is(err, context.Canceled) {
+			return fmt.Errorf("call Telegram %s: %w", method, context.Canceled)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("call Telegram %s: %w", method, context.DeadlineExceeded)
+		}
+		return fmt.Errorf("call Telegram %s: transport request failed", method)
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
@@ -159,6 +170,20 @@ func (client *Client) call(ctx context.Context, method string, payload any, dest
 	if destination != nil {
 		if err := json.Unmarshal(body, destination); err != nil {
 			return fmt.Errorf("decode Telegram result: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateButtons(rows [][]Button) error {
+	for _, row := range rows {
+		for _, button := range row {
+			if button.URL != "" && !urlguard.IsSafeExternalHTTPSURL(button.URL) {
+				return errors.New("Telegram button URL must use a public HTTPS destination")
+			}
+			if button.URL != "" && button.Data != "" {
+				return errors.New("Telegram button cannot contain both URL and callback data")
+			}
 		}
 	}
 	return nil

@@ -152,13 +152,18 @@ func (store *Store) CompleteRadarDelivery(
 		timestamp(now), timestamp(now), deliveryID); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE radar_candidates SET status='delivered',updated_at=?
-		WHERE id=? AND user_id=? AND status IN ('qualified','delivered')`,
+	result, err := tx.ExecContext(ctx, `UPDATE radar_candidates SET
+		status=CASE WHEN status='skipped' THEN 'skipped' ELSE 'delivered' END,
+		updated_at=? WHERE id=? AND user_id=?
+		AND status IN ('qualified','delivered','skipped')`,
 		timestamp(now), candidateID, userID)
 	if err != nil {
 		return err
 	}
-	changed, _ := result.RowsAffected()
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if changed != 1 {
 		return sql.ErrNoRows
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -175,17 +176,44 @@ func jsonResponse(request *http.Request, body string) *http.Response {
 func TestClassifyHTTPDoesNotExposeGeneratedContent(t *testing.T) {
 	errorValue := classifyHTTP("groq", 400, []byte(`{
 		"error": {
-			"message": "Generated JSON does not match the schema",
+			"message": "Generated JSON contains secret-profile-content",
 			"type": "invalid_request_error",
 			"code": "json_validate_failed",
 			"failed_generation": "private generated lesson text"
 		}
 	}`))
 	message := errorValue.Error()
-	if strings.Contains(message, "private generated lesson text") {
+	if strings.Contains(message, "private generated lesson text") ||
+		strings.Contains(message, "secret-profile-content") {
 		t.Fatalf("provider output leaked into the error: %s", message)
 	}
 	if !strings.Contains(message, "json_validate_failed") {
 		t.Fatalf("safe provider code was lost: %s", message)
+	}
+}
+
+func TestClassifyHTTPDoesNotExposeUnknownProviderFields(t *testing.T) {
+	errorValue := classifyHTTP("gemini", 400, []byte(`{
+		"error": {
+			"message": "private prompt text",
+			"type": "private-type-value",
+			"code": {"secret": "private-code-value"}
+		}
+	}`))
+	message := errorValue.Error()
+	for _, privateValue := range []string{"private prompt text", "private-type-value", "private-code-value"} {
+		if strings.Contains(message, privateValue) {
+			t.Fatalf("provider-controlled value leaked into error: %s", message)
+		}
+	}
+}
+
+func TestClassifyHTTPRecognizesQuotaFromProviderCode(t *testing.T) {
+	errorValue := classifyHTTP("groq", http.StatusRequestEntityTooLarge, []byte(`{
+		"error": {"message": "request too large", "type": "tokens", "code": "rate_limit_exceeded"}
+	}`))
+	var providerError *Error
+	if !errors.As(errorValue, &providerError) || providerError.Kind != FailureQuota {
+		t.Fatalf("provider failure = %#v, want quota", errorValue)
 	}
 }

@@ -3,7 +3,7 @@
 ## Health and readiness
 
 `/api/app/health` proves the function is running. `/api/app/ready` also checks
-Turso and requires every migration through version 7. Neither response exposes
+Turso and requires every migration through version 8. Neither response exposes
 credentials.
 
 The owner Operations page shows queued, leased, failed, and quota-blocked jobs,
@@ -51,7 +51,7 @@ AI enrichment was unavailable.
 
 If Radar stops while lessons continue, inspect `ingest_source`, `rank_radar`,
 and `deliver_radar` job states in chronological order. Confirm every migration
-through version 7 is applied, the destination is connected, and Radar is
+through version 8 is applied, the destination is connected, and Radar is
 enabled. The default is eight updates spread across the user's local day,
 including weekends; a value of zero means unlimited. A finite target can
 legitimately leave fresh candidates pending until the next interval.

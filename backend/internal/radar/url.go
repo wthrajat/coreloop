@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -66,12 +65,15 @@ func CanonicalURL(rawURL string) (string, error) {
 	if urlguard.IsPlaceholderHost(hostname) {
 		return "", errors.New("news URL must not use a placeholder host")
 	}
+	if !urlguard.IsPublicWebHost(hostname) {
+		return "", errors.New("news URL must use a public host")
+	}
 	port := parsed.Port()
 	if port == "80" || port == "443" {
 		port = ""
 	}
 	if port != "" {
-		parsed.Host = net.JoinHostPort(hostname, port)
+		return "", errors.New("news URL must use the standard HTTPS port")
 	} else if strings.Contains(hostname, ":") {
 		parsed.Host = "[" + hostname + "]"
 	} else {

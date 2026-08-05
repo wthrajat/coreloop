@@ -53,17 +53,42 @@ func TestAccountDeletionCascadesPrivateRows(t *testing.T) {
 		script.WriteString(".read " + migration + "\n")
 	}
 	script.WriteString("INSERT INTO users(id,telegram_subject) VALUES('cascade-user','subject');\n")
+	script.WriteString("INSERT INTO invites(id,token_hash,expires_at,consumed_at,consumed_by_user_id) VALUES('consumed-invite','token-hash','2099-01-01T00:00:00Z','2026-08-05T00:00:00Z','cascade-user');\n")
 	script.WriteString("INSERT INTO learning_profiles(id,user_id) VALUES('profile','cascade-user');\n")
+	script.WriteString("BEGIN;\n")
+	script.WriteString("DELETE FROM invites WHERE consumed_by_user_id='cascade-user';\n")
 	script.WriteString("DELETE FROM users WHERE id='cascade-user';\n")
-	script.WriteString("SELECT COUNT(*) FROM learning_profiles WHERE id='profile';\n")
+	script.WriteString("COMMIT;\n")
+	script.WriteString("SELECT COUNT(*) || ',' || (SELECT COUNT(*) FROM invites WHERE id='consumed-invite') FROM learning_profiles WHERE id='profile';\n")
 	command := exec.Command("sqlite3", ":memory:")
 	command.Stdin = strings.NewReader(script.String())
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run cascade integration test: %v: %s", err, output)
 	}
-	if strings.TrimSpace(string(output)) != "0" {
-		t.Fatalf("private profile survived account deletion: %s", output)
+	if strings.TrimSpace(string(output)) != "0,0" {
+		t.Fatalf("private account data survived deletion: %s", output)
+	}
+}
+
+func TestSecurityMigrationBindsOIDCFlowsToTheStartingBrowser(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	migration, err := os.ReadFile(filepath.Join(projectRoot, "migrations", "0008_security_hardening.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToLower(string(migration))
+	for _, required := range []string{
+		"browser_binding_hash",
+		"values (8, 'security_hardening')",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("security migration is missing %q", required)
+		}
 	}
 }
 

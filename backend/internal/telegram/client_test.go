@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -60,7 +63,7 @@ func TestSendMessageSupportsSourceURLButtons(t *testing.T) {
 			t.Fatal(err)
 		}
 		button := payload.ReplyMarkup.Keyboard[0][0]
-		if button["url"] != "https://example.com/source" || button["callback_data"] != "" {
+		if button["url"] != "https://go.dev/blog/source" || button["callback_data"] != "" {
 			t.Fatalf("source button = %#v", button)
 		}
 		return &http.Response{
@@ -70,10 +73,48 @@ func TestSendMessageSupportsSourceURLButtons(t *testing.T) {
 		}, nil
 	})})
 	_, err := client.SendMessage(context.Background(), "987654321", "Source", MessageOptions{
-		Buttons: [][]Button{{{Text: "Open source", URL: "https://example.com/source"}}},
+		Buttons: [][]Button{{{Text: "Open source", URL: "https://go.dev/blog/source"}}},
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSendMessageDoesNotExposeTokenOnTransportFailure(t *testing.T) {
+	token := "super-secret-bot-token"
+	client := New(token, &http.Client{Transport: telegramRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: "Post", URL: request.URL.String(), Err: errors.New("network unavailable")}
+	})})
+
+	_, err := client.SendMessage(context.Background(), "987654321", "test", MessageOptions{})
+	if err == nil {
+		t.Fatal("expected transport failure")
+	}
+	if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "/bot") {
+		t.Fatalf("Telegram credential leaked in error: %v", err)
+	}
+}
+
+func TestSendMessageDoesNotExposeMalformedTokenInRequestError(t *testing.T) {
+	token := "secret-token-with-invalid-%-escape"
+	client := New(token, nil)
+
+	_, err := client.SendMessage(context.Background(), "987654321", "test", MessageOptions{})
+	if err == nil {
+		t.Fatal("expected request construction failure")
+	}
+	if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "/bot") {
+		t.Fatalf("Telegram credential leaked in error: %v", err)
+	}
+}
+
+func TestSendMessageRejectsUnsafeButtonURL(t *testing.T) {
+	client := New("test-token", nil)
+	_, err := client.SendMessage(context.Background(), "987654321", "Source", MessageOptions{
+		Buttons: [][]Button{{{Text: "Open source", URL: "https://127.0.0.1/admin"}}},
+	})
+	if err == nil {
+		t.Fatal("expected private destination to be rejected")
 	}
 }
 

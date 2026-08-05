@@ -54,9 +54,11 @@ func (store *Store) CreateAuthFlow(ctx context.Context, flow AuthFlow, stateHash
 		invite = flow.InviteID
 	}
 	_, err := store.database.ExecContext(ctx, `INSERT INTO auth_flows
-		(id, state_hash, invite_id, code_verifier, nonce, return_path, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, flow.ID, stateHash, invite, flow.CodeVerifier, flow.Nonce,
-		flow.ReturnPath, timestamp(flow.ExpiresAt))
+		(id, state_hash, invite_id, code_verifier, nonce, return_path,
+		 browser_binding_hash, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, flow.ID, stateHash, invite,
+		flow.CodeVerifier, flow.Nonce, flow.ReturnPath, flow.BrowserBindingHash,
+		timestamp(flow.ExpiresAt))
 	return err
 }
 
@@ -88,7 +90,30 @@ func (store *Store) AllowRateLimit(
 	return err == nil && requestCount <= limit, err
 }
 
-func (store *Store) ConsumeAuthFlow(ctx context.Context, stateHash string, now time.Time) (AuthFlow, error) {
+func (store *Store) PruneSecurityState(ctx context.Context, now time.Time) error {
+	tx, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_flows
+		WHERE expires_at<=? OR (used_at IS NOT NULL AND used_at<=?)`,
+		timestamp(now), timestamp(now.Add(-24*time.Hour))); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM rate_limits WHERE updated_at<=?`,
+		timestamp(now.Add(-24*time.Hour))); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (store *Store) ConsumeAuthFlow(
+	ctx context.Context,
+	stateHash string,
+	browserBindingHash string,
+	now time.Time,
+) (AuthFlow, error) {
 	tx, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
 		return AuthFlow{}, err
@@ -98,7 +123,8 @@ func (store *Store) ConsumeAuthFlow(ctx context.Context, stateHash string, now t
 	var invite sql.NullString
 	var expires string
 	err = tx.QueryRowContext(ctx, `SELECT id, invite_id, code_verifier, nonce, return_path, expires_at
-		FROM auth_flows WHERE state_hash = ? AND used_at IS NULL AND expires_at > ?`, stateHash, timestamp(now)).
+		FROM auth_flows WHERE state_hash = ? AND browser_binding_hash = ?
+		AND used_at IS NULL AND expires_at > ?`, stateHash, browserBindingHash, timestamp(now)).
 		Scan(&flow.ID, &invite, &flow.CodeVerifier, &flow.Nonce, &flow.ReturnPath, &expires)
 	if err != nil {
 		return AuthFlow{}, err
@@ -269,8 +295,23 @@ func (store *Store) SessionByToken(ctx context.Context, tokenHash string, now ti
 }
 
 func (store *Store) RevokeSession(ctx context.Context, sessionID string, now time.Time) error {
-	_, err := store.database.ExecContext(ctx, "UPDATE sessions SET revoked_at = ? WHERE id = ?", timestamp(now), sessionID)
-	return err
+	result, err := store.database.ExecContext(
+		ctx,
+		"UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+		timestamp(now),
+		sessionID,
+	)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (store *Store) RevokeAllSessions(ctx context.Context, userID string, now time.Time) error {
@@ -316,6 +357,12 @@ func (store *Store) DeleteUser(ctx context.Context, userID string, now time.Time
 		return err
 	}
 	defer tx.Rollback()
+	// A consumed invite cannot survive ON DELETE SET NULL because its original
+	// table constraint requires consumed_at and consumed_by_user_id together.
+	// It is private authentication history, so remove it as part of hard delete.
+	if _, err := tx.ExecContext(ctx, "DELETE FROM invites WHERE consumed_by_user_id=?", userID); err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, "DELETE FROM users WHERE id=?", userID)
 	if err != nil {
 		return err

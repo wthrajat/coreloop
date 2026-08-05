@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"coreloop/backend/internal/apperror"
@@ -57,6 +58,32 @@ type contextKey string
 
 const sessionKey contextKey = "session"
 
+type readinessProbe struct {
+	mu        sync.Mutex
+	check     func(context.Context) error
+	ttl       time.Duration
+	checkedAt time.Time
+	lastError error
+}
+
+func newReadinessProbe(
+	check func(context.Context) error,
+	ttl time.Duration,
+) *readinessProbe {
+	return &readinessProbe{check: check, ttl: ttl}
+}
+
+func (probe *readinessProbe) Check(ctx context.Context, checkedAt time.Time) error {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	if !probe.checkedAt.IsZero() && checkedAt.Sub(probe.checkedAt) < probe.ttl {
+		return probe.lastError
+	}
+	probe.lastError = probe.check(ctx)
+	probe.checkedAt = checkedAt
+	return probe.lastError
+}
+
 func NewRouter(configuration Config) http.Handler {
 	buildVersion := strings.TrimSpace(configuration.BuildVersion)
 	if buildVersion == "" {
@@ -69,6 +96,9 @@ func NewRouter(configuration Config) http.Handler {
 	}
 	mux.HandleFunc("GET /api/app", health)
 	mux.HandleFunc("GET /api/app/health", health)
+	readiness := newReadinessProbe(func(ctx context.Context) error {
+		return configuration.Store.Ping(ctx)
+	}, 10*time.Second)
 	mux.HandleFunc("GET /api/app/ready", func(w http.ResponseWriter, r *http.Request) {
 		if configuration.Store == nil {
 			WriteJSON(w, http.StatusServiceUnavailable, healthResponse{Status: "degraded", Service: "coreloop-api", Version: buildVersion, Ready: false, Message: "runtime dependencies are not configured"})
@@ -76,7 +106,7 @@ func NewRouter(configuration Config) http.Handler {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
-		if err := configuration.Store.Ping(ctx); err != nil {
+		if err := readiness.Check(ctx, time.Now()); err != nil {
 			WriteJSON(w, http.StatusServiceUnavailable, healthResponse{Status: "degraded", Service: "coreloop-api", Version: buildVersion, Ready: false, Message: "database is unavailable"})
 			return
 		}
@@ -110,7 +140,7 @@ func NewRouter(configuration Config) http.Handler {
 }
 
 func (configuration Config) startAuth(w http.ResponseWriter, r *http.Request) {
-	clientAddress := requestClientAddress(r)
+	clientAddress := requestClientAddress(r, configuration.Runtime.VercelEnvironment != "")
 	bucketKey := "auth-start:" + securehash.Keyed(clientAddress, configuration.Runtime.SessionSecret)
 	allowed, err := configuration.Store.AllowRateLimit(
 		r.Context(), bucketKey, time.Now(), 10*time.Minute, 20,
@@ -127,19 +157,42 @@ func (configuration Config) startAuth(w http.ResponseWriter, r *http.Request) {
 		))
 		return
 	}
-	loginURL, err := configuration.Auth.Start(r.Context(), r.URL.Query().Get("invite"), r.URL.Query().Get("return"))
+	result, err := configuration.Auth.Start(
+		r.Context(),
+		r.URL.Query().Get("invite"),
+		r.URL.Query().Get("return"),
+	)
 	if err != nil {
-		WriteProblem(w, apperror.Wrap(apperror.CodeInvalidRequest, err.Error(), http.StatusBadRequest, err))
+		switch {
+		case errors.Is(err, auth.ErrInvalidInvite):
+			WriteProblem(w, apperror.New(
+				apperror.CodeInvalidRequest,
+				"invite is invalid, expired, or already used",
+				http.StatusBadRequest,
+			))
+		case errors.Is(err, auth.ErrLoginNotConfigured):
+			WriteProblem(w, apperror.New(
+				apperror.CodeNotReady,
+				"Telegram login is not configured",
+				http.StatusServiceUnavailable,
+			))
+		default:
+			writeInternal(w, err)
+		}
 		return
 	}
-	http.Redirect(w, r, loginURL, http.StatusFound)
+	configuration.setLoginBindingCookie(w, result.BrowserBindingToken, result.ExpiresAt)
+	http.Redirect(w, r, result.LoginURL, http.StatusFound)
 }
 
-func requestClientAddress(r *http.Request) string {
-	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-	for index := len(forwarded) - 1; index >= 0; index-- {
-		if address := net.ParseIP(strings.TrimSpace(forwarded[index])); address != nil {
-			return address.String()
+func requestClientAddress(r *http.Request, trustVercelProxy bool) string {
+	if trustVercelProxy {
+		for _, header := range []string{"X-Vercel-Forwarded-For", "X-Forwarded-For"} {
+			for _, forwarded := range strings.Split(r.Header.Get(header), ",") {
+				if address := net.ParseIP(strings.TrimSpace(forwarded)); address != nil {
+					return address.String()
+				}
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -150,15 +203,42 @@ func requestClientAddress(r *http.Request) string {
 }
 
 func (configuration Config) authCallback(w http.ResponseWriter, r *http.Request) {
-	result, err := configuration.Auth.Callback(r.Context(), r.URL.Query().Get("code"), r.URL.Query().Get("state"))
+	clientAddress := requestClientAddress(r, configuration.Runtime.VercelEnvironment != "")
+	bucketKey := "auth-callback:" + securehash.Keyed(
+		clientAddress,
+		configuration.Runtime.SessionSecret,
+	)
+	allowed, err := configuration.Store.AllowRateLimit(
+		r.Context(), bucketKey, time.Now(), 10*time.Minute, 40,
+	)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "Telegram callback rate limit failed", "error", err)
+		http.Redirect(w, r, "/access-required?error=login_failed", http.StatusFound)
+		return
+	}
+	if !allowed {
+		http.Redirect(w, r, "/access-required?error=rate_limited", http.StatusFound)
+		return
+	}
+	cookieName := configuration.loginBindingCookieName()
+	bindingCookie, cookieErr := r.Cookie(cookieName)
+	browserBindingToken := ""
+	if cookieErr == nil {
+		browserBindingToken = bindingCookie.Value
+	}
+	configuration.clearLoginBindingCookie(w)
+	result, err := configuration.Auth.Callback(
+		r.Context(),
+		r.URL.Query().Get("code"),
+		r.URL.Query().Get("state"),
+		browserBindingToken,
+	)
 	if err != nil {
 		slog.WarnContext(r.Context(), "Telegram login failed", "error", err)
 		http.Redirect(w, r, "/access-required?error=login_failed", http.StatusFound)
 		return
 	}
-	secure := configuration.Runtime.SecureCookies()
-	http.SetCookie(w, &http.Cookie{Name: auth.SessionCookieName, Value: result.SessionToken, Path: "/", Expires: result.SessionExpiry, MaxAge: int(time.Until(result.SessionExpiry).Seconds()), HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode})
-	http.SetCookie(w, &http.Cookie{Name: auth.CSRFCookieName, Value: result.CSRFToken, Path: "/", Expires: result.SessionExpiry, MaxAge: int(time.Until(result.SessionExpiry).Seconds()), HttpOnly: false, Secure: secure, SameSite: http.SameSiteStrictMode})
+	configuration.setSessionCookies(w, result)
 	if configuration.Telegram != nil {
 		if err := configuration.Telegram.ValidateChat(r.Context(), result.TelegramChatID); err != nil {
 			disconnectErr := configuration.Store.DisconnectDestination(r.Context(), result.User.ID, time.Now())
@@ -226,8 +306,11 @@ func (configuration Config) session(w http.ResponseWriter, r *http.Request) {
 }
 func (configuration Config) logout(w http.ResponseWriter, r *http.Request) {
 	value := sessionFrom(r)
-	_ = configuration.Store.RevokeSession(r.Context(), value.Session.ID, time.Now())
 	configuration.clearCookies(w)
+	if err := configuration.Store.RevokeSession(r.Context(), value.Session.ID, time.Now()); err != nil {
+		writeInternal(w, fmt.Errorf("revoke session: %w", err))
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 func (configuration Config) topics(w http.ResponseWriter, r *http.Request) {
@@ -528,6 +611,59 @@ func (configuration Config) clearCookies(w http.ResponseWriter) {
 		http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), HttpOnly: name == auth.SessionCookieName, Secure: secure, SameSite: http.SameSiteLaxMode})
 	}
 }
+
+func (configuration Config) setSessionCookies(w http.ResponseWriter, result auth.LoginResult) {
+	secure := configuration.Runtime.SecureCookies()
+	maxAge := int(time.Until(result.SessionExpiry).Seconds())
+	http.SetCookie(w, &http.Cookie{
+		Name: auth.SessionCookieName, Value: result.SessionToken, Path: "/",
+		Expires: result.SessionExpiry, MaxAge: maxAge, HttpOnly: true,
+		Secure: secure, SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name: auth.CSRFCookieName, Value: result.CSRFToken, Path: "/",
+		Expires: result.SessionExpiry, MaxAge: maxAge, HttpOnly: false,
+		Secure: secure, SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (configuration Config) loginBindingCookieName() string {
+	if configuration.Runtime.SecureCookies() {
+		return auth.SecureLoginBindingName
+	}
+	return auth.LoginBindingCookieName
+}
+
+func (configuration Config) setLoginBindingCookie(
+	w http.ResponseWriter,
+	value string,
+	expiresAt time.Time,
+) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     configuration.loginBindingCookieName(),
+		Value:    value,
+		Path:     "/",
+		Expires:  expiresAt,
+		MaxAge:   int(time.Until(expiresAt).Seconds()),
+		HttpOnly: true,
+		Secure:   configuration.Runtime.SecureCookies(),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func (configuration Config) clearLoginBindingCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     configuration.loginBindingCookieName(),
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(1, 0),
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   configuration.Runtime.SecureCookies(),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
 func sessionFrom(r *http.Request) sessionContext {
 	return r.Context().Value(sessionKey).(sessionContext)
 }
@@ -653,6 +789,11 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
+		w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		next.ServeHTTP(w, r)
@@ -661,11 +802,11 @@ func securityHeaders(next http.Handler) http.Handler {
 
 func NewNotReadyHandler(component string) http.Handler {
 	message := component + " is not configured"
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			WriteProblem(w, apperror.New(apperror.CodeMethodNotAllowed, "only POST is accepted", http.StatusMethodNotAllowed))
 			return
 		}
 		WriteProblem(w, apperror.New(apperror.CodeNotReady, message, http.StatusNotImplemented))
-	})
+	}))
 }

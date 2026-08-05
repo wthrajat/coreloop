@@ -109,7 +109,7 @@ func (provider *OpenAICompatible) Generate(ctx context.Context, system, input st
 	if len(decoded.Choices) == 0 || decoded.Choices[0].Message.Content == "" {
 		message := "response contained no content"
 		if len(decoded.Choices) > 0 && decoded.Choices[0].Message.Refusal != "" {
-			message = decoded.Choices[0].Message.Refusal
+			message = "provider refused the request"
 		}
 		return Response{}, &Error{Provider: provider.provider, Kind: FailureInvalid, Message: message}
 	}
@@ -233,9 +233,10 @@ func (provider *Gemini) Generate(ctx context.Context, system, input string, sche
 }
 
 func classifyHTTP(provider string, status int, body []byte) error {
-	message := safeProviderError(body)
+	details := parseProviderError(body)
+	message := details.safeMessage()
 	kind := FailurePermanent
-	if status == http.StatusTooManyRequests || status == http.StatusPaymentRequired || strings.Contains(strings.ToLower(message), "quota") {
+	if status == http.StatusTooManyRequests || status == http.StatusPaymentRequired || details.quota {
 		kind = FailureQuota
 	} else if status >= 500 || status == http.StatusRequestTimeout {
 		kind = FailureTransient
@@ -243,7 +244,13 @@ func classifyHTTP(provider string, status int, body []byte) error {
 	return &Error{Provider: provider, Kind: kind, Status: status, Message: fmt.Sprintf("HTTP %d: %s", status, message)}
 }
 
-func safeProviderError(body []byte) string {
+type providerErrorDetails struct {
+	errorType string
+	code      string
+	quota     bool
+}
+
+func parseProviderError(body []byte) providerErrorDetails {
 	var response struct {
 		Error struct {
 			Message string `json:"message"`
@@ -252,24 +259,56 @@ func safeProviderError(body []byte) string {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
-		return "provider request failed"
+		return providerErrorDetails{}
 	}
-	parts := make([]string, 0, 3)
-	if message := strings.TrimSpace(response.Error.Message); message != "" {
-		message = strings.Join(strings.Fields(message), " ")
-		if len(message) > 300 {
-			message = message[:300]
-		}
-		parts = append(parts, message)
+	details := providerErrorDetails{
+		errorType: safeProviderIdentifier(response.Error.Type),
 	}
-	if response.Error.Type != "" {
-		parts = append(parts, "type="+response.Error.Type)
+	if code, ok := response.Error.Code.(string); ok {
+		details.code = safeProviderIdentifier(code)
 	}
-	if response.Error.Code != nil {
-		parts = append(parts, fmt.Sprintf("code=%v", response.Error.Code))
+	quotaText := strings.ToLower(strings.Join([]string{
+		response.Error.Message,
+		response.Error.Type,
+		details.code,
+	}, " "))
+	details.quota = strings.Contains(quotaText, "quota") ||
+		strings.Contains(quotaText, "rate_limit") ||
+		strings.Contains(quotaText, "resource_exhausted")
+	return details
+}
+
+func (details providerErrorDetails) safeMessage() string {
+	parts := make([]string, 0, 2)
+	if details.errorType != "" {
+		parts = append(parts, "type="+details.errorType)
+	}
+	if details.code != "" {
+		parts = append(parts, "code="+details.code)
 	}
 	if len(parts) == 0 {
 		return "provider request failed"
 	}
-	return strings.Join(parts, "; ")
+	return "provider request failed; " + strings.Join(parts, "; ")
+}
+
+func safeProviderIdentifier(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	known := map[string]bool{
+		"api_error":               true,
+		"context_length_exceeded": true,
+		"insufficient_quota":      true,
+		"invalid_request_error":   true,
+		"json_validate_failed":    true,
+		"model_not_found":         true,
+		"quota_error":             true,
+		"rate_limit_error":        true,
+		"rate_limit_exceeded":     true,
+		"resource_exhausted":      true,
+		"tokens":                  true,
+	}
+	if known[value] {
+		return value
+	}
+	return ""
 }

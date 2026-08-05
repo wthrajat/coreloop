@@ -2,7 +2,6 @@ package content
 
 import (
 	"html"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -69,11 +68,7 @@ func sourceFromEvidence(evidence Evidence) Source {
 }
 
 func DeliverableSourceURL(rawURL string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
-		return false
-	}
-	return !urlguard.IsPlaceholderHost(parsed.Hostname())
+	return urlguard.IsSafeExternalHTTPSURL(rawURL)
 }
 
 // SanitizeRenderedSourceLinks protects delivery of already-persisted lesson

@@ -105,7 +105,8 @@ func NewTelegramRouter(configuration TelegramConfig) http.Handler {
 			WriteProblem(w, apperror.New(apperror.CodeMethodNotAllowed, "only POST is accepted", http.StatusMethodNotAllowed))
 			return
 		}
-		if configuration.Telegram == nil || configuration.Store == nil {
+		if configuration.Telegram == nil || configuration.Store == nil ||
+			strings.TrimSpace(configuration.WebhookSecret) == "" {
 			WriteProblem(w, apperror.New(apperror.CodeNotReady, "Telegram is not configured", http.StatusServiceUnavailable))
 			return
 		}

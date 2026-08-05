@@ -93,6 +93,9 @@ func (service *Service) Tick(ctx context.Context) error {
 	if err := service.store.RecoverJobs(ctx, now); err != nil {
 		return err
 	}
+	if err := service.store.PruneSecurityState(ctx, now); err != nil {
+		slog.WarnContext(ctx, "security state pruning failed", "error", err)
+	}
 	occurrences, err := service.store.DueOccurrences(ctx, now, 6*time.Minute)
 	if err != nil {
 		return err

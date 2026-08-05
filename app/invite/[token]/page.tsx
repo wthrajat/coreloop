@@ -1,6 +1,10 @@
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
-export const metadata = { title: "Accept invitation" };
+export const metadata: Metadata = {
+  title: "Accept invitation",
+  robots: { index: false, follow: false, noarchive: true, nocache: true },
+};
 
 export default async function InvitePage({
   params,

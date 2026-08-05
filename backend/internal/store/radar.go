@@ -488,13 +488,26 @@ func (store *Store) CompleteRadar(ctx context.Context, userID, candidateID, stat
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `UPDATE radar_candidates SET status=?,updated_at=?
-		WHERE id=? AND user_id=?`, state, timestamp(now), candidateID, userID)
+		WHERE id=? AND user_id=? AND status<>?`, state, timestamp(now), candidateID,
+		userID, state)
 	if err != nil {
 		return err
 	}
-	changed, _ := result.RowsAffected()
-	if changed != 1 {
-		return sql.ErrNoRows
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		var currentState string
+		err = tx.QueryRowContext(ctx, `SELECT status FROM radar_candidates
+			WHERE id=? AND user_id=?`, candidateID, userID).Scan(&currentState)
+		if err != nil {
+			return err
+		}
+		if currentState != state {
+			return sql.ErrNoRows
+		}
+		return tx.Commit()
 	}
 	if state == "skipped" {
 		_, err = tx.ExecContext(ctx, `UPDATE user_topic_preferences SET

@@ -27,12 +27,13 @@ type Invite struct {
 }
 
 type AuthFlow struct {
-	ID           string
-	InviteID     string
-	CodeVerifier string
-	Nonce        string
-	ReturnPath   string
-	ExpiresAt    time.Time
+	ID                 string
+	InviteID           string
+	CodeVerifier       string
+	Nonce              string
+	ReturnPath         string
+	BrowserBindingHash string
+	ExpiresAt          time.Time
 }
 
 type LearningProfile struct {

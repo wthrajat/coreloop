@@ -17,9 +17,17 @@ import (
 )
 
 const (
-	SessionCookieName = "coreloop_session"
-	CSRFCookieName    = "coreloop_csrf"
-	SessionLifetime   = 30 * 24 * time.Hour
+	SessionCookieName      = "coreloop_session"
+	CSRFCookieName         = "coreloop_csrf"
+	LoginBindingCookieName = "coreloop_login_binding"
+	SecureLoginBindingName = "__Host-coreloop_login_binding"
+	SessionLifetime        = 30 * 24 * time.Hour
+	LoginBindingLifetime   = 10 * time.Minute
+)
+
+var (
+	ErrLoginNotConfigured = errors.New("Telegram login is not configured")
+	ErrInvalidInvite      = errors.New("invite is invalid, expired, or already used")
 )
 
 type Service struct {
@@ -39,6 +47,12 @@ type LoginResult struct {
 	TelegramChatID string
 }
 
+type StartResult struct {
+	LoginURL            string
+	BrowserBindingToken string
+	ExpiresAt           time.Time
+}
+
 func NewService(dataStore *store.Store, configuration config.Config, client *OIDCClient) *Service {
 	if client == nil {
 		client = NewOIDCClient(configuration.TelegramClientID, configuration.TelegramClientSecret,
@@ -47,15 +61,19 @@ func NewService(dataStore *store.Store, configuration config.Config, client *OID
 	return &Service{store: dataStore, oidc: client, config: configuration, now: time.Now}
 }
 
-func (service *Service) Start(ctx context.Context, inviteToken, returnPath string) (string, error) {
+func (service *Service) Start(
+	ctx context.Context,
+	inviteToken string,
+	returnPath string,
+) (StartResult, error) {
 	if service.config.TelegramClientID == "" || service.config.TelegramClientSecret == "" {
-		return "", errors.New("Telegram login is not configured")
+		return StartResult{}, ErrLoginNotConfigured
 	}
 	inviteID := ""
 	if inviteToken != "" {
 		invite, err := service.store.ResolveInvite(ctx, securehash.Keyed(inviteToken, service.config.SessionSecret), service.now())
 		if err != nil {
-			return "", errors.New("invite is invalid, expired, or already used")
+			return StartResult{}, ErrInvalidInvite
 		}
 		inviteID = invite.ID
 	}
@@ -64,33 +82,55 @@ func (service *Service) Start(ctx context.Context, inviteToken, returnPath strin
 	}
 	state, err := ids.Token(32)
 	if err != nil {
-		return "", err
+		return StartResult{}, err
 	}
 	verifier, err := ids.Token(48)
 	if err != nil {
-		return "", err
+		return StartResult{}, err
 	}
 	nonce, err := ids.Token(24)
 	if err != nil {
-		return "", err
+		return StartResult{}, err
+	}
+	browserBindingToken, err := ids.Token(32)
+	if err != nil {
+		return StartResult{}, err
 	}
 	flowID, err := ids.New("oidc")
 	if err != nil {
-		return "", err
+		return StartResult{}, err
 	}
+	expiresAt := service.now().Add(LoginBindingLifetime)
 	flow := store.AuthFlow{ID: flowID, InviteID: inviteID, CodeVerifier: verifier, Nonce: nonce,
-		ReturnPath: returnPath, ExpiresAt: service.now().Add(10 * time.Minute)}
+		ReturnPath: returnPath, BrowserBindingHash: securehash.Keyed(
+			browserBindingToken,
+			service.config.SessionSecret,
+		), ExpiresAt: expiresAt}
 	if err := service.store.CreateAuthFlow(ctx, flow, securehash.SHA256(state)); err != nil {
-		return "", fmt.Errorf("create login flow: %w", err)
+		return StartResult{}, fmt.Errorf("create login flow: %w", err)
 	}
-	return service.oidc.AuthorizationURL(state, nonce, PKCEChallenge(verifier)), nil
+	return StartResult{
+		LoginURL:            service.oidc.AuthorizationURL(state, nonce, PKCEChallenge(verifier)),
+		BrowserBindingToken: browserBindingToken,
+		ExpiresAt:           expiresAt,
+	}, nil
 }
 
-func (service *Service) Callback(ctx context.Context, code, stateValue string) (LoginResult, error) {
-	if code == "" || stateValue == "" {
+func (service *Service) Callback(
+	ctx context.Context,
+	code string,
+	stateValue string,
+	browserBindingToken string,
+) (LoginResult, error) {
+	if code == "" || stateValue == "" || browserBindingToken == "" {
 		return LoginResult{}, errors.New("Telegram login did not return code and state")
 	}
-	flow, err := service.store.ConsumeAuthFlow(ctx, securehash.SHA256(stateValue), service.now())
+	flow, err := service.store.ConsumeAuthFlow(
+		ctx,
+		securehash.SHA256(stateValue),
+		securehash.Keyed(browserBindingToken, service.config.SessionSecret),
+		service.now(),
+	)
 	if err != nil {
 		return LoginResult{}, errors.New("login state is invalid, expired, or already used")
 	}

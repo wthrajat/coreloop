@@ -9,14 +9,32 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"coreloop/backend/internal/qstash"
+	"coreloop/backend/internal/store"
+	"coreloop/backend/internal/telegram"
 )
 
 type blockingJobRunner struct {
 	deadline time.Time
+}
+
+func TestTelegramWebhookRejectsMissingConfiguredSecret(t *testing.T) {
+	handler := NewTelegramRouter(TelegramConfig{
+		Telegram: telegram.New("test-token", nil),
+		Store:    store.New(nil),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/telegram", strings.NewReader(`{}`))
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
 }
 
 func (*blockingJobRunner) Tick(context.Context) error { return nil }

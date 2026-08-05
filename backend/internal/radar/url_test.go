@@ -58,6 +58,20 @@ func TestCanonicalURLRejectsPlaceholderHosts(t *testing.T) {
 	}
 }
 
+func TestCanonicalURLRejectsLocalAndNonstandardDestinations(t *testing.T) {
+	for _, value := range []string{
+		"https://127.0.0.1/story",
+		"https://10.0.0.1/story",
+		"https://service.internal/story",
+		"https://publisher.local/story",
+		"https://go.dev:8443/story",
+	} {
+		if _, err := CanonicalURL(value); err == nil {
+			t.Fatalf("CanonicalURL(%q) unexpectedly accepted an unsafe destination", value)
+		}
+	}
+}
+
 func TestClusterKeyFallsBackToNormalizedTitle(t *testing.T) {
 	first := ClusterKey("not a valid URL %", "Go 1.30: Runtime Changes!")
 	second := ClusterKey("", "  GO 1.30 — runtime changes  ")

@@ -40,6 +40,7 @@ type OIDCClient struct {
 type Claims struct {
 	Issuer            string          `json:"iss"`
 	Audience          json.RawMessage `json:"aud"`
+	AuthorizedParty   string          `json:"azp"`
 	Subject           string          `json:"sub"`
 	TelegramUserID    int64           `json:"id"`
 	ExpiresAt         int64           `json:"exp"`
@@ -143,11 +144,21 @@ func (client *OIDCClient) VerifyIDToken(ctx context.Context, token, expectedNonc
 	if claims.Issuer != telegramIssuer {
 		return Claims{}, errors.New("Telegram ID token issuer is invalid")
 	}
-	if !audienceContains(claims.Audience, client.clientID) {
+	audiences, validAudience := parseAudiences(claims.Audience)
+	if !validAudience || !containsAudience(audiences, client.clientID) {
 		return Claims{}, errors.New("Telegram ID token audience is invalid")
+	}
+	if claims.AuthorizedParty != "" && claims.AuthorizedParty != client.clientID {
+		return Claims{}, errors.New("Telegram ID token authorized party is invalid")
+	}
+	if len(audiences) > 1 && claims.AuthorizedParty != client.clientID {
+		return Claims{}, errors.New("Telegram ID token authorized party is required")
 	}
 	if claims.Subject == "" || claims.ExpiresAt <= client.now().Unix() {
 		return Claims{}, errors.New("Telegram ID token is expired or missing a subject")
+	}
+	if claims.IssuedAt > client.now().Add(2*time.Minute).Unix() {
+		return Claims{}, errors.New("Telegram ID token issue time is invalid")
 	}
 	if claims.TelegramUserID <= 0 {
 		return Claims{}, errors.New("Telegram ID token is missing its user ID")
@@ -235,15 +246,24 @@ func decodeSegment(segment string, destination any) error {
 }
 
 func audienceContains(raw json.RawMessage, expected string) bool {
+	audiences, ok := parseAudiences(raw)
+	return ok && containsAudience(audiences, expected)
+}
+
+func parseAudiences(raw json.RawMessage) ([]string, bool) {
 	var single string
 	if json.Unmarshal(raw, &single) == nil {
-		return single == expected
+		return []string{single}, single != ""
 	}
 	var multiple []string
-	if json.Unmarshal(raw, &multiple) != nil {
-		return false
+	if json.Unmarshal(raw, &multiple) != nil || len(multiple) == 0 {
+		return nil, false
 	}
-	for _, value := range multiple {
+	return multiple, true
+}
+
+func containsAudience(audiences []string, expected string) bool {
+	for _, value := range audiences {
 		if value == expected {
 			return true
 		}
@@ -257,6 +277,6 @@ func PKCEChallenge(verifier string) string {
 }
 
 func NumericSubject(subject string) bool {
-	_, err := strconv.ParseInt(subject, 10, 64)
-	return err == nil
+	value, err := strconv.ParseInt(subject, 10, 64)
+	return err == nil && value > 0
 }

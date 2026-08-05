@@ -116,6 +116,12 @@ func (config Config) ValidateProduction() error {
 	if config.TelegramWebhookSecret != "" && len(config.TelegramWebhookSecret) < 32 {
 		missing = append(missing, "TELEGRAM_WEBHOOK_SECRET (at least 32 characters)")
 	}
+	if config.QStashCurrentSigningKey != "" && len(config.QStashCurrentSigningKey) < 32 {
+		missing = append(missing, "QSTASH_CURRENT_SIGNING_KEY (at least 32 characters)")
+	}
+	if config.QStashNextSigningKey != "" && len(config.QStashNextSigningKey) < 32 {
+		missing = append(missing, "QSTASH_NEXT_SIGNING_KEY (at least 32 characters)")
+	}
 	ownerSubject, ownerSubjectError := strconv.ParseInt(config.OwnerTelegramSubject, 10, 64)
 	if ownerSubjectError != nil || ownerSubject <= 0 {
 		missing = append(missing, "OWNER_TELEGRAM_SUBJECT (numeric)")

@@ -47,14 +47,23 @@ func TestSecureCookiesFollowHTTPSOrigin(t *testing.T) {
 	}
 }
 
+func TestProductionRejectsShortQStashSigningKeys(t *testing.T) {
+	configuration := validProductionConfig()
+	configuration.QStashCurrentSigningKey = "short"
+	if err := configuration.ValidateProduction(); err == nil ||
+		!strings.Contains(err.Error(), "QSTASH_CURRENT_SIGNING_KEY") {
+		t.Fatalf("signing-key validation error = %v", err)
+	}
+}
+
 func validProductionConfig() Config {
 	return Config{
 		Environment: "production", AppOrigin: "https://coreloop.example",
 		TursoURL: "libsql://database.turso.io", TursoToken: "token",
 		TelegramClientID: "client", TelegramClientSecret: "client-secret",
 		TelegramBotToken: "bot-token", TelegramWebhookSecret: strings.Repeat("w", 32),
-		OwnerTelegramSubject: "123", QStashCurrentSigningKey: "current",
-		QStashNextSigningKey: "next", QStashToken: "token",
+		OwnerTelegramSubject: "123", QStashCurrentSigningKey: strings.Repeat("q", 32),
+		QStashNextSigningKey: strings.Repeat("n", 32), QStashToken: "token",
 		GroqAPIKey: "groq", SessionSecret: strings.Repeat("s", 32),
 		TimeZone: defaultTimeZone,
 	}
