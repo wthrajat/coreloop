@@ -40,7 +40,10 @@ func (fake *fakeApplicationJobs) TriggerRadarNow(_ context.Context, userID, requ
 	if fake.radarError != nil {
 		return jobs.ManualRadar{}, fake.radarError
 	}
-	return jobs.ManualRadar{JobID: "job_radar", State: "queued", Message: "Queued for Telegram."}, nil
+	return jobs.ManualRadar{
+		BatchID: "batch_radar", State: "queued", ProfileTarget: 8,
+		RequestedCount: 8, SelectedCount: 8, Message: "Queued for Telegram.",
+	}, nil
 }
 
 func (fake *fakeApplicationJobs) ManualRadarStatus(context.Context, string, string) (jobs.ManualRadar, error) {

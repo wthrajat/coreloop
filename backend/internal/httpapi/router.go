@@ -102,7 +102,7 @@ func NewRouter(configuration Config) http.Handler {
 		mux.Handle("POST /api/app/operations/lessons", configuration.withSession(configuration.withCSRF(configuration.ownerOnly(http.HandlerFunc(configuration.triggerLessonNow)))))
 		mux.Handle("GET /api/app/operations/lessons/{jobID}", configuration.withSession(configuration.ownerOnly(http.HandlerFunc(configuration.manualLessonStatus))))
 		mux.Handle("POST /api/app/operations/radar", configuration.withSession(configuration.withCSRF(configuration.ownerOnly(http.HandlerFunc(configuration.triggerRadarNow)))))
-		mux.Handle("GET /api/app/operations/radar/{jobID}", configuration.withSession(configuration.ownerOnly(http.HandlerFunc(configuration.manualRadarStatus))))
+		mux.Handle("GET /api/app/operations/radar/{batchID}", configuration.withSession(configuration.ownerOnly(http.HandlerFunc(configuration.manualRadarStatus))))
 		mux.Handle("POST /api/app/operations/openai", configuration.withSession(configuration.withCSRF(configuration.ownerOnly(http.HandlerFunc(configuration.openAI)))))
 	}
 	return securityHeaders(routeCompatibility(mux))
@@ -424,10 +424,10 @@ func (configuration Config) manualRadarStatus(w http.ResponseWriter, r *http.Req
 	value, err := configuration.Jobs.ManualRadarStatus(
 		r.Context(),
 		sessionFrom(r).User.ID,
-		r.PathValue("jobID"),
+		r.PathValue("batchID"),
 	)
 	if errors.Is(err, jobs.ErrManualRadarNotFound) {
-		WriteProblem(w, apperror.New(apperror.CodeNotFound, "Radar job was not found", http.StatusNotFound))
+		WriteProblem(w, apperror.New(apperror.CodeNotFound, "Radar batch was not found", http.StatusNotFound))
 		return
 	}
 	if err != nil {

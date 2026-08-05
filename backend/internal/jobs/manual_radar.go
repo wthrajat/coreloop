@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -16,20 +17,37 @@ import (
 const manualRadarKeyPrefix = "manual-radar:"
 
 var (
-	ErrManualRadarNotFound    = errors.New("manual Radar job not found")
+	ErrManualRadarNotFound    = errors.New("manual Radar batch not found")
 	ErrManualRadarUnavailable = errors.New("no eligible Radar item is ready")
 )
 
 type ManualRadar struct {
-	JobID   string `json:"job_id"`
-	State   string `json:"state"`
-	Message string `json:"message"`
+	BatchID        string `json:"batch_id"`
+	State          string `json:"state"`
+	ProfileTarget  int    `json:"profile_target"`
+	RequestedCount int    `json:"requested_count"`
+	SelectedCount  int    `json:"selected_count"`
+	DeliveredCount int    `json:"delivered_count"`
+	FailedCount    int    `json:"failed_count"`
+	Message        string `json:"message"`
+}
+
+type radarJobMetadata struct {
+	CandidateID    string `json:"candidate_id"`
+	ManualBatchID  string `json:"manual_batch_id,omitempty"`
+	ProfileTarget  int    `json:"profile_target,omitempty"`
+	RequestedCount int    `json:"requested_count,omitempty"`
 }
 
 type manualRadarStore interface {
-	EnqueueManualRadar(context.Context, string, string, time.Time) (string, error)
-	Job(context.Context, string) (store.Job, error)
-	RadarCandidateDeliveryState(context.Context, string, string) (string, string, error)
+	EnqueueManualRadarBatch(
+		context.Context,
+		string,
+		string,
+		string,
+		time.Time,
+	) ([]store.ManualRadarBatchJob, error)
+	ManualRadarBatchJobs(context.Context, string, string) ([]store.ManualRadarBatchJob, error)
 }
 
 func (service *Service) TriggerRadarNow(
@@ -57,10 +75,12 @@ func triggerRadarNow(
 	userID string,
 	requestID string,
 ) (ManualRadar, error) {
-	jobID, err := dataStore.EnqueueManualRadar(
+	batchID := manualRadarBatchID(userID, requestID)
+	batchJobs, err := dataStore.EnqueueManualRadarBatch(
 		ctx,
 		userID,
-		manualRadarKey(userID, requestID),
+		batchID,
+		manualRadarBatchPrefix(userID, batchID),
 		now,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -69,112 +89,223 @@ func triggerRadarNow(
 	if err != nil {
 		return ManualRadar{}, err
 	}
-	job, err := dataStore.Job(ctx, jobID)
-	if err != nil {
-		return ManualRadar{}, err
-	}
-	status, err := manualRadarStatus(ctx, dataStore, userID, job)
+	status, err := manualRadarStatus(userID, batchID, batchJobs)
 	if err != nil {
 		return ManualRadar{}, err
 	}
 	slog.InfoContext(
 		ctx,
-		"manual Radar durable job ready",
-		"job_id", job.ID,
-		"job_state", job.State,
-		"attempt", job.AttemptCount,
+		"manual Radar durable batch ready",
+		"batch_id", batchID,
+		"selected_count", len(batchJobs),
+		"profile_target", status.ProfileTarget,
 	)
-	if job.State != "queued" {
+	firstJob, ready := firstQueuedManualRadarJob(batchJobs)
+	if !ready || status.State != "queued" {
 		return status, nil
 	}
-	if err := publishJob(ctx, publisher, appOrigin, job.ID, job.AttemptCount); err != nil {
-		slog.WarnContext(ctx, "immediate Radar dispatch failed", "job_id", job.ID, "error", err)
-		status.Message = "Radar queued. Immediate dispatch is unavailable, so the scheduler will retry it."
+	if err := publishJob(
+		ctx,
+		publisher,
+		appOrigin,
+		firstJob.ID,
+		firstJob.AttemptCount,
+	); err != nil {
+		slog.WarnContext(
+			ctx,
+			"immediate Radar batch dispatch failed",
+			"batch_id", batchID,
+			"job_id", firstJob.ID,
+			"error", err,
+		)
+		status.Message += " Immediate dispatch is unavailable, so the scheduler will retry it."
 	} else {
-		slog.InfoContext(ctx, "immediate Radar dispatch accepted", "job_id", job.ID, "attempt", job.AttemptCount)
+		slog.InfoContext(
+			ctx,
+			"immediate Radar batch dispatch accepted",
+			"batch_id", batchID,
+			"job_id", firstJob.ID,
+			"attempt", firstJob.AttemptCount,
+		)
 	}
 	return status, nil
+}
+
+func firstQueuedManualRadarJob(
+	batchJobs []store.ManualRadarBatchJob,
+) (store.Job, bool) {
+	for _, batchJob := range batchJobs {
+		if batchJob.Job.State == "queued" {
+			return batchJob.Job, true
+		}
+	}
+	return store.Job{}, false
 }
 
 func (service *Service) ManualRadarStatus(
 	ctx context.Context,
 	userID string,
-	jobID string,
+	batchID string,
 ) (ManualRadar, error) {
-	job, err := service.store.Job(ctx, jobID)
+	batchJobs, err := service.store.ManualRadarBatchJobs(ctx, userID, batchID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ManualRadar{}, ErrManualRadarNotFound
 		}
 		return ManualRadar{}, err
 	}
-	return manualRadarStatus(ctx, service.store, userID, job)
+	return manualRadarStatus(userID, batchID, batchJobs)
 }
 
 func manualRadarStatus(
-	ctx context.Context,
-	dataStore manualRadarStore,
 	userID string,
-	job store.Job,
+	batchID string,
+	batchJobs []store.ManualRadarBatchJob,
 ) (ManualRadar, error) {
-	if job.UserID != userID || job.Type != "deliver_radar" ||
-		!strings.HasPrefix(job.IdempotencyKey, manualRadarPrefix(userID)) {
+	if len(batchJobs) == 0 {
 		return ManualRadar{}, ErrManualRadarNotFound
 	}
-	status := ManualRadar{JobID: job.ID}
-	switch job.State {
-	case "queued":
-		status.State = "queued"
-		status.Message = "The best eligible Radar update is queued for Telegram."
-	case "leased":
-		status.State = "delivering"
-		status.Message = "Sending the selected Radar update to Telegram."
-	case "failed", "cancelled", "blocked_quota":
-		status.State = "failed"
-		status.Message = "Radar delivery failed. Review the queue state and try again."
-	case "completed":
-		candidateID := radarCandidateID(job)
-		if candidateID == "" {
-			status.State = "failed"
-			status.Message = "Radar delivery completed without a selected update."
-			return status, nil
+
+	metadata, valid := radarMetadata(batchJobs[0].Job)
+	if !valid || metadata.ManualBatchID != batchID {
+		return ManualRadar{}, ErrManualRadarNotFound
+	}
+	status := ManualRadar{
+		BatchID:        batchID,
+		ProfileTarget:  metadata.ProfileTarget,
+		RequestedCount: metadata.RequestedCount,
+		SelectedCount:  len(batchJobs),
+	}
+	active := false
+	started := false
+	for _, batchJob := range batchJobs {
+		job := batchJob.Job
+		jobMetadata, valid := radarMetadata(job)
+		if job.UserID != userID || job.Type != "deliver_radar" || !valid ||
+			jobMetadata.ManualBatchID != batchID ||
+			!strings.HasPrefix(job.IdempotencyKey, manualRadarBatchPrefix(userID, batchID)) {
+			return ManualRadar{}, ErrManualRadarNotFound
 		}
-		candidateState, deliveryState, err := dataStore.RadarCandidateDeliveryState(
-			ctx,
-			userID,
-			candidateID,
-		)
-		if err != nil {
-			return ManualRadar{}, err
-		}
-		switch {
-		case candidateState == "delivered" || candidateState == "skipped" || deliveryState == "delivered":
-			status.State = "delivered"
-			status.Message = "Delivered as one sourced Radar message in Telegram."
-		case candidateState == "rejected" || deliveryState == "failed" || deliveryState == "partial":
-			status.State = "failed"
-			status.Message = "The selected update could not be delivered to Telegram."
+		switch job.State {
+		case "queued":
+			active = true
+		case "leased":
+			active = true
+			started = true
+		case "failed", "cancelled", "blocked_quota":
+			status.FailedCount++
+		case "completed":
+			started = true
+			delivered, failed := manualRadarDeliveryOutcome(
+				jobMetadata.CandidateID,
+				batchJob.CandidateState,
+				batchJob.DeliveryState,
+			)
+			if delivered {
+				status.DeliveredCount++
+			} else if failed {
+				status.FailedCount++
+			} else {
+				active = true
+			}
 		default:
-			status.State = "delivering"
-			status.Message = "The selected Radar update is still being delivered."
+			status.FailedCount++
 		}
+	}
+
+	finished := status.DeliveredCount+status.FailedCount == status.SelectedCount
+	switch {
+	case finished && status.FailedCount > 0:
+		status.State = "failed"
+		status.Message = fmt.Sprintf(
+			"Delivered %d of %d Radar updates; %d could not be delivered.",
+			status.DeliveredCount,
+			status.SelectedCount,
+			status.FailedCount,
+		)
+	case finished:
+		status.State = "delivered"
+		status.Message = fmt.Sprintf(
+			"Delivered %d Radar updates, each as one sourced Telegram message.",
+			status.DeliveredCount,
+		)
+	case started || status.DeliveredCount > 0:
+		status.State = "delivering"
+		status.Message = fmt.Sprintf(
+			"Delivered %d of %d selected Radar updates.",
+			status.DeliveredCount,
+			status.SelectedCount,
+		)
+	case active:
+		status.State = "queued"
+		status.Message = manualRadarQueuedMessage(status)
 	default:
 		status.State = "failed"
-		status.Message = "The Radar job entered an unknown state."
+		status.Message = "The Radar batch entered an unknown state."
 	}
 	return status, nil
 }
 
-func radarCandidateID(job store.Job) string {
-	var payload struct {
-		CandidateID string `json:"candidate_id"`
+func manualRadarDeliveryOutcome(
+	candidateID string,
+	candidateState string,
+	deliveryState string,
+) (bool, bool) {
+	if candidateID == "" || candidateState == "" {
+		return false, true
 	}
-	_ = json.Unmarshal([]byte(job.PayloadJSON), &payload)
-	return payload.CandidateID
+	if candidateState == "delivered" || candidateState == "skipped" ||
+		deliveryState == "delivered" {
+		return true, false
+	}
+	if candidateState == "rejected" || deliveryState == "failed" ||
+		deliveryState == "partial" {
+		return false, true
+	}
+	return false, false
 }
 
-func manualRadarKey(userID, requestID string) string {
-	return manualRadarPrefix(userID) + securehash.SHA256(strings.TrimSpace(requestID))
+func manualRadarQueuedMessage(status ManualRadar) string {
+	if status.ProfileTarget == 0 {
+		return fmt.Sprintf(
+			"Your saved Radar target is unlimited. Queued %d eligible updates for this bounded manual batch.",
+			status.SelectedCount,
+		)
+	}
+	if status.SelectedCount < status.RequestedCount {
+		return fmt.Sprintf(
+			"Queued %d of your saved target of %d; only %d eligible updates are ready.",
+			status.SelectedCount,
+			status.ProfileTarget,
+			status.SelectedCount,
+		)
+	}
+	return fmt.Sprintf(
+		"Queued %d Radar updates from your saved profile target.",
+		status.SelectedCount,
+	)
+}
+
+func radarMetadata(job store.Job) (radarJobMetadata, bool) {
+	var metadata radarJobMetadata
+	if err := json.Unmarshal([]byte(job.PayloadJSON), &metadata); err != nil {
+		return radarJobMetadata{}, false
+	}
+	return metadata, metadata.CandidateID != ""
+}
+
+func radarCandidateID(job store.Job) string {
+	metadata, _ := radarMetadata(job)
+	return metadata.CandidateID
+}
+
+func manualRadarBatchID(userID, requestID string) string {
+	input := userID + ":" + strings.TrimSpace(requestID)
+	return securehash.SHA256(input)
+}
+
+func manualRadarBatchPrefix(userID, batchID string) string {
+	return manualRadarPrefix(userID) + batchID + ":"
 }
 
 func manualRadarPrefix(userID string) string {

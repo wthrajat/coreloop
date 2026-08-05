@@ -85,15 +85,15 @@ export default function OperationsPage() {
   }, [lesson?.job_id, lesson?.state, refresh]);
 
   useEffect(() => {
-    const jobID = radar?.job_id;
-    if (!jobID || !ACTIVE_RADAR_STATES.has(radar.state)) return;
-    const currentJobID = jobID;
+    const batchID = radar?.batch_id;
+    if (!batchID || !ACTIVE_RADAR_STATES.has(radar.state)) return;
+    const currentBatchID = batchID;
 
     let active = true;
     async function pollRadar() {
       try {
         const value = await api<ManualRadar>(
-          `/operations/radar/${encodeURIComponent(currentJobID)}`,
+          `/operations/radar/${encodeURIComponent(currentBatchID)}`,
         );
         if (!active) return;
         setRadar(value);
@@ -118,7 +118,7 @@ export default function OperationsPage() {
       window.clearTimeout(firstPoll);
       window.clearInterval(pollInterval);
     };
-  }, [radar?.job_id, radar?.state, refresh]);
+  }, [radar?.batch_id, radar?.state, refresh]);
 
   async function sendLessonNow() {
     setLessonStarting(true);
@@ -401,7 +401,7 @@ function RadarNowPanel({
     <OwnerDeliveryPanel
       labelledBy="radar-now-title"
       title="Send latest Radar now"
-      description="Deliver the highest-ranked eligible update already waiting for your profile. This acceptance test does not consume today's normal Radar target."
+      description="Deliver the number of eligible updates saved in your Radar profile, one sourced Telegram message per update. This acceptance test does not consume today's normal Radar target."
       statusLabel={radarStateLabel(state, Boolean(error))}
       statusTone={radarStateTone(state, Boolean(error))}
       statusMessage={stateMessage}
@@ -561,9 +561,9 @@ function radarStateTone(
 function radarStateMessage(state: RadarDisplayState) {
   switch (state) {
     case "ready":
-      return "Ready to send the best ranked update currently available.";
+      return "Ready to send your saved Radar target from the best ranked updates currently available.";
     case "starting":
-      return "Reserving the best eligible Radar update…";
+      return "Reserving the best eligible Radar updates…";
     default:
       return "Radar delivery status is updating.";
   }
@@ -574,15 +574,15 @@ function radarActionLabel(state: RadarDisplayState) {
     case "starting":
       return "Starting…";
     case "queued":
-      return "Radar queued";
+      return "Radar batch queued";
     case "delivering":
       return "Delivering…";
     case "delivered":
-      return "Send another update";
+      return "Send another batch";
     case "failed":
       return "Try again";
     default:
-      return "Send latest Radar";
+      return "Send Radar batch";
   }
 }
 

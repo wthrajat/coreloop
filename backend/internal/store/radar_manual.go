@@ -6,128 +6,328 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"coreloop/backend/internal/ids"
 	"coreloop/backend/internal/radar"
 )
 
-// EnqueueManualRadar atomically reserves the best currently eligible Radar
-// candidate and creates its durable delivery job. It deliberately does not
-// update radar_daily_usage or released_at, so an owner acceptance test cannot
-// consume or delay normal Radar delivery.
-func (store *Store) EnqueueManualRadar(
+type manualRadarJobPayload struct {
+	CandidateID    string `json:"candidate_id"`
+	ManualBatchID  string `json:"manual_batch_id"`
+	ProfileTarget  int    `json:"profile_target"`
+	RequestedCount int    `json:"requested_count"`
+}
+
+type ManualRadarBatchJob struct {
+	Job            Job
+	CandidateState string
+	DeliveryState  string
+}
+
+// EnqueueManualRadarBatch atomically reserves the best currently eligible
+// Radar candidates up to the profile's saved target and creates one durable
+// delivery job per candidate. It deliberately does not update
+// radar_daily_usage or released_at, so an owner acceptance test cannot consume
+// or delay normal Radar delivery.
+func (store *Store) EnqueueManualRadarBatch(
 	ctx context.Context,
 	userID string,
-	idempotencyKey string,
+	batchID string,
+	idempotencyPrefix string,
 	now time.Time,
-) (string, error) {
+) ([]ManualRadarBatchJob, error) {
 	tx, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer tx.Rollback()
 
-	var existingJobID string
-	err = tx.QueryRowContext(
-		ctx,
-		"SELECT id FROM job_queue WHERE idempotency_key=?",
-		idempotencyKey,
-	).Scan(&existingJobID)
+	existingJobs, err := queryManualRadarBatchJobs(ctx, tx, userID, batchID)
 	if err == nil {
-		return existingJobID, tx.Commit()
+		return existingJobs, tx.Commit()
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
+		return nil, err
 	}
 
-	var candidateID string
-	rows, err := tx.QueryContext(ctx, `SELECT rc.id,si.normalized_url
+	profileTarget, err := manualRadarProfileTarget(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
+	requestedCount := profileTarget
+	if requestedCount == 0 {
+		requestedCount = maximumUnlimitedReleasePass
+	}
+	if requestedCount < 1 {
+		return nil, sql.ErrNoRows
+	}
+
+	candidateIDs, err := manualRadarCandidateIDs(
+		ctx,
+		tx,
+		userID,
+		requestedCount,
+		now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidateIDs) == 0 {
+		return nil, sql.ErrNoRows
+	}
+
+	batchJobs, err := newManualRadarJobs(
+		userID,
+		batchID,
+		idempotencyPrefix,
+		profileTarget,
+		requestedCount,
+		candidateIDs,
+		now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := reserveManualRadarCandidates(ctx, tx, userID, candidateIDs, now); err != nil {
+		return nil, err
+	}
+	if err := insertManualRadarJobs(ctx, tx, batchJobs); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return batchJobs, nil
+}
+
+func newManualRadarJobs(
+	userID string,
+	batchID string,
+	idempotencyPrefix string,
+	profileTarget int,
+	requestedCount int,
+	candidateIDs []string,
+	now time.Time,
+) ([]ManualRadarBatchJob, error) {
+	jobs := make([]ManualRadarBatchJob, 0, len(candidateIDs))
+	for index, candidateID := range candidateIDs {
+		jobID, err := ids.New("job")
+		if err != nil {
+			return nil, err
+		}
+		payload, err := json.Marshal(manualRadarJobPayload{
+			CandidateID:    candidateID,
+			ManualBatchID:  batchID,
+			ProfileTarget:  profileTarget,
+			RequestedCount: requestedCount,
+		})
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, ManualRadarBatchJob{
+			Job: Job{
+				ID:             jobID,
+				UserID:         userID,
+				Type:           "deliver_radar",
+				State:          "queued",
+				DueAt:          now,
+				MaxAttempts:    5,
+				IdempotencyKey: fmt.Sprintf("%s%d", idempotencyPrefix, index+1),
+				PayloadJSON:    string(payload),
+			},
+			CandidateState: "qualified",
+		})
+	}
+	return jobs, nil
+}
+
+func reserveManualRadarCandidates(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	candidateIDs []string,
+	now time.Time,
+) error {
+	arguments := make([]any, 0, len(candidateIDs)+2)
+	arguments = append(arguments, timestamp(now), userID)
+	for _, candidateID := range candidateIDs {
+		arguments = append(arguments, candidateID)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(candidateIDs)), ",")
+	statement := `UPDATE radar_candidates SET status='qualified',updated_at=?
+		WHERE user_id=? AND status='pending' AND id IN (` + placeholders + `)`
+	result, err := tx.ExecContext(ctx, statement, arguments...)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != int64(len(candidateIDs)) {
+		return fmt.Errorf("reserve manual Radar batch: %w", sql.ErrNoRows)
+	}
+	return nil
+}
+
+func insertManualRadarJobs(
+	ctx context.Context,
+	tx *sql.Tx,
+	jobs []ManualRadarBatchJob,
+) error {
+	values := strings.TrimSuffix(strings.Repeat("(?,?,?,?,?,?),", len(jobs)), ",")
+	arguments := make([]any, 0, len(jobs)*6)
+	for _, batchJob := range jobs {
+		job := batchJob.Job
+		arguments = append(
+			arguments,
+			job.ID,
+			job.UserID,
+			job.Type,
+			timestamp(job.DueAt),
+			job.IdempotencyKey,
+			job.PayloadJSON,
+		)
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO job_queue
+		(id,user_id,job_type,due_at,idempotency_key,payload_json) VALUES `+values,
+		arguments...)
+	return err
+}
+
+func manualRadarProfileTarget(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+) (int, error) {
+	var target int
+	err := tx.QueryRowContext(ctx, `SELECT lp.radar_items_per_day
+		FROM learning_preferences lp
+		JOIN users u ON u.id=lp.user_id AND u.status='active'
+		JOIN delivery_destinations dd ON dd.user_id=lp.user_id
+			AND dd.channel='telegram' AND dd.enabled=1 AND dd.status='connected'
+		WHERE lp.user_id=? AND lp.radar_enabled=1`, userID).Scan(&target)
+	return target, err
+}
+
+func manualRadarCandidateIDs(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	limit int,
+	now time.Time,
+) ([]string, error) {
+	candidatePoolLimit := max(limit*8, 40)
+	rows, err := tx.QueryContext(ctx, `SELECT rc.id,si.source_id,si.normalized_url,
+		rc.relevance_score
 		FROM radar_candidates rc
 		JOIN source_items si ON si.id=rc.source_item_id
-		JOIN users u ON u.id=rc.user_id AND u.status='active'
-		JOIN learning_preferences lp ON lp.user_id=rc.user_id AND lp.radar_enabled=1
-		JOIN delivery_destinations dd ON dd.user_id=rc.user_id
-			AND dd.channel='telegram' AND dd.enabled=1 AND dd.status='connected'
 		WHERE rc.user_id=? AND rc.status='pending'
 			AND rc.ranker_version=? AND rc.relevance_score>=?
 			AND COALESCE(si.published_at,si.retrieved_at)>=?
 		ORDER BY rc.relevance_score DESC,
 			COALESCE(si.published_at,si.retrieved_at) DESC,rc.created_at,rc.id
-		LIMIT 20`, userID, radar.RankerVersion, radar.MinimumDeliveryScore,
-		timestamp(now.Add(-radar.MaximumItemAge)))
+		LIMIT ?`, userID, radar.RankerVersion, radar.MinimumDeliveryScore,
+		timestamp(now.Add(-radar.MaximumItemAge)), candidatePoolLimit)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+	defer rows.Close()
+
+	pool := make([]radarReleaseCandidate, 0, limit)
 	for rows.Next() {
-		var currentID, currentURL string
-		if err := rows.Scan(&currentID, &currentURL); err != nil {
-			rows.Close()
-			return "", err
+		var candidate radarReleaseCandidate
+		if err := rows.Scan(
+			&candidate.ID,
+			&candidate.SourceID,
+			&candidate.URL,
+			&candidate.Score,
+		); err != nil {
+			return nil, err
 		}
-		if _, err := radar.CanonicalURL(currentURL); err == nil {
-			candidateID = currentID
-			break
+		if _, err := radar.CanonicalURL(candidate.URL); err != nil {
+			continue
 		}
+		pool = append(pool, candidate)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
-		return "", err
+		return nil, err
 	}
-	if err := rows.Close(); err != nil {
-		return "", err
-	}
-	if candidateID == "" {
-		return "", sql.ErrNoRows
-	}
-
-	result, err := tx.ExecContext(ctx, `UPDATE radar_candidates
-		SET status='qualified',updated_at=?
-		WHERE id=? AND user_id=? AND status='pending'`,
-		timestamp(now), candidateID, userID)
-	if err != nil {
-		return "", err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return "", err
-	}
-	if changed != 1 {
-		return "", fmt.Errorf("reserve manual Radar candidate: %w", sql.ErrNoRows)
-	}
-
-	jobID, err := ids.New("job")
-	if err != nil {
-		return "", err
-	}
-	payload, err := json.Marshal(map[string]string{"candidate_id": candidateID})
-	if err != nil {
-		return "", err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO job_queue
-		(id,user_id,job_type,due_at,idempotency_key,payload_json)
-		VALUES (?,?,?,?,?,?)`, jobID, userID, "deliver_radar", timestamp(now),
-		idempotencyKey, string(payload))
-	if err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return "", err
-	}
-	return jobID, nil
+	return diverseRadarCandidates(pool, nil, limit), nil
 }
 
-func (store *Store) RadarCandidateDeliveryState(
+func (store *Store) ManualRadarBatchJobs(
 	ctx context.Context,
 	userID string,
-	candidateID string,
-) (string, string, error) {
-	var candidateState, deliveryState string
-	err := store.database.QueryRowContext(ctx, `SELECT rc.status,COALESCE((
-		SELECT rd.state FROM radar_deliveries rd
-		WHERE rd.candidate_id=rc.id AND rd.user_id=rc.user_id
-		ORDER BY rd.created_at DESC LIMIT 1
-	),'') FROM radar_candidates rc WHERE rc.id=? AND rc.user_id=?`,
-		candidateID, userID).Scan(&candidateState, &deliveryState)
-	return candidateState, deliveryState, err
+	batchID string,
+) ([]ManualRadarBatchJob, error) {
+	return queryManualRadarBatchJobs(ctx, store.database, userID, batchID)
+}
+
+type manualRadarBatchQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func queryManualRadarBatchJobs(
+	ctx context.Context,
+	queryer manualRadarBatchQueryer,
+	userID string,
+	batchID string,
+) ([]ManualRadarBatchJob, error) {
+	rows, err := queryer.QueryContext(ctx, `SELECT jq.id,jq.sequence,
+		COALESCE(jq.user_id,''),COALESCE(jq.assignment_id,''),jq.job_type,jq.state,
+		jq.due_at,jq.attempt_count,jq.max_attempts,jq.idempotency_key,jq.payload_json,
+		COALESCE(rc.status,''),COALESCE((
+			SELECT rd.state FROM radar_deliveries rd
+			WHERE rd.candidate_id=rc.id AND rd.user_id=rc.user_id
+			ORDER BY rd.created_at DESC LIMIT 1
+		),'')
+		FROM job_queue jq
+		LEFT JOIN radar_candidates rc
+			ON rc.id=json_extract(jq.payload_json,'$.candidate_id')
+			AND rc.user_id=jq.user_id
+		WHERE jq.user_id=? AND jq.job_type='deliver_radar'
+			AND json_extract(jq.payload_json,'$.manual_batch_id')=?
+		ORDER BY jq.sequence`, userID, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []ManualRadarBatchJob
+	for rows.Next() {
+		var batchJob ManualRadarBatchJob
+		var dueAt string
+		if err := rows.Scan(
+			&batchJob.Job.ID,
+			&batchJob.Job.Sequence,
+			&batchJob.Job.UserID,
+			&batchJob.Job.AssignmentID,
+			&batchJob.Job.Type,
+			&batchJob.Job.State,
+			&dueAt,
+			&batchJob.Job.AttemptCount,
+			&batchJob.Job.MaxAttempts,
+			&batchJob.Job.IdempotencyKey,
+			&batchJob.Job.PayloadJSON,
+			&batchJob.CandidateState,
+			&batchJob.DeliveryState,
+		); err != nil {
+			return nil, err
+		}
+		batchJob.Job.DueAt, err = parseTimestamp(dueAt)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, batchJob)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(jobs) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return jobs, nil
 }

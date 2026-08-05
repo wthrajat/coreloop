@@ -86,7 +86,12 @@ export type ManualLesson = {
 };
 
 export type ManualRadar = {
-  job_id: string;
+  batch_id: string;
   state: "queued" | "delivering" | "delivered" | "failed";
+  profile_target: number;
+  requested_count: number;
+  selected_count: number;
+  delivered_count: number;
+  failed_count: number;
   message: string;
 };

@@ -487,11 +487,11 @@ func (service *Service) rankRadar(ctx context.Context, job store.Job) error {
 
 func (service *Service) deliverRadar(ctx context.Context, job store.Job) error {
 	slog.InfoContext(ctx, "Radar delivery started", "job_id", job.ID, "attempt", job.AttemptCount)
-	var payload map[string]string
+	var payload radarJobMetadata
 	if err := json.Unmarshal([]byte(job.PayloadJSON), &payload); err != nil {
 		return err
 	}
-	candidate, err := service.store.RadarCandidate(ctx, payload["candidate_id"])
+	candidate, err := service.store.RadarCandidate(ctx, payload.CandidateID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
