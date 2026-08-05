@@ -201,8 +201,9 @@ func (store *Store) EnqueueSourcePolls(ctx context.Context, now time.Time) error
 
 func (store *Store) RecoverJobs(ctx context.Context, now time.Time) error {
 	_, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state='failed',lease_owner=NULL,lease_expires_at=NULL,
-		last_error_code=COALESCE(last_error_code,'attempts_exhausted'),
-		last_error_at=COALESCE(last_error_at,?),updated_at=?
+		last_error_code='attempts_exhausted',
+		last_error_summary='The job reached its attempt limit before completing.',
+		last_error_at=?,updated_at=?
 		WHERE attempt_count>=max_attempts AND (state='queued' OR (state='leased' AND lease_expires_at<=?))`,
 		timestamp(now), timestamp(now), timestamp(now))
 	if err != nil {
@@ -248,8 +249,9 @@ func (store *Store) PublishableJobs(ctx context.Context, now time.Time, limit in
 
 func (store *Store) FailExhaustedJob(ctx context.Context, jobID string, now time.Time) (bool, error) {
 	result, err := store.database.ExecContext(ctx, `UPDATE job_queue SET state='failed',lease_owner=NULL,lease_expires_at=NULL,
-		last_error_code=COALESCE(last_error_code,'attempts_exhausted'),
-		last_error_at=COALESCE(last_error_at,?),updated_at=?
+		last_error_code='attempts_exhausted',
+		last_error_summary='The job reached its attempt limit before completing.',
+		last_error_at=?,updated_at=?
 		WHERE id=? AND state='queued' AND attempt_count>=max_attempts`, timestamp(now), timestamp(now), jobID)
 	if err != nil {
 		return false, err
@@ -339,15 +341,27 @@ func (store *Store) AssignmentDeliveryState(ctx context.Context, userID, assignm
 	return assignmentState, deliveryState, err
 }
 
-func (store *Store) FailJob(ctx context.Context, job Job, owner, code string, quota bool, now time.Time) error {
+func (store *Store) FailJob(
+	ctx context.Context,
+	job Job,
+	owner, code, summary string,
+	quota bool,
+	now time.Time,
+) error {
+	code = boundedFailureText(code, 64, "job_failed")
+	summary = boundedFailureText(
+		summary,
+		800,
+		"The job failed without a recorded diagnostic.",
+	)
 	var result sql.Result
 	var err error
 	if quota {
 		result, err = store.database.ExecContext(ctx, `UPDATE job_queue SET state='blocked_quota',due_at=?,
 			lease_owner=NULL,lease_expires_at=NULL,attempt_count=MAX(attempt_count-1,0),
-			last_error_code=?,last_error_at=?,updated_at=?
+			last_error_code=?,last_error_summary=?,last_error_at=?,updated_at=?
 			WHERE id=? AND state='leased' AND lease_owner=?`,
-			timestamp(now.Add(time.Hour)), code, timestamp(now), timestamp(now), job.ID, owner)
+			timestamp(now.Add(time.Hour)), code, summary, timestamp(now), timestamp(now), job.ID, owner)
 	} else {
 		state := "queued"
 		due := now.Add(time.Duration(job.AttemptCount*job.AttemptCount) * time.Minute)
@@ -355,9 +369,9 @@ func (store *Store) FailJob(ctx context.Context, job Job, owner, code string, qu
 			state = "failed"
 		}
 		result, err = store.database.ExecContext(ctx, `UPDATE job_queue SET state=?,due_at=?,lease_owner=NULL,lease_expires_at=NULL,
-			last_error_code=?,last_error_at=?,updated_at=?
+			last_error_code=?,last_error_summary=?,last_error_at=?,updated_at=?
 			WHERE id=? AND state='leased' AND lease_owner=?`,
-			state, timestamp(due), code, timestamp(now), timestamp(now), job.ID, owner)
+			state, timestamp(due), code, summary, timestamp(now), timestamp(now), job.ID, owner)
 	}
 	if err != nil {
 		return err
@@ -370,6 +384,18 @@ func (store *Store) FailJob(ctx context.Context, job Job, owner, code string, qu
 		return ErrJobLeaseLost
 	}
 	return nil
+}
+
+func boundedFailureText(value string, limit int, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = fallback
+	}
+	runes := []rune(value)
+	if len(runes) > limit {
+		value = strings.TrimSpace(string(runes[:limit]))
+	}
+	return value
 }
 
 func (store *Store) Job(ctx context.Context, jobID string) (Job, error) {

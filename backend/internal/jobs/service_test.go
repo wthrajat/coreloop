@@ -498,7 +498,9 @@ func TestRecoveryTerminalizesExhaustedJobsAndPreservesQuotaRetries(t *testing.T)
 		t.Fatalf("recovery request count = %d, want 6", len(requests))
 	}
 	exhaustedSQL := firstTursoSQL(t, requests[0])
-	if !strings.Contains(exhaustedSQL, "state='failed'") || !strings.Contains(exhaustedSQL, "attempt_count>=max_attempts") {
+	if !strings.Contains(exhaustedSQL, "state='failed'") ||
+		!strings.Contains(exhaustedSQL, "attempt_count>=max_attempts") ||
+		!strings.Contains(exhaustedSQL, "last_error_summary='The job reached its attempt limit before completing.'") {
 		t.Fatalf("exhausted recovery query = %s", exhaustedSQL)
 	}
 	leaseRecoverySQL := firstTursoSQL(t, requests[1])
@@ -557,7 +559,15 @@ func TestQuotaFailureDoesNotConsumeTheOrdinaryAttemptBudget(t *testing.T) {
 	defer database.Close()
 
 	job := store.Job{ID: "job_quota", AttemptCount: 5, MaxAttempts: 5}
-	if err := store.New(database).FailJob(context.Background(), job, "worker", "ai_quota_exhausted", true, time.Now()); err != nil {
+	if err := store.New(database).FailJob(
+		context.Background(),
+		job,
+		"worker",
+		"ai_quota_exhausted",
+		"Free provider quota is exhausted.",
+		true,
+		time.Now(),
+	); err != nil {
 		t.Fatal(err)
 	}
 	quotaFailureSQL := firstTursoSQL(t, requestBody)

@@ -285,11 +285,16 @@ func (service *Service) Run(ctx context.Context, jobID, workerID string) error {
 		return service.continueQueue(ctx)
 	}
 	quota := errors.Is(err, providers.ErrFreeQuotaExhausted)
-	code := "job_failed"
-	if quota {
-		code = "ai_quota_exhausted"
-	}
-	if failErr := service.store.FailJob(ctx, job, workerID, code, quota, service.now()); failErr != nil {
+	code, summary := classifyJobFailure(job, err, quota)
+	if failErr := service.store.FailJob(
+		ctx,
+		job,
+		workerID,
+		code,
+		summary,
+		quota,
+		service.now(),
+	); failErr != nil {
 		return errors.Join(err, failErr)
 	}
 	slog.WarnContext(
@@ -773,7 +778,16 @@ func (service *Service) RunBlockedWithOpenAI(ctx context.Context, jobID string) 
 	err = service.generateLesson(executionContext, job, true)
 	cancelExecution()
 	if err != nil {
-		if failError := service.store.FailJob(ctx, job, owner, "manual_openai_failed", true, service.now()); failError != nil {
+		_, summary := classifyJobFailure(job, err, false)
+		if failError := service.store.FailJob(
+			ctx,
+			job,
+			owner,
+			"manual_openai_failed",
+			summary,
+			true,
+			service.now(),
+		); failError != nil {
 			return errors.Join(err, failError)
 		}
 		return err

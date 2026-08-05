@@ -5,7 +5,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { PageHeader } from "@/components/page-header";
 import { StatusPill } from "@/components/status-pill";
 import { api } from "@/lib/api-client";
-import type { ManualLesson, ManualRadar, Operations } from "@/lib/api-types";
+import type {
+  FailedJob,
+  JobFailureEvent,
+  ManualLesson,
+  ManualRadar,
+  Operations,
+} from "@/lib/api-types";
 import { formatIndiaDateTime } from "@/lib/date-time";
 
 const ACTIVE_LESSON_STATES = new Set<ManualLesson["state"]>([
@@ -445,10 +451,15 @@ export default function OperationsPage() {
           label="Failed"
           value={operations.failed}
           tone={operations.failed ? "attention" : "ready"}
+          detailsHref={operations.failed ? "#failed-jobs" : undefined}
         />
         <Metric label="Users" value={operations.users} tone="neutral" />
         <Metric label="Sources" value={operations.sources} tone="neutral" />
       </section>
+      <FailedJobs
+        jobs={operations.failed_jobs ?? []}
+        total={operations.failed}
+      />
       <section className="section-block">
         <div className="section-heading">
           <div>
@@ -738,15 +749,181 @@ function Metric({
   label,
   value,
   tone,
+  detailsHref,
 }: {
   label: string;
   value: number;
   tone: "neutral" | "ready" | "attention" | "error";
+  detailsHref?: string;
 }) {
   return (
     <article className="metric">
       <StatusPill tone={tone}>{label}</StatusPill>
       <strong>{value}</strong>
+      {detailsHref ? (
+        <a className="metric-link" href={detailsHref}>
+          Review failures
+        </a>
+      ) : null}
     </article>
   );
+}
+
+function FailedJobs({ jobs, total }: { jobs: FailedJob[]; total: number }) {
+  return (
+    <section className="section-block" id="failed-jobs">
+      <div className="section-heading">
+        <div>
+          <h2>Failed jobs</h2>
+          <p>
+            Terminal failures with safe diagnostics for every recorded attempt.
+            Provider payloads, lesson text, credentials, and Telegram
+            identifiers are never shown here.
+          </p>
+        </div>
+        {total > jobs.length ? (
+          <p className="failure-list-limit">
+            Showing the latest {jobs.length} of {total}
+          </p>
+        ) : null}
+      </div>
+      {jobs.length ? (
+        <ol className="failure-list">
+          {jobs.map((job) => (
+            <FailedJobDetails job={job} key={job.id} />
+          ))}
+        </ol>
+      ) : (
+        <div className="empty-state">
+          <span className="empty-symbol">0</span>
+          <div>
+            <h3>No failed jobs</h3>
+            <p>
+              Terminal queue failures will appear here with their attempt
+              history.
+            </p>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function FailedJobDetails({ job }: { job: FailedJob }) {
+  const latestFailure = job.failures[0];
+  const latestSummary =
+    latestFailure?.error_summary ||
+    job.last_error_summary ||
+    "Detailed diagnostics were not recorded for this historical failure.";
+
+  return (
+    <li>
+      <details className="failure-details">
+        <summary>
+          <div className="failure-summary-main">
+            <div className="failure-title-row">
+              <h3>{jobTypeLabel(job.job_type)}</h3>
+              <span>
+                Attempt {job.attempt_count} of {job.max_attempts}
+              </span>
+            </div>
+            <p>{latestSummary}</p>
+            <time dateTime={job.failed_at}>
+              Failed {formatIndiaDateTime(job.failed_at)}
+            </time>
+          </div>
+          <span className="failure-disclosure" aria-hidden="true" />
+        </summary>
+        <div className="failure-body">
+          <dl className="failure-metadata">
+            <div>
+              <dt>Job ID</dt>
+              <dd>
+                <code>{job.id}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>Latest code</dt>
+              <dd>
+                <code>{job.last_error_code || "unavailable"}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>Queued</dt>
+              <dd>
+                <time dateTime={job.created_at}>
+                  {formatIndiaDateTime(job.created_at)}
+                </time>
+              </dd>
+            </div>
+          </dl>
+          {job.failures.length ? (
+            <>
+              {job.failure_count > job.failures.length ? (
+                <p className="failure-attempt-limit">
+                  Showing the latest {job.failures.length} of{" "}
+                  {job.failure_count}
+                  recorded attempts.
+                </p>
+              ) : null}
+              <ol className="failure-attempts">
+                {job.failures.map((failure, index) => (
+                  <FailureAttempt
+                    failure={failure}
+                    key={`${failure.occurred_at}-${failure.attempt_count}-${index}`}
+                  />
+                ))}
+              </ol>
+            </>
+          ) : (
+            <p className="failure-history-unavailable">
+              This job failed before attempt-level diagnostics were enabled. Its
+              historical log output cannot be reconstructed safely.
+            </p>
+          )}
+        </div>
+      </details>
+    </li>
+  );
+}
+
+function FailureAttempt({ failure }: { failure: JobFailureEvent }) {
+  return (
+    <li>
+      <div className="failure-attempt-heading">
+        <strong>Attempt {failure.attempt_count}</strong>
+        <time dateTime={failure.occurred_at}>
+          {formatIndiaDateTime(failure.occurred_at)}
+        </time>
+      </div>
+      <p>{failure.error_summary}</p>
+      <div className="failure-attempt-codes">
+        <code>{failure.error_code}</code>
+        <span>{failureStateLabel(failure.next_state)}</span>
+      </div>
+    </li>
+  );
+}
+
+function jobTypeLabel(jobType: string) {
+  const labels: Record<string, string> = {
+    generate_lesson: "Generate lesson",
+    deliver_lesson: "Deliver lesson",
+    ingest_source: "Ingest news source",
+    rank_radar: "Rank Radar updates",
+    deliver_radar: "Deliver Radar update",
+    recover: "Recover queue",
+  };
+  return labels[jobType] ?? "Background job";
+}
+
+function failureStateLabel(state: JobFailureEvent["next_state"]) {
+  switch (state) {
+    case "queued":
+      return "Retried later";
+    case "blocked_quota":
+      return "Blocked by quota";
+    case "failed":
+      return "Terminal failure";
+  }
 }

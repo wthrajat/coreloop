@@ -71,6 +71,28 @@ export type Operations = {
   users: number;
   sources: number;
   blocked_jobs: { id: string; created_at: string; attempt_count: number }[];
+  failed_jobs: FailedJob[];
+};
+
+export type JobFailureEvent = {
+  attempt_count: number;
+  error_code: string;
+  error_summary: string;
+  next_state: "queued" | "failed" | "blocked_quota";
+  occurred_at: string;
+};
+
+export type FailedJob = {
+  id: string;
+  job_type: string;
+  created_at: string;
+  failed_at: string;
+  attempt_count: number;
+  max_attempts: number;
+  last_error_code: string;
+  last_error_summary: string;
+  failure_count: number;
+  failures: JobFailureEvent[];
 };
 
 export type ManualLesson = {

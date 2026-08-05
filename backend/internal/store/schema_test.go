@@ -269,6 +269,43 @@ func TestDeliveryQualityMigrationCollapsesDuplicateSourcePolls(t *testing.T) {
 	}
 }
 
+func TestJobFailureDiagnosticsMigrationRecordsEveryAttemptAtomically(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	matches, err := filepath.Glob(filepath.Join(
+		projectRoot,
+		"migrations",
+		"[0-9][0-9][0-9][0-9]_*.sql",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(matches)
+	var script strings.Builder
+	for _, migration := range matches {
+		script.WriteString(".read " + migration + "\n")
+	}
+	script.WriteString(`INSERT INTO job_queue(id,job_type,state,due_at,attempt_count,max_attempts,idempotency_key,payload_json,lease_owner,lease_expires_at) VALUES('job-diagnostic','generate_lesson','leased','2026-08-05T10:00:00Z',1,5,'diagnostic','{}','worker','2026-08-05T10:05:00Z');` + "\n")
+	script.WriteString(`UPDATE job_queue SET state='queued',last_error_code='ai_invalid_output',last_error_summary='Groq returned invalid output.',last_error_at='2026-08-05T10:01:00Z' WHERE id='job-diagnostic';` + "\n")
+	script.WriteString(`UPDATE job_queue SET state='leased',attempt_count=2,last_error_at='2026-08-05T10:01:00Z' WHERE id='job-diagnostic';` + "\n")
+	script.WriteString(`UPDATE job_queue SET state='failed',last_error_code='execution_timeout',last_error_summary='The job exceeded its execution deadline.',last_error_at='2026-08-05T10:02:00Z' WHERE id='job-diagnostic';` + "\n")
+	script.WriteString(`SELECT COUNT(*) || ',' || MIN(attempt_count) || ',' || MAX(attempt_count) || ',' || (SELECT last_error_summary FROM job_queue WHERE id='job-diagnostic') FROM job_failure_events WHERE job_id='job-diagnostic';` + "\n")
+
+	command := exec.Command("sqlite3", ":memory:")
+	command.Stdin = strings.NewReader(script.String())
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run failure diagnostics migration: %v: %s", err, output)
+	}
+	want := "2,1,2,The job exceeded its execution deadline."
+	if strings.TrimSpace(string(output)) != want {
+		t.Fatalf("failure diagnostics = %s, want %s", output, want)
+	}
+}
+
 func TestPerformanceMigrationAddsIndexesAndRecallAttachment(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
