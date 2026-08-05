@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -17,6 +18,12 @@ import (
 type SourceRecord struct {
 	ID, Publisher, URL, FetchMethod, Role, AdapterConfig, ETag, LastModified string
 	Tier                                                                     int
+}
+
+type SourcePollOutcome struct {
+	NotModified    bool
+	AttemptedItems int
+	FailedItems    int
 }
 
 type RadarCandidate struct {
@@ -44,6 +51,7 @@ func (store *Store) SaveSourceItems(
 	items []radar.Item,
 	etag string,
 	lastModified string,
+	outcome SourcePollOutcome,
 	now time.Time,
 ) ([]string, error) {
 	valueGroups := make([]string, 0, len(items))
@@ -157,9 +165,28 @@ func (store *Store) SaveSourceItems(
 			return nil, err
 		}
 	}
+	acceptedItems := len(valueGroups)
+	rejectedItems := len(items) - acceptedItems
+	totalFailures := outcome.FailedItems + rejectedItems
+	pollState := "healthy"
+	var errorCode, errorSummary any
+	if totalFailures > 0 {
+		pollState = "degraded"
+		errorCode = "partial_item_failure"
+		errorSummary = fmt.Sprintf(
+			"%d source items could not be fetched or accepted; %d usable items remained.",
+			totalFailures,
+			acceptedItems,
+		)
+	}
 	_, err = tx.ExecContext(ctx, `UPDATE sources SET etag=?,last_modified=?,last_polled_at=?,
-		consecutive_failures=0,updated_at=? WHERE id=?`, etag, lastModified,
-		timestamp(now), timestamp(now), source.ID)
+		consecutive_failures=0,last_poll_state=?,last_success_at=?,
+		last_error_code=?,last_error_summary=?,last_error_at=CASE
+			WHEN ? IS NULL THEN NULL ELSE ? END,
+		last_item_count=CASE WHEN ?=1 THEN last_item_count ELSE ? END,updated_at=?
+		WHERE id=?`, etag, lastModified, timestamp(now), pollState, timestamp(now),
+		errorCode, errorSummary, errorCode, timestamp(now), boolInt(outcome.NotModified),
+		acceptedItems, timestamp(now), source.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -214,10 +241,26 @@ func normalizedSourceItemValues(
 	}, true, nil
 }
 
-func (store *Store) SourcePollFailed(ctx context.Context, id string, now time.Time) error {
+func (store *Store) SourcePollFailed(
+	ctx context.Context,
+	id string,
+	errorCode string,
+	errorSummary string,
+	now time.Time,
+) error {
+	if strings.TrimSpace(errorCode) == "" {
+		errorCode = "source_poll_failed"
+	}
+	errorCode = boundedFailureText(errorCode, 64, "source_poll_failed")
+	errorSummary = boundedFailureText(
+		errorSummary,
+		500,
+		"The source could not be fetched or processed.",
+	)
 	_, err := store.database.ExecContext(ctx, `UPDATE sources SET
-		consecutive_failures=consecutive_failures+1,last_polled_at=?,updated_at=? WHERE id=?`,
-		timestamp(now), timestamp(now), id)
+		consecutive_failures=consecutive_failures+1,last_polled_at=?,last_poll_state='failed',
+		last_error_code=?,last_error_summary=?,last_error_at=?,updated_at=? WHERE id=?`,
+		timestamp(now), errorCode, errorSummary, timestamp(now), timestamp(now), id)
 	return err
 }
 
@@ -273,6 +316,7 @@ func (store *Store) RankSourceItems(
 					Category:          category, CommunityPoints: item.CommunityPoints,
 					CommunityComments:         item.CommunityComments,
 					CommunitySignalsAvailable: item.CommunityAvailable,
+					SourceRole:                item.Candidate.SourceRole,
 				})
 				if breakdown.Total > selectedBreakdown.Total {
 					selectedTopic, selectedBreakdown = topic, breakdown
@@ -290,6 +334,7 @@ func (store *Store) RankSourceItems(
 				Category:          category, CommunityPoints: item.CommunityPoints,
 				CommunityComments:         item.CommunityComments,
 				CommunitySignalsAvailable: item.CommunityAvailable,
+				SourceRole:                item.Candidate.SourceRole,
 			}, selectedBreakdown)
 			breakdown, _ := json.Marshal(map[string]any{
 				"ranker": radar.RankerVersion, "category": category,

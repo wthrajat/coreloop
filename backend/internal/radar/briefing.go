@@ -14,17 +14,19 @@ type SourceReference struct {
 }
 
 type BriefingInput struct {
-	Category      Category
-	Title         string
-	Summary       string
-	WhyItMatters  string
-	Source        SourceReference
-	DiscoveredVia []SourceReference
+	Category          Category
+	Title             string
+	Summary           string
+	WhyItMatters      string
+	SimpleExplanation string
+	Source            SourceReference
+	DiscoveredVia     []SourceReference
 }
 
 type briefingTextLimits struct {
-	Summary int
-	Context int
+	Summary     int
+	Context     int
+	Explanation int
 }
 
 var callToAction = regexp.MustCompile(`(?i)^\s*(?:learn more|read more|read the (?:full|official) (?:article|post|source)|click here|sign up|register now|register today|get started|contact sales|try (?:it|this) (?:now|today)|watch now|download (?:it )?today|visit .+ to learn more)\b`)
@@ -86,6 +88,9 @@ func RenderBriefing(input BriefingInput) (string, error) {
 	if context := NeutralText(input.WhyItMatters); context != "" {
 		sections = append(sections, "Why it matters\n"+context)
 	}
+	if explanation := NeutralText(input.SimpleExplanation); explanation != "" {
+		sections = append(sections, "Simple explanation\n"+explanation)
+	}
 	sections = append(sections, "Source\n"+sourceName+"\n"+sourceURL)
 
 	additionalSources := renderAdditionalSources(input.DiscoveredVia, sourceURL)
@@ -109,6 +114,10 @@ func RenderCompactBriefing(input BriefingInput, maximumEscapedRunes int) (string
 	limits := compactBriefingLimits(category)
 	input.Summary = truncateNeutralText(input.Summary, limits.Summary)
 	input.WhyItMatters = truncateNeutralText(input.WhyItMatters, limits.Context)
+	input.SimpleExplanation = truncateNeutralText(
+		input.SimpleExplanation,
+		limits.Explanation,
+	)
 
 	briefing, err := RenderBriefing(input)
 	if err != nil {
@@ -122,9 +131,11 @@ func RenderCompactBriefing(input BriefingInput, maximumEscapedRunes int) (string
 	// headline, publisher, and source URL always remain intact.
 	originalSummary := input.Summary
 	originalContext := input.WhyItMatters
+	originalExplanation := input.SimpleExplanation
 	bestInput := input
 	bestInput.Summary = ""
 	bestInput.WhyItMatters = ""
+	bestInput.SimpleExplanation = ""
 	best, err := RenderBriefing(bestInput)
 	if err != nil {
 		return "", err
@@ -152,6 +163,10 @@ func RenderCompactBriefing(input BriefingInput, maximumEscapedRunes int) (string
 		candidateInput.WhyItMatters = truncateNeutralText(
 			originalContext, int(float64(utf8.RuneCountInString(originalContext))*scale),
 		)
+		candidateInput.SimpleExplanation = truncateNeutralText(
+			originalExplanation,
+			int(float64(utf8.RuneCountInString(originalExplanation))*scale),
+		)
 		candidate, renderErr := RenderBriefing(candidateInput)
 		if renderErr != nil {
 			return "", renderErr
@@ -168,13 +183,13 @@ func RenderCompactBriefing(input BriefingInput, maximumEscapedRunes int) (string
 func compactBriefingLimits(category Category) briefingTextLimits {
 	switch category {
 	case CategoryRelease:
-		return briefingTextLimits{Summary: 600, Context: 220}
+		return briefingTextLimits{Summary: 600, Context: 220, Explanation: 360}
 	case CategorySecurity, CategoryIndustry:
-		return briefingTextLimits{Summary: 1_500, Context: 450}
+		return briefingTextLimits{Summary: 1_500, Context: 450, Explanation: 700}
 	case CategoryEngineering, CategoryResearch, CategoryDiscussion:
-		return briefingTextLimits{Summary: 1_400, Context: 450}
+		return briefingTextLimits{Summary: 1_400, Context: 450, Explanation: 700}
 	default:
-		return briefingTextLimits{Summary: 800, Context: 280}
+		return briefingTextLimits{Summary: 800, Context: 280, Explanation: 500}
 	}
 }
 

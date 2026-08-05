@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -36,10 +37,12 @@ type sourceAdapterConfig struct {
 }
 
 type sourceFetchResult struct {
-	Items        []radar.Item
-	ETag         string
-	LastModified string
-	NotModified  bool
+	Items          []radar.Item
+	ETag           string
+	LastModified   string
+	NotModified    bool
+	AttemptedItems int
+	FailedItems    int
 }
 
 type sourceDocument struct {
@@ -60,20 +63,26 @@ func (service *Service) fetchSource(ctx context.Context, source store.SourceReco
 		configuration.ItemLimit = defaultAPIItemLimit
 	}
 
+	var result sourceFetchResult
+	var err error
 	switch configuration.Adapter {
 	case "feed", "":
-		return service.fetchFeed(ctx, source)
+		result, err = service.fetchFeed(ctx, source)
 	case "github_releases":
-		return service.fetchGitHubReleases(ctx, source, configuration.ItemLimit)
+		result, err = service.fetchGitHubReleases(ctx, source, configuration.ItemLimit)
 	case "hacker_news":
-		return service.fetchHackerNews(ctx, source, configuration.ItemLimit)
+		result, err = service.fetchHackerNews(ctx, source, configuration.ItemLimit)
 	case "bluesky_author":
-		return service.fetchBlueskyAuthor(ctx, source, configuration.ItemLimit)
+		result, err = service.fetchBlueskyAuthor(ctx, source, configuration.ItemLimit)
 	case "sitemap":
-		return service.fetchSitemap(ctx, source, configuration)
+		result, err = service.fetchSitemap(ctx, source, configuration)
 	default:
 		return sourceFetchResult{}, fmt.Errorf("unsupported source adapter %q", configuration.Adapter)
 	}
+	if err == nil && !result.NotModified && result.AttemptedItems == 0 {
+		result.AttemptedItems = len(result.Items)
+	}
+	return result, err
 }
 
 type blueskyAuthorFeed struct {
@@ -203,8 +212,25 @@ func (service *Service) fetchFeed(ctx context.Context, source store.SourceRecord
 	}
 	for index := range items {
 		items[index].URL = resolveSourceItemURL(source.URL, items[index].URL)
+		if source.Role == "community_discovery" &&
+			!sameSourceHostname(source.URL, items[index].URL) {
+			items[index].DiscoveredVia = append(
+				items[index].DiscoveredVia,
+				radar.SourceReference{
+					Name: source.Publisher + " feed",
+					URL:  source.URL,
+				},
+			)
+		}
 	}
 	return sourceFetchResult{Items: items, ETag: document.ETag, LastModified: document.LastModified}, nil
+}
+
+func sameSourceHostname(leftURL, rightURL string) bool {
+	left, leftErr := url.Parse(leftURL)
+	right, rightErr := url.Parse(rightURL)
+	return leftErr == nil && rightErr == nil &&
+		strings.EqualFold(left.Hostname(), right.Hostname())
 }
 
 func resolveSourceItemURL(sourceURL, itemURL string) string {
@@ -355,7 +381,10 @@ func (service *Service) fetchHackerNews(ctx context.Context, source store.Source
 	if len(ids) > 0 && len(output) == 0 {
 		return sourceFetchResult{}, errors.New("Hacker News item requests returned no usable stories")
 	}
-	return sourceFetchResult{Items: output, ETag: document.ETag, LastModified: document.LastModified}, nil
+	return sourceFetchResult{
+		Items: output, ETag: document.ETag, LastModified: document.LastModified,
+		AttemptedItems: len(ids), FailedItems: len(ids) - len(output),
+	}, nil
 }
 
 type sitemapDocument struct {
@@ -448,7 +477,18 @@ func (service *Service) fetchSitemap(ctx context.Context, source store.SourceRec
 	if len(pages) > 0 && len(output) == 0 {
 		return sourceFetchResult{}, errors.New("sitemap pages returned no usable metadata")
 	}
-	return sourceFetchResult{Items: output, ETag: document.ETag, LastModified: document.LastModified}, nil
+	return sourceFetchResult{
+		Items: output, ETag: document.ETag, LastModified: document.LastModified,
+		AttemptedItems: len(pages), FailedItems: len(pages) - len(output),
+	}, nil
+}
+
+type sourceHTTPError struct {
+	StatusCode int
+}
+
+func (failure sourceHTTPError) Error() string {
+	return fmt.Sprintf("source returned HTTP %d", failure.StatusCode)
 }
 
 func (service *Service) fetchDocument(ctx context.Context, rawURL, etag, lastModified string) (sourceDocument, error) {
@@ -486,7 +526,7 @@ func (service *Service) fetchDocument(ctx context.Context, rawURL, etag, lastMod
 		return result, nil
 	}
 	if response.StatusCode != http.StatusOK {
-		return sourceDocument{}, fmt.Errorf("source returned %s", response.Status)
+		return sourceDocument{}, sourceHTTPError{StatusCode: response.StatusCode}
 	}
 	result.Body, err = io.ReadAll(io.LimitReader(response.Body, maximumSourceBodyBytes+1))
 	if err != nil {
@@ -496,6 +536,37 @@ func (service *Service) fetchDocument(ctx context.Context, rawURL, etag, lastMod
 		return sourceDocument{}, errors.New("source response exceeds 8 MiB")
 	}
 	return result, nil
+}
+
+func sourcePollDiagnostic(err error) (string, string) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "source_timeout", "The source did not respond before the fetch deadline."
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) {
+		return "source_network_error", "The source could not be reached over the network."
+	}
+	var httpError sourceHTTPError
+	if errors.As(err, &httpError) {
+		return "source_http_error", fmt.Sprintf(
+			"The source returned HTTP %d.",
+			httpError.StatusCode,
+		)
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "unsupported source adapter") ||
+		strings.Contains(message, "decode source adapter config"):
+		return "source_configuration_invalid", "The source adapter configuration is invalid."
+	case strings.Contains(message, "parse"):
+		return "source_parse_failed", "The source response could not be parsed in its configured format."
+	case strings.Contains(message, "no usable"):
+		return "source_items_unavailable", "The source index loaded, but its item requests returned no usable stories."
+	case strings.Contains(message, "exceeds 8 mib"):
+		return "source_response_too_large", "The source response exceeded the safe size limit."
+	default:
+		return "source_poll_failed", "The source could not be fetched or processed."
+	}
 }
 
 func hasPathPrefix(path string, prefixes []string) bool {

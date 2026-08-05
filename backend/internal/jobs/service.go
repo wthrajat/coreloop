@@ -517,22 +517,50 @@ func (service *Service) ingestSource(ctx context.Context, job store.Job) error {
 	}
 	result, err := service.fetchSource(ctx, source)
 	if err != nil {
-		_ = service.store.SourcePollFailed(ctx, source.ID, service.now())
+		errorCode, errorSummary := sourcePollDiagnostic(err)
+		_ = service.store.SourcePollFailed(
+			ctx, source.ID, errorCode, errorSummary, service.now(),
+		)
+		slog.WarnContext(ctx, "source poll failed",
+			"source_id", source.ID,
+			"publisher", source.Publisher,
+			"error_code", errorCode,
+			"error_summary", errorSummary,
+		)
 		return err
 	}
+	outcome := store.SourcePollOutcome{
+		NotModified:    result.NotModified,
+		AttemptedItems: result.AttemptedItems,
+		FailedItems:    result.FailedItems,
+	}
 	if result.NotModified {
-		_, err := service.store.SaveSourceItems(ctx, source, nil, result.ETag, result.LastModified, service.now())
+		_, err := service.store.SaveSourceItems(
+			ctx, source, nil, result.ETag, result.LastModified, outcome, service.now(),
+		)
 		if err == nil {
 			slog.InfoContext(ctx, "source poll not modified", "source_id", source.ID, "publisher", source.Publisher)
 		}
 		return err
 	}
 	itemIDs, err := service.store.SaveSourceItems(
-		ctx, source, result.Items, result.ETag, result.LastModified, service.now(),
+		ctx, source, result.Items, result.ETag, result.LastModified, outcome, service.now(),
 	)
 	if err != nil {
-		_ = service.store.SourcePollFailed(ctx, source.ID, service.now())
+		_ = service.store.SourcePollFailed(
+			ctx, source.ID, "source_persistence_failed",
+			"Fetched source items could not be saved.", service.now(),
+		)
 		return err
+	}
+	if result.FailedItems > 0 {
+		slog.WarnContext(ctx, "source poll completed with partial item failures",
+			"source_id", source.ID,
+			"publisher", source.Publisher,
+			"attempted_items", result.AttemptedItems,
+			"usable_items", len(result.Items),
+			"failed_items", result.FailedItems,
+		)
 	}
 	if len(itemIDs) == 0 {
 		slog.InfoContext(ctx, "source poll completed", "source_id", source.ID,
@@ -622,12 +650,13 @@ func (service *Service) deliverRadar(ctx context.Context, job store.Job) error {
 		)
 	}
 	sourceName := radarSourceName(candidate)
-	summary, whyItMatters := service.radarBriefingContent(ctx, candidate)
+	sections := service.radarBriefingContent(ctx, candidate)
 	briefing, err := radar.RenderCompactBriefing(radar.BriefingInput{
 		Category: radar.Category(candidate.Category), Title: candidate.Title,
-		Summary: summary, WhyItMatters: whyItMatters,
-		Source:        radar.SourceReference{Name: sourceName, URL: candidate.URL},
-		DiscoveredVia: candidate.Discovery,
+		Summary: sections.SourceSummary, WhyItMatters: sections.DeveloperContext,
+		SimpleExplanation: sections.SimpleExplanation,
+		Source:            radar.SourceReference{Name: sourceName, URL: candidate.URL},
+		DiscoveredVia:     candidate.Discovery,
 	}, telegram.SafeChunkCharacters)
 	if err != nil {
 		return fmt.Errorf("render deterministic Radar briefing: %w", err)

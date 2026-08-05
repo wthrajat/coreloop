@@ -158,11 +158,27 @@ func TestRadarSourceFamilyCombinesHighVolumeSiblings(t *testing.T) {
 		"source_stacker_tech":      "stacker_news",
 		"source_stacker_lightning": "stacker_news",
 		"source_hacker_news":       "hacker_news",
+		"source_lobsters":          "lobsters",
 		"source_openai_news":       "source_openai_news",
 	}
 	for sourceID, want := range cases {
 		if got := radarSourceFamily(sourceID); got != want {
 			t.Fatalf("source family for %q = %q, want %q", sourceID, got, want)
 		}
+	}
+}
+
+func TestRadarSourceFamilyPreservesCommunityDiscoveryProvenance(t *testing.T) {
+	if got := radarSourceFamily(
+		"source_postgresql_news",
+		`[{"name":"Hacker News discussion","url":"https://news.ycombinator.com/item?id=42"}]`,
+	); got != "hacker_news" {
+		t.Fatalf("HN-discovered official item family = %q", got)
+	}
+	if got := radarSourceFamily(
+		"source_bitcoin_optech",
+		`[{"name":"Stacker News","url":"https://stacker.news/items/123"}]`,
+	); got != "stacker_news" {
+		t.Fatalf("Stacker-discovered official item family = %q", got)
 	}
 }

@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const RankerVersion = "deterministic-editorial-v3"
+const RankerVersion = "deterministic-editorial-v4"
 
 const MaximumItemAge = 10 * 24 * time.Hour
 
@@ -83,6 +83,7 @@ type ScoreInput struct {
 	CommunityPoints           int
 	CommunityComments         int
 	CommunitySignalsAvailable bool
+	SourceRole                string
 }
 
 // ScoreBreakdown exposes every ranking dimension so callers can persist and
@@ -229,7 +230,14 @@ func topicRelevance(document map[string]bool, topicTerms []string) float64 {
 			matches++
 		}
 	}
-	return math.Min(1, float64(matches)/math.Min(6, float64(len(wanted))))
+	if matches == 0 {
+		return 0
+	}
+	// Headlines and feed summaries are short. One precise match should be a
+	// useful relevance signal instead of being diluted by a broad profile's
+	// full vocabulary. Additional matches still increase confidence.
+	matchTarget := math.Min(3, float64(len(wanted)))
+	return math.Min(1, 0.35+0.65*float64(matches)/matchTarget)
 }
 
 func developerValue(category Category, document map[string]bool) float64 {
@@ -266,6 +274,12 @@ func sourceAuthority(sourceTier int) float64 {
 
 func communityInterest(input ScoreInput) float64 {
 	if !input.CommunitySignalsAvailable {
+		if input.SourceRole == "community_discovery" ||
+			input.SourceRole == "community_discussion" {
+			// A curated community feed is itself a modest signal even when RSS
+			// does not expose points or comment counts.
+			return 0.68
+		}
 		return 0.5
 	}
 	points := math.Max(0, float64(input.CommunityPoints))

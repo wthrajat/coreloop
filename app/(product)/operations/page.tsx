@@ -11,6 +11,7 @@ import type {
   ManualLesson,
   ManualRadar,
   Operations,
+  SourceHealth,
 } from "@/lib/api-types";
 import { formatIndiaDateTime } from "@/lib/date-time";
 
@@ -456,6 +457,7 @@ export default function OperationsPage() {
         <Metric label="Users" value={operations.users} tone="neutral" />
         <Metric label="Sources" value={operations.sources} tone="neutral" />
       </section>
+      <SourceHealthPanel sources={operations.source_health ?? []} />
       <FailedJobs
         jobs={operations.failed_jobs ?? []}
         total={operations.failed}
@@ -506,6 +508,102 @@ export default function OperationsPage() {
       </section>
     </div>
   );
+}
+
+function SourceHealthPanel({ sources }: { sources: SourceHealth[] }) {
+  const counts = sources.reduce(
+    (totals, source) => {
+      totals[source.poll_state] += 1;
+      return totals;
+    },
+    { healthy: 0, degraded: 0, failed: 0, never: 0 },
+  );
+  const attention = counts.degraded + counts.failed + counts.never;
+
+  return (
+    <section className="section-block source-health-section">
+      <details className="source-health-disclosure">
+        <summary>
+          <div>
+            <span className="eyebrow">Radar ingestion</span>
+            <h2>Source health</h2>
+            <p>
+              {counts.healthy} healthy · {counts.degraded} degraded ·{" "}
+              {counts.failed} failed · {counts.never} not yet polled
+            </p>
+          </div>
+          <StatusPill tone={attention ? "attention" : "ready"}>
+            {attention ? `${attention} need attention` : "All healthy"}
+          </StatusPill>
+        </summary>
+        {sources.length ? (
+          <ol className="source-health-list">
+            {sources.map((source) => (
+              <SourceHealthRow key={source.id} source={source} />
+            ))}
+          </ol>
+        ) : (
+          <p className="muted-copy">No enabled Radar sources were found.</p>
+        )}
+      </details>
+    </section>
+  );
+}
+
+function SourceHealthRow({ source }: { source: SourceHealth }) {
+  const tone =
+    source.poll_state === "healthy"
+      ? "ready"
+      : source.poll_state === "failed"
+        ? "error"
+        : "attention";
+  const stateLabel =
+    source.poll_state === "never"
+      ? "Not yet polled"
+      : source.poll_state[0].toUpperCase() + source.poll_state.slice(1);
+
+  return (
+    <li>
+      <div className="source-health-heading">
+        <div>
+          <h3>{source.publisher}</h3>
+          <p>
+            {source.source_role.replaceAll("_", " ")} ·{" "}
+            {source.fetch_method.toUpperCase()}
+          </p>
+        </div>
+        <StatusPill tone={tone}>{stateLabel}</StatusPill>
+      </div>
+      {source.last_error_summary ? (
+        <div className="source-health-error" role="note">
+          <p>{source.last_error_summary}</p>
+          <code>{source.last_error_code}</code>
+        </div>
+      ) : null}
+      <dl className="source-health-metadata">
+        <div>
+          <dt>Last poll</dt>
+          <dd>{sourceTimestamp(source.last_polled_at)}</dd>
+        </div>
+        <div>
+          <dt>Last success</dt>
+          <dd>{sourceTimestamp(source.last_success_at)}</dd>
+        </div>
+        <div>
+          <dt>Latest usable items</dt>
+          <dd>{source.last_item_count}</dd>
+        </div>
+        <div>
+          <dt>Items seen in 10 days</dt>
+          <dd>{source.recent_items}</dd>
+        </div>
+      </dl>
+    </li>
+  );
+}
+
+function sourceTimestamp(value: string) {
+  return value ? formatIndiaDateTime(value) : "Not available";
 }
 
 function LessonNowPanel({

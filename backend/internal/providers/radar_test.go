@@ -12,8 +12,7 @@ func TestRadarEnrichmentFallsBackAcrossFreeProvidersOnly(t *testing.T) {
 	}}
 	gemini := &fakeProvider{name: "gemini", configured: true, responses: []any{
 		map[string]string{
-			"what_changed":   "The runtime added a stable API and reduced cold starts.",
-			"why_it_matters": "This can simplify deployments that create instances frequently.",
+			"simple_explanation": "The runtime now has a stable API and starts faster. This can make frequent deployments simpler.",
 		},
 	}}
 	openAI := &fakeProvider{name: "openai", configured: true, responses: []any{
@@ -26,7 +25,7 @@ func TestRadarEnrichmentFallsBackAcrossFreeProvidersOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if enrichment.Provider != "gemini" || enrichment.Summary == "" || enrichment.WhyItMatters == "" {
+	if enrichment.Provider != "gemini" || enrichment.Explanation == "" {
 		t.Fatalf("enrichment = %#v", enrichment)
 	}
 	if openAI.calls != 0 {
@@ -43,5 +42,17 @@ func TestRadarEnrichmentReportsFailureForDeterministicFallback(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected an enrichment miss")
+	}
+	if !errors.Is(err, ErrFreeQuotaExhausted) {
+		t.Fatalf("error = %v, want free-quota classification", err)
+	}
+}
+
+func TestRadarEnrichmentReportsMissingFreeProvider(t *testing.T) {
+	_, err := NewRouter(nil, nil, &fakeProvider{
+		name: "openai", configured: true,
+	}).EnrichRadar(context.Background(), RadarInput{Title: "A release", Summary: "Details"})
+	if !errors.Is(err, ErrNoFreeProviderConfigured) {
+		t.Fatalf("error = %v, want missing free-provider classification", err)
 	}
 }

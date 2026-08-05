@@ -23,7 +23,8 @@ func TestDeterministicRadarBriefingAlwaysFitsOneTelegramMessage(t *testing.T) {
 		Title:    "Runtime 2.0 is generally available",
 		Summary: "We are thrilled to announce a world-class release. " + detail +
 			"Register now.",
-		WhyItMatters: radarDeveloperContext(string(radar.CategoryRelease)),
+		WhyItMatters:      radarDeveloperContext(string(radar.CategoryRelease)),
+		SimpleExplanation: "This runtime changed how requests are routed. Developers should review compatibility before upgrading.",
 		Source: radar.SourceReference{
 			Name: "Runtime project", URL: "https://example.co/releases/2.0",
 		},
@@ -44,6 +45,9 @@ func TestDeterministicRadarBriefingAlwaysFitsOneTelegramMessage(t *testing.T) {
 		!strings.Contains(briefing, "https://news.ycombinator.com/item?id=42") {
 		t.Fatalf("briefing is missing source provenance: %s", briefing)
 	}
+	if !strings.Contains(briefing, "Simple explanation") {
+		t.Fatalf("briefing lost the optional AI explanation: %s", briefing)
+	}
 	message := html.EscapeString(briefing)
 	if strings.TrimSpace(message) == "" {
 		t.Fatal("Radar message is empty")
@@ -62,12 +66,15 @@ func TestRadarRankWorkIsSplitIntoServerlessSizedBatches(t *testing.T) {
 	}
 }
 
-func TestRadarEnrichmentCannotReplaceDetailWithAHeadline(t *testing.T) {
+func TestRadarSimpleExplanationMustContainUsefulDetail(t *testing.T) {
 	source := strings.Repeat("Detailed source fact. ", 60)
-	if radarEnrichmentDetailedEnough(source, "Short headline.") {
-		t.Fatal("an underspecified enrichment replaced detailed source evidence")
+	if radarExplanationDetailedEnough(source, "Short headline.") {
+		t.Fatal("an underspecified explanation was accepted")
 	}
-	if !radarEnrichmentDetailedEnough("Short source.", "A clear rewritten source explanation.") {
+	if !radarExplanationDetailedEnough(
+		"Short source.",
+		"This is a clear, simple explanation of the source and why a developer may care.",
+	) {
 		t.Fatal("a sufficiently detailed enrichment was rejected")
 	}
 }

@@ -72,6 +72,23 @@ export type Operations = {
   sources: number;
   blocked_jobs: { id: string; created_at: string; attempt_count: number }[];
   failed_jobs: FailedJob[];
+  source_health: SourceHealth[];
+};
+
+export type SourceHealth = {
+  id: string;
+  publisher: string;
+  fetch_method: string;
+  source_role: string;
+  poll_state: "never" | "healthy" | "degraded" | "failed";
+  consecutive_failures: number;
+  last_polled_at: string;
+  last_success_at: string;
+  last_error_code: string;
+  last_error_summary: string;
+  last_error_at: string;
+  last_item_count: number;
+  recent_items: number;
 };
 
 export type JobFailureEvent = {

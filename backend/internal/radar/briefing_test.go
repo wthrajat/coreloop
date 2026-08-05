@@ -24,11 +24,12 @@ func TestNeutralTextRemovesMarketingButKeepsFacts(t *testing.T) {
 
 func TestRenderBriefingIncludesDetailedFactsAndEveryValidSource(t *testing.T) {
 	got, err := RenderBriefing(BriefingInput{
-		Category:     CategoryProductUpdate,
-		Title:        "EC2 I8g instances now available in Paris and Jakarta",
-		Summary:      "I8g instances use Graviton4 processors and local Nitro NVMe storage. AWS reports up to 65% better real-time storage performance per TB than I4g.",
-		WhyItMatters: "This affects teams evaluating storage-intensive workloads in these regions.",
-		Source:       SourceReference{Name: "AWS What's New", URL: "http://aws.amazon.com/about-aws/whats-new/example?utm_source=rss#top"},
+		Category:          CategoryProductUpdate,
+		Title:             "EC2 I8g instances now available in Paris and Jakarta",
+		Summary:           "I8g instances use Graviton4 processors and local Nitro NVMe storage. AWS reports up to 65% better real-time storage performance per TB than I4g.",
+		WhyItMatters:      "This affects teams evaluating storage-intensive workloads in these regions.",
+		SimpleExplanation: "These are faster storage-focused virtual machines. Teams with heavy disk workloads can compare them with their current instances.",
+		Source:            SourceReference{Name: "AWS What's New", URL: "http://aws.amazon.com/about-aws/whats-new/example?utm_source=rss#top"},
 		DiscoveredVia: []SourceReference{
 			{Name: "Hacker News", URL: "https://news.ycombinator.com/item?id=123"},
 			{Name: "Duplicate AWS", URL: "https://aws.amazon.com/about-aws/whats-new/example"},
@@ -40,7 +41,7 @@ func TestRenderBriefingIncludesDetailedFactsAndEveryValidSource(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"Product update · AWS What's New", "What happened", "Graviton4 processors",
-		"65% better real-time storage performance", "Why it matters",
+		"65% better real-time storage performance", "Why it matters", "Simple explanation",
 		"https://aws.amazon.com/about-aws/whats-new/example",
 		"Hacker News: https://news.ycombinator.com/item?id=123",
 	} {
@@ -50,6 +51,30 @@ func TestRenderBriefingIncludesDetailedFactsAndEveryValidSource(t *testing.T) {
 	}
 	if strings.Contains(got, "Broken") || strings.Contains(got, "Duplicate AWS") || strings.Contains(got, "utm_source") {
 		t.Fatalf("briefing retained an invalid or tracking source:\n%s", got)
+	}
+}
+
+func TestRenderBriefingShowsAIQuotaWithoutDroppingSourceFacts(t *testing.T) {
+	got, err := RenderBriefing(BriefingInput{
+		Category:          CategoryEngineering,
+		Title:             "Database recovery analysis",
+		Summary:           "The source describes a failed replica and the recovery sequence.",
+		WhyItMatters:      "The incident shows how recovery order affects reliability.",
+		SimpleExplanation: "AI summary unavailable: free AI quota is exhausted.",
+		Source:            SourceReference{Name: "Engineering Blog", URL: "https://example.co/recovery"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"The source describes a failed replica",
+		"Simple explanation",
+		"AI summary unavailable: free AI quota is exhausted.",
+		"https://example.co/recovery",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("briefing missing %q:\n%s", expected, got)
+		}
 	}
 }
 

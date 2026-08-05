@@ -31,21 +31,39 @@ type FailedJob struct {
 	Failures         []JobFailureEvent `json:"failures"`
 }
 
+type SourceHealth struct {
+	ID                  string `json:"id"`
+	Publisher           string `json:"publisher"`
+	FetchMethod         string `json:"fetch_method"`
+	Role                string `json:"source_role"`
+	PollState           string `json:"poll_state"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastPolledAt        string `json:"last_polled_at"`
+	LastSuccessAt       string `json:"last_success_at"`
+	LastErrorCode       string `json:"last_error_code"`
+	LastErrorSummary    string `json:"last_error_summary"`
+	LastErrorAt         string `json:"last_error_at"`
+	LastItemCount       int    `json:"last_item_count"`
+	RecentItems         int    `json:"recent_items"`
+}
+
 type Operations struct {
-	Queued       int          `json:"queued"`
-	Leased       int          `json:"leased"`
-	Failed       int          `json:"failed"`
-	BlockedQuota int          `json:"blocked_quota"`
-	Users        int          `json:"users"`
-	Sources      int          `json:"sources"`
-	BlockedJobs  []BlockedJob `json:"blocked_jobs"`
-	FailedJobs   []FailedJob  `json:"failed_jobs"`
+	Queued       int            `json:"queued"`
+	Leased       int            `json:"leased"`
+	Failed       int            `json:"failed"`
+	BlockedQuota int            `json:"blocked_quota"`
+	Users        int            `json:"users"`
+	Sources      int            `json:"sources"`
+	BlockedJobs  []BlockedJob   `json:"blocked_jobs"`
+	FailedJobs   []FailedJob    `json:"failed_jobs"`
+	SourceHealth []SourceHealth `json:"source_health"`
 }
 
 func (store *Store) Operations(ctx context.Context) (Operations, error) {
 	value := Operations{
-		BlockedJobs: make([]BlockedJob, 0),
-		FailedJobs:  make([]FailedJob, 0),
+		BlockedJobs:  make([]BlockedJob, 0),
+		FailedJobs:   make([]FailedJob, 0),
+		SourceHealth: make([]SourceHealth, 0),
 	}
 	if err := store.database.QueryRowContext(ctx, `SELECT
 		(SELECT COUNT(*) FROM job_queue WHERE state='queued'),
@@ -81,7 +99,54 @@ func (store *Store) Operations(ctx context.Context) (Operations, error) {
 	if err := store.loadFailedJobs(ctx, &value); err != nil {
 		return value, err
 	}
+	if err := store.loadSourceHealth(ctx, &value); err != nil {
+		return value, err
+	}
 	return value, nil
+}
+
+func (store *Store) loadSourceHealth(ctx context.Context, operations *Operations) error {
+	rows, err := store.database.QueryContext(ctx, `WITH recent AS (
+		SELECT source_id,COUNT(*) AS item_count
+		FROM source_items
+		WHERE retrieved_at>=strftime('%Y-%m-%dT%H:%M:%fZ','now','-10 days')
+		GROUP BY source_id
+	)
+	SELECT s.id,s.publisher,s.fetch_method,s.source_role,s.last_poll_state,
+		s.consecutive_failures,COALESCE(s.last_polled_at,''),COALESCE(s.last_success_at,''),
+		COALESCE(s.last_error_code,''),COALESCE(s.last_error_summary,''),
+		COALESCE(s.last_error_at,''),s.last_item_count,COALESCE(recent.item_count,0)
+	FROM sources s LEFT JOIN recent ON recent.source_id=s.id
+	WHERE s.enabled=1
+	ORDER BY CASE s.last_poll_state
+		WHEN 'failed' THEN 0 WHEN 'degraded' THEN 1 WHEN 'never' THEN 2 ELSE 3 END,
+		s.consecutive_failures DESC,s.publisher`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var source SourceHealth
+		if err := rows.Scan(
+			&source.ID,
+			&source.Publisher,
+			&source.FetchMethod,
+			&source.Role,
+			&source.PollState,
+			&source.ConsecutiveFailures,
+			&source.LastPolledAt,
+			&source.LastSuccessAt,
+			&source.LastErrorCode,
+			&source.LastErrorSummary,
+			&source.LastErrorAt,
+			&source.LastItemCount,
+			&source.RecentItems,
+		); err != nil {
+			return err
+		}
+		operations.SourceHealth = append(operations.SourceHealth, source)
+	}
+	return rows.Err()
 }
 
 func (store *Store) loadFailedJobs(ctx context.Context, operations *Operations) error {

@@ -11,7 +11,7 @@ import (
 
 const (
 	radarProviderTimeout = 5 * time.Second
-	radarOutputBudget    = 600
+	radarOutputBudget    = 400
 )
 
 type RadarInput struct {
@@ -22,10 +22,9 @@ type RadarInput struct {
 }
 
 type RadarEnrichment struct {
-	Summary      string `json:"what_changed"`
-	WhyItMatters string `json:"why_it_matters"`
-	Provider     string `json:"-"`
-	Model        string `json:"-"`
+	Explanation string `json:"simple_explanation"`
+	Provider    string `json:"-"`
+	Model       string `json:"-"`
 }
 
 // EnrichRadar tries configured free providers with a deliberately small input
@@ -33,27 +32,23 @@ type RadarEnrichment struct {
 // deterministic rendering.
 func (router *Router) EnrichRadar(ctx context.Context, input RadarInput) (RadarEnrichment, error) {
 	if router == nil {
-		return RadarEnrichment{}, errors.New("AI provider router is unavailable")
+		return RadarEnrichment{}, ErrNoFreeProviderConfigured
 	}
 	encodedInput, err := json.Marshal(input)
 	if err != nil {
 		return RadarEnrichment{}, err
 	}
-	system := "Rewrite one important technology-news item in simple, neutral English. " +
-		"Use only facts present in the supplied title and summary. Do not add claims, " +
-		"predictions, praise, calls to action, or links. Be concise: for an application " +
-		"or library version release, use at most two short what_changed sentences and one " +
-		"short why_it_matters sentence. Use extra detail only for a consequential incident, " +
-		"genuinely new capability, substantial engineering analysis, or important research. " +
-		"why_it_matters should explain what a developer can learn or may need to change " +
-		"without claiming facts absent from the source."
+	system := "Explain one technology-news item in very simple, neutral English. " +
+		"Use only facts present in the supplied title and summary. Write two to four short " +
+		"sentences explaining what happened and why a developer may care. Briefly define an " +
+		"unfamiliar technical term in parentheses when useful. Do not add claims, predictions, " +
+		"praise, calls to action, or links. Keep routine version releases especially short."
 	schema := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"what_changed":   map[string]any{"type": "string"},
-			"why_it_matters": map[string]any{"type": "string"},
+			"simple_explanation": map[string]any{"type": "string"},
 		},
-		"required":             []string{"what_changed", "why_it_matters"},
+		"required":             []string{"simple_explanation"},
 		"additionalProperties": false,
 	}
 	var failures []error
@@ -75,9 +70,8 @@ func (router *Router) EnrichRadar(ctx context.Context, input RadarInput) (RadarE
 			failures = append(failures, fmt.Errorf("%s Radar output is invalid JSON: %w", provider.Name(), err))
 			continue
 		}
-		enrichment.Summary = strings.TrimSpace(enrichment.Summary)
-		enrichment.WhyItMatters = strings.TrimSpace(enrichment.WhyItMatters)
-		if enrichment.Summary == "" || len([]rune(enrichment.Summary)) > 6_000 || len([]rune(enrichment.WhyItMatters)) > 2_500 {
+		enrichment.Explanation = strings.TrimSpace(enrichment.Explanation)
+		if enrichment.Explanation == "" || len([]rune(enrichment.Explanation)) > 2_500 {
 			failures = append(failures, fmt.Errorf("%s Radar output is outside accepted bounds", provider.Name()))
 			continue
 		}
@@ -85,7 +79,11 @@ func (router *Router) EnrichRadar(ctx context.Context, input RadarInput) (RadarE
 		return enrichment, nil
 	}
 	if len(failures) == 0 {
-		return RadarEnrichment{}, errors.New("no free AI provider is configured")
+		return RadarEnrichment{}, ErrNoFreeProviderConfigured
 	}
-	return RadarEnrichment{}, errors.Join(failures...)
+	joined := errors.Join(failures...)
+	if everyFailureIsQuotaExhaustion(failures) {
+		return RadarEnrichment{}, fmt.Errorf("%w: %v", ErrFreeQuotaExhausted, joined)
+	}
+	return RadarEnrichment{}, joined
 }

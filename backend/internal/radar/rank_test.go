@@ -78,6 +78,60 @@ func TestCalculateScoreUsesCommunityInterestOnlyWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestEditorialDecisionKeepsRelevantHackerNewsStory(t *testing.T) {
+	input := ScoreInput{
+		Title:                     "PostgreSQL replication failure analysis",
+		Summary:                   "Engineers discuss a database outage, recovery, and reliability trade-offs.",
+		TopicTerms:                []string{"backend engineering", "database", "reliability", "cloud architecture"},
+		SourceTier:                3,
+		SourceRole:                "community_discovery",
+		PublishedAgeHours:         4,
+		Category:                  CategoryEngineering,
+		CommunityPoints:           280,
+		CommunityComments:         95,
+		CommunitySignalsAvailable: true,
+	}
+	score := CalculateScore(input)
+	if decision := DecideEditorialEligibility(input, score); !decision.Eligible {
+		t.Fatalf("relevant Hacker News story was rejected: score=%#v decision=%#v", score, decision)
+	}
+}
+
+func TestEditorialDecisionKeepsRelevantCuratedCommunityFeedItem(t *testing.T) {
+	input := ScoreInput{
+		Title:             "Lightning node database reliability postmortem",
+		Summary:           "A technical discussion explains recovery, protocol, and performance lessons.",
+		TopicTerms:        []string{"bitcoin", "lightning", "database", "reliability", "backend engineering"},
+		SourceTier:        3,
+		SourceRole:        "community_discovery",
+		PublishedAgeHours: 5,
+		Category:          CategoryEngineering,
+	}
+	score := CalculateScore(input)
+	if score.CommunityInterest != 0.68 {
+		t.Fatalf("curated community baseline = %f, want 0.68", score.CommunityInterest)
+	}
+	if decision := DecideEditorialEligibility(input, score); !decision.Eligible {
+		t.Fatalf("relevant Stacker News item was rejected: score=%#v decision=%#v", score, decision)
+	}
+}
+
+func TestEditorialDecisionStillRejectsUnrelatedCommunityItem(t *testing.T) {
+	input := ScoreInput{
+		Title:             "Favorite desk colors this week",
+		Summary:           "A casual collection of home-office photographs.",
+		TopicTerms:        []string{"database", "security", "backend engineering", "distributed systems"},
+		SourceTier:        3,
+		SourceRole:        "community_discovery",
+		PublishedAgeHours: 2,
+		Category:          CategoryDiscussion,
+	}
+	score := CalculateScore(input)
+	if decision := DecideEditorialEligibility(input, score); decision.Eligible {
+		t.Fatalf("unrelated community item passed: score=%#v decision=%#v", score, decision)
+	}
+}
+
 func TestEditorialDecisionSuppressesRoutineCVEBulletins(t *testing.T) {
 	input := ScoreInput{
 		Title:             "CVE-2026-12345 security advisory",

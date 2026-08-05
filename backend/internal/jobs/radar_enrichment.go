@@ -13,8 +13,21 @@ import (
 	"coreloop/backend/internal/store"
 )
 
-const radarEnrichmentVersion = "simple-neutral-v2"
+const radarEnrichmentVersion = "simple-explanation-v3"
 const maximumRadarAIInputRunes = 6_000
+
+const (
+	radarSummaryNoProvider = "AI summary unavailable: no free AI provider is configured."
+	radarSummaryQuota      = "AI summary unavailable: free AI quota is exhausted."
+	radarSummaryTemporary  = "AI summary unavailable right now."
+	radarSummaryNoDetail   = "AI summary unavailable: the source did not provide enough detail to simplify safely."
+)
+
+type radarBriefingSections struct {
+	SourceSummary     string
+	DeveloperContext  string
+	SimpleExplanation string
+}
 
 // radarBriefingContent is deliberately fail-open. Every cache, provider,
 // validation, and persistence failure returns deterministic content rather than
@@ -22,11 +35,20 @@ const maximumRadarAIInputRunes = 6_000
 func (service *Service) radarBriefingContent(
 	ctx context.Context,
 	candidate store.RadarCandidate,
-) (string, string) {
+) radarBriefingSections {
 	deterministicSummary := candidate.Summary
 	deterministicContext := radarDeveloperContext(candidate.Category)
-	if service.providers == nil || deterministicSummary == "" {
-		return deterministicSummary, deterministicContext
+	sections := radarBriefingSections{
+		SourceSummary:    deterministicSummary,
+		DeveloperContext: deterministicContext,
+	}
+	if deterministicSummary == "" {
+		sections.SimpleExplanation = radarSummaryNoDetail
+		return sections
+	}
+	if service.providers == nil {
+		sections.SimpleExplanation = radarSummaryNoProvider
+		return sections
 	}
 	inputHash := radarEnrichmentHash(candidate)
 	cached, err := service.store.RadarEnrichment(
@@ -34,7 +56,8 @@ func (service *Service) radarBriefingContent(
 	)
 	if err == nil {
 		slog.InfoContext(ctx, "Radar enrichment cache hit", "source_item_id", candidate.SourceItemID)
-		return cached.Summary, cached.WhyItMatters
+		sections.SimpleExplanation = cached.Summary
+		return sections
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		slog.WarnContext(ctx, "Radar enrichment cache unavailable", "error", err)
@@ -44,21 +67,31 @@ func (service *Service) radarBriefingContent(
 		Title: candidate.Title, Summary: compactRadarAIInput(deterministicSummary),
 	})
 	if err != nil {
-		slog.InfoContext(ctx, "Radar AI enrichment unavailable; deterministic fallback selected", "error", err)
-		return deterministicSummary, deterministicContext
+		reason := "provider_failure"
+		sections.SimpleExplanation = radarSummaryTemporary
+		switch {
+		case errors.Is(err, providers.ErrFreeQuotaExhausted):
+			reason = "free_quota_exhausted"
+			sections.SimpleExplanation = radarSummaryQuota
+		case errors.Is(err, providers.ErrNoFreeProviderConfigured):
+			reason = "no_free_provider"
+			sections.SimpleExplanation = radarSummaryNoProvider
+		}
+		slog.InfoContext(ctx, "Radar AI summary unavailable; source-backed delivery continues",
+			"reason", reason, "source_item_id", candidate.SourceItemID)
+		return sections
 	}
-	enrichment.Summary = radar.NeutralText(enrichment.Summary)
-	enrichment.WhyItMatters = radar.NeutralText(enrichment.WhyItMatters)
-	if !radarEnrichmentDetailedEnough(deterministicSummary, enrichment.Summary) {
-		return deterministicSummary, deterministicContext
-	}
-	if enrichment.WhyItMatters == "" {
-		enrichment.WhyItMatters = deterministicContext
+	enrichment.Explanation = radar.NeutralText(enrichment.Explanation)
+	if !radarExplanationDetailedEnough(deterministicSummary, enrichment.Explanation) {
+		sections.SimpleExplanation = radarSummaryTemporary
+		slog.InfoContext(ctx, "Radar AI summary rejected; source-backed delivery continues",
+			"reason", "explanation_too_shallow", "source_item_id", candidate.SourceItemID)
+		return sections
 	}
 	slog.InfoContext(ctx, "Radar AI enrichment completed", "provider", enrichment.Provider,
 		"model", enrichment.Model, "source_item_id", candidate.SourceItemID)
 	cacheValue := store.RadarEnrichment{
-		Summary: enrichment.Summary, WhyItMatters: enrichment.WhyItMatters,
+		Summary: enrichment.Explanation, WhyItMatters: "",
 		Provider: enrichment.Provider, Model: enrichment.Model,
 	}
 	if err := service.store.SaveRadarEnrichment(
@@ -67,7 +100,8 @@ func (service *Service) radarBriefingContent(
 	); err != nil {
 		slog.WarnContext(ctx, "Radar enrichment could not be cached", "error", err)
 	}
-	return cacheValue.Summary, cacheValue.WhyItMatters
+	sections.SimpleExplanation = cacheValue.Summary
+	return sections
 }
 
 func compactRadarAIInput(value string) string {
@@ -78,13 +112,13 @@ func compactRadarAIInput(value string) string {
 	return string(runes[:maximumRadarAIInputRunes])
 }
 
-func radarEnrichmentDetailedEnough(sourceSummary, enrichedSummary string) bool {
-	enrichedLength := len([]rune(enrichedSummary))
-	if enrichedLength == 0 {
+func radarExplanationDetailedEnough(sourceSummary, explanation string) bool {
+	explanationLength := len([]rune(explanation))
+	if explanationLength == 0 {
 		return false
 	}
-	minimum := len([]rune(sourceSummary)) / 3
-	return enrichedLength >= minimum
+	minimum := min(120, max(40, len([]rune(sourceSummary))/5))
+	return explanationLength >= minimum
 }
 
 func radarEnrichmentHash(candidate store.RadarCandidate) string {

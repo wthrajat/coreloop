@@ -86,6 +86,39 @@ func TestFetchHackerNewsKeepsOriginalAndDiscussionSources(t *testing.T) {
 	}
 }
 
+func TestFetchHackerNewsReportsPartialChildFailures(t *testing.T) {
+	service := sourceTestService(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/v0/beststories.json":
+			return sourceResponse(http.StatusOK, `[42,43]`), nil
+		case "/v0/item/42.json":
+			return sourceResponse(http.StatusOK, `{"id":42,"type":"story","title":"Database reliability notes","url":"https://example.co/reliability","time":1785913200,"score":100,"descendants":20}`), nil
+		case "/v0/item/43.json":
+			return sourceResponse(http.StatusTooManyRequests, ``), nil
+		default:
+			t.Fatalf("unexpected path %q", request.URL.Path)
+			return nil, nil
+		}
+	})
+	result, err := service.fetchSource(context.Background(), store.SourceRecord{
+		URL:           "https://hacker-news.firebaseio.com/v0/beststories.json",
+		AdapterConfig: `{"adapter":"hacker_news","item_limit":5}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.AttemptedItems != 2 || result.FailedItems != 1 {
+		t.Fatalf("partial HN result = %#v", result)
+	}
+}
+
+func TestSourcePollDiagnosticDoesNotExposeResponseDetails(t *testing.T) {
+	code, summary := sourcePollDiagnostic(sourceHTTPError{StatusCode: http.StatusTooManyRequests})
+	if code != "source_http_error" || summary != "The source returned HTTP 429." {
+		t.Fatalf("diagnostic = %q %q", code, summary)
+	}
+}
+
 func TestFetchBlueskyAuthorUsesEmbeddedOriginalSource(t *testing.T) {
 	service := sourceTestService(func(request *http.Request) (*http.Response, error) {
 		if request.URL.Path != "/xrpc/app.bsky.feed.getAuthorFeed" {
@@ -173,6 +206,27 @@ func TestFetchFeedResolvesRelativeArticleLinks(t *testing.T) {
 	}
 	if len(result.Items) != 1 || result.Items[0].URL != "https://example.co/news/update" {
 		t.Fatalf("items = %#v", result.Items)
+	}
+}
+
+func TestCommunityFeedPreservesDiscoveryProvenanceForOutboundLinks(t *testing.T) {
+	service := sourceTestService(func(*http.Request) (*http.Response, error) {
+		return sourceResponse(http.StatusOK, `<rss><channel><item><title>Database analysis</title><link>https://example.co/database</link><description>Technical details</description></item></channel></rss>`), nil
+	})
+	result, err := service.fetchSource(context.Background(), store.SourceRecord{
+		Publisher:     "Stacker News · Tech",
+		URL:           "https://stacker.news/~tech/rss",
+		Role:          "community_discovery",
+		AdapterConfig: `{"adapter":"feed"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || len(result.Items[0].DiscoveredVia) != 1 {
+		t.Fatalf("community discovery provenance = %#v", result.Items)
+	}
+	if result.Items[0].DiscoveredVia[0].URL != "https://stacker.news/~tech/rss" {
+		t.Fatalf("discovery = %#v", result.Items[0].DiscoveredVia)
 	}
 }
 

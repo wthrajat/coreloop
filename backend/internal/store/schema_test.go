@@ -114,6 +114,79 @@ func TestRequiredSchemaVersionMatchesLatestMigration(t *testing.T) {
 	}
 }
 
+func TestSourceHealthMigrationAddsSafeOperationalDiagnostics(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	migration, err := os.ReadFile(filepath.Join(projectRoot, "migrations", "0011_source_health.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToLower(string(migration))
+	for _, required := range []string{
+		"last_poll_state",
+		"last_success_at",
+		"last_error_code",
+		"last_error_summary",
+		"last_item_count",
+		"radar-reindex:deterministic-editorial-v4",
+		"source_position <= 25",
+		"values (11, 'source_health')",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("source-health migration is missing %q", required)
+		}
+	}
+}
+
+func TestSourceHealthMigrationQueuesBoundedFreshRadarReindex(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	var script strings.Builder
+	for version := 1; version <= 10; version++ {
+		matches, err := filepath.Glob(filepath.Join(
+			projectRoot,
+			"migrations",
+			fmt.Sprintf("%04d_*.sql", version),
+		))
+		if err != nil || len(matches) != 1 {
+			t.Fatalf("resolve migration %d: %v, matches=%v", version, err, matches)
+		}
+		script.WriteString(".read " + matches[0] + "\n")
+	}
+	script.WriteString(`WITH RECURSIVE numbers(value) AS (
+		SELECT 1 UNION ALL SELECT value+1 FROM numbers WHERE value<26
+	) INSERT INTO source_items(
+		id,source_id,canonical_url,normalized_url,title,published_at,retrieved_at,
+		content_hash,evidence_json
+	) SELECT
+		'reindex-'||value,CASE WHEN value<=13 THEN 'source_hacker_news' ELSE 'source_stacker_news' END,'https://example.co/'||value,
+		'https://example.co/'||value,'Fresh item '||value,
+		strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		'hash-'||value,'{}' FROM numbers;` + "\n")
+	script.WriteString(".read " + filepath.Join(
+		projectRoot,
+		"migrations",
+		"0011_source_health.sql",
+	) + "\n")
+	script.WriteString(`SELECT COUNT(*)||','||SUM(json_array_length(json_extract(payload_json,'$.source_item_ids'))) FROM job_queue WHERE idempotency_key LIKE 'radar-reindex:deterministic-editorial-v4:%';` + "\n")
+
+	command := exec.Command("sqlite3", ":memory:")
+	command.Stdin = strings.NewReader(script.String())
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run populated source-health migration: %v: %s", err, output)
+	}
+	if strings.TrimSpace(string(output)) != "2,26" {
+		t.Fatalf("Radar reindex migration state = %s, want two jobs with 26 source-balanced items", output)
+	}
+}
+
 func TestRadarQualityMigrationContainsDurableFallbackAndFrequencyState(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {

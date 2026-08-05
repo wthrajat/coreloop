@@ -77,7 +77,10 @@ func NewRouter(groq, gemini, openAI Provider) *Router {
 	}
 }
 
-var ErrFreeQuotaExhausted = errors.New("all configured free AI providers are unavailable or out of quota")
+var (
+	ErrFreeQuotaExhausted       = errors.New("all configured free AI providers are unavailable or out of quota")
+	ErrNoFreeProviderConfigured = errors.New("no free AI provider is configured")
+)
 
 func (router *Router) Generate(ctx context.Context, lessonContext content.LessonContext) (content.Generated, error) {
 	var failures []error

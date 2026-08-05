@@ -29,7 +29,7 @@ type radarReleaseUser struct {
 
 type radarReleaseCandidate struct {
 	ID, SourceID, SourceFamily string
-	URL                        string
+	URL, DiscoveryJSON         string
 	Score                      float64
 }
 
@@ -334,22 +334,21 @@ func radarSourceUsage(
 	dayStart time.Time,
 	dayEnd time.Time,
 ) (map[string]int, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT si.source_id,COUNT(*)
+	rows, err := tx.QueryContext(ctx, `SELECT si.source_id,si.discovery_json
 		FROM radar_candidates rc JOIN source_items si ON si.id=rc.source_item_id
 		WHERE rc.user_id=? AND rc.released_at>=? AND rc.released_at<?
-		GROUP BY si.source_id`, userID, timestamp(dayStart), timestamp(dayEnd))
+		ORDER BY rc.released_at,rc.id`, userID, timestamp(dayStart), timestamp(dayEnd))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	usage := map[string]int{}
 	for rows.Next() {
-		var sourceID string
-		var count int
-		if err := rows.Scan(&sourceID, &count); err != nil {
+		var sourceID, discoveryJSON string
+		if err := rows.Scan(&sourceID, &discoveryJSON); err != nil {
 			return nil, err
 		}
-		usage[radarSourceFamily(sourceID)] += count
+		usage[radarSourceFamily(sourceID, discoveryJSON)]++
 	}
 	return usage, rows.Err()
 }
@@ -371,7 +370,7 @@ func radarCandidatePool(
 ) ([]radarReleaseCandidate, error) {
 	perSourceLimit := max(2, min(requestedCount, maximumUnlimitedReleasePass))
 	rows, err := queryer.QueryContext(ctx, `WITH eligible AS (
-		SELECT rc.id,si.source_id,si.normalized_url,rc.relevance_score,
+		SELECT rc.id,si.source_id,si.normalized_url,si.discovery_json,rc.relevance_score,
 			COALESCE(si.published_at,si.retrieved_at) AS freshness,
 			rc.created_at,
 			ROW_NUMBER() OVER (
@@ -386,7 +385,7 @@ func radarCandidatePool(
 			AND rc.ranker_version=? AND rc.relevance_score>=?
 			AND COALESCE(si.published_at,si.retrieved_at)>=?
 	)
-	SELECT id,source_id,normalized_url,relevance_score
+	SELECT id,source_id,normalized_url,discovery_json,relevance_score
 	FROM eligible WHERE source_position<=?
 	ORDER BY relevance_score DESC,freshness DESC,created_at,id`,
 		userID, radar.RankerVersion, radar.MinimumDeliveryScore,
@@ -403,6 +402,7 @@ func radarCandidatePool(
 			&candidate.ID,
 			&candidate.SourceID,
 			&candidate.URL,
+			&candidate.DiscoveryJSON,
 			&candidate.Score,
 		); err != nil {
 			return nil, err
@@ -410,13 +410,34 @@ func radarCandidatePool(
 		if _, err := radar.CanonicalURL(candidate.URL); err != nil {
 			continue
 		}
-		candidate.SourceFamily = radarSourceFamily(candidate.SourceID)
+		candidate.SourceFamily = radarSourceFamily(
+			candidate.SourceID,
+			candidate.DiscoveryJSON,
+		)
 		pool = append(pool, candidate)
 	}
 	return pool, rows.Err()
 }
 
-func radarSourceFamily(sourceID string) string {
+func radarSourceFamily(sourceID string, discoveryJSON ...string) string {
+	if len(discoveryJSON) > 0 {
+		var discovery []radar.SourceReference
+		if json.Unmarshal([]byte(discoveryJSON[0]), &discovery) == nil {
+			for _, reference := range discovery {
+				lowerURL := strings.ToLower(reference.URL)
+				switch {
+				case strings.Contains(lowerURL, "news.ycombinator.com/"):
+					return "hacker_news"
+				case strings.Contains(lowerURL, "stacker.news/"):
+					return "stacker_news"
+				case strings.Contains(lowerURL, "lobste.rs/"):
+					return "lobsters"
+				case strings.Contains(lowerURL, "bsky.app/"):
+					return "bluesky"
+				}
+			}
+		}
+	}
 	switch {
 	case sourceID == "source_hacker_news":
 		return "hacker_news"
@@ -424,6 +445,8 @@ func radarSourceFamily(sourceID string) string {
 		return "stacker_news"
 	case strings.HasPrefix(sourceID, "source_arxiv_"):
 		return "arxiv"
+	case sourceID == "source_lobsters":
+		return "lobsters"
 	case strings.HasSuffix(sourceID, "_bluesky"):
 		return "bluesky"
 	default:
@@ -438,7 +461,10 @@ func diverseRadarCandidates(pool []radarReleaseCandidate, historicalUsage map[st
 	ranked := append([]radarReleaseCandidate(nil), pool...)
 	for index := range ranked {
 		if ranked[index].SourceFamily == "" {
-			ranked[index].SourceFamily = radarSourceFamily(ranked[index].SourceID)
+			ranked[index].SourceFamily = radarSourceFamily(
+				ranked[index].SourceID,
+				ranked[index].DiscoveryJSON,
+			)
 		}
 	}
 	sort.SliceStable(ranked, func(left, right int) bool {
