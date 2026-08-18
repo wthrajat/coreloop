@@ -1,4 +1,4 @@
-# Coreloop
+<h1 align="center">Coreloop</h1>
 
 <p align="center">
   <strong>A private, self-hosted learning and news loop that arrives in Telegram.</strong>
@@ -17,6 +17,17 @@
   <code>AI-optional news</code>
   &nbsp;·&nbsp;
   <code>Built for free tiers</code>
+</p>
+
+<p align="center">
+  <img alt="Next.js" src="https://img.shields.io/badge/Next.js-000000?style=flat-square&amp;logo=nextdotjs&amp;logoColor=white" />
+  <img alt="React" src="https://img.shields.io/badge/React-20232A?style=flat-square&amp;logo=react&amp;logoColor=61DAFB" />
+  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&amp;logo=typescript&amp;logoColor=white" />
+  <img alt="Go" src="https://img.shields.io/badge/Go-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white" />
+  <img alt="Turso" src="https://img.shields.io/badge/Turso-4FF8D2?style=flat-square&amp;logo=turso&amp;logoColor=111827" />
+  <img alt="QStash" src="https://img.shields.io/badge/QStash-00E9A3?style=flat-square&amp;logo=upstash&amp;logoColor=111827" />
+  <img alt="Telegram" src="https://img.shields.io/badge/Telegram-26A5E4?style=flat-square&amp;logo=telegram&amp;logoColor=white" />
+  <img alt="Vercel" src="https://img.shields.io/badge/Vercel-000000?style=flat-square&amp;logo=vercel&amp;logoColor=white" />
 </p>
 
 <table>
