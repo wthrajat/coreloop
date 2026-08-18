@@ -96,7 +96,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </span>
           <span>
             <strong>Coreloop</strong>
-            <small>Private learning system</small>
+            <small>Learning and news loop</small>
           </span>
         </Link>
         <AppNavigation owner={session.owner} />

@@ -449,6 +449,22 @@ func radarSourceFamily(sourceID string, discoveryJSON ...string) string {
 		return "lobsters"
 	case strings.HasSuffix(sourceID, "_bluesky"):
 		return "bluesky"
+	case strings.HasPrefix(sourceID, "source_huggingface_"):
+		return "huggingface"
+	case strings.HasPrefix(sourceID, "source_cloudflare_"):
+		return "cloudflare"
+	case strings.HasPrefix(sourceID, "source_google_") || sourceID == "source_deepmind_blog":
+		return "google"
+	case strings.HasPrefix(sourceID, "source_github_"):
+		return "github"
+	case strings.HasPrefix(sourceID, "source_meta_"):
+		return "meta"
+	case strings.HasPrefix(sourceID, "source_microsoft_") ||
+		sourceID == "source_azure_updates" ||
+		sourceID == "source_msrc_blog" ||
+		sourceID == "source_typescript_blog" ||
+		sourceID == "source_dotnet_blog":
+		return "microsoft"
 	default:
 		return sourceID
 	}

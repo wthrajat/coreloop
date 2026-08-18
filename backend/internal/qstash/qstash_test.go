@@ -92,12 +92,12 @@ func TestPublisherPreservesDestinationURLInPublishPath(t *testing.T) {
 
 	publisher := NewPublisher("qstash-token", client)
 	publisher.baseURL = "https://qstash.upstash.io"
-	destination := "https://coreloop1.vercel.app/api/jobs/run"
+	destination := "https://coreloop.example/api/jobs/run"
 	if err := publisher.Publish(context.Background(), destination, "dispatch-job_1", map[string]string{"job_id": "job_1"}); err != nil {
 		t.Fatal(err)
 	}
 
-	if captured.escapedPath != "/v2/publish/https://coreloop1.vercel.app/api/jobs/run" {
+	if captured.escapedPath != "/v2/publish/https://coreloop.example/api/jobs/run" {
 		t.Fatalf("unexpected escaped path: %q", captured.escapedPath)
 	}
 	if captured.authorization != "Bearer qstash-token" {

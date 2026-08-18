@@ -173,6 +173,71 @@ func TestFetchSitemapFiltersPathsAndReadsNeutralPageMetadata(t *testing.T) {
 	}
 }
 
+func TestFetchHTMLListingFollowsOnlyAllowlistedArticleLinks(t *testing.T) {
+	service := sourceTestService(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.String() {
+		case "https://example.co/engineering/":
+			return sourceResponse(http.StatusOK, `<html><body>
+				<a href="/engineering/">Listing</a>
+				<a href="/engineering/runtime?utm_source=navigation#details">Runtime</a>
+				<a href="/engineering/runtime?utm_source=navigation#comments">Duplicate</a>
+				<a href="https://research.example.co/engineering/paper">Paper</a>
+				<a href="https://untrusted.example/engineering/trap">Untrusted</a>
+				<a href="/careers">Careers</a>
+			</body></html>`), nil
+		case "https://example.co/engineering/runtime?utm_source=navigation":
+			return sourceResponse(http.StatusOK, `<html><head><meta property="og:title" content="A faster runtime"><meta name="description" content="We are excited to announce a new runtime. It cuts startup latency by 40%."><meta property="article:published_time" content="2026-08-05T07:00:00Z"></head></html>`), nil
+		case "https://research.example.co/engineering/paper":
+			return sourceResponse(http.StatusOK, `<html><head><title>Distributed systems paper</title><meta name="description" content="A new consistency protocol."><meta name="date" content="2026-08-04"></head></html>`), nil
+		default:
+			t.Fatalf("unexpected URL %q", request.URL.String())
+			return nil, nil
+		}
+	})
+	result, err := service.fetchSource(context.Background(), store.SourceRecord{
+		URL:           "https://example.co/engineering/",
+		AdapterConfig: `{"adapter":"html_listing","item_limit":5,"path_prefixes":["/engineering/"],"allowed_hosts":["research.example.co"]}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 2 || result.AttemptedItems != 2 || result.FailedItems != 0 {
+		t.Fatalf("HTML listing result = %#v", result)
+	}
+	if result.Items[0].Title != "A faster runtime" ||
+		result.Items[0].Summary != "a new runtime. It cuts startup latency by 40%." {
+		t.Fatalf("first listing item = %#v", result.Items[0])
+	}
+	if result.Items[1].URL != "https://research.example.co/engineering/paper" {
+		t.Fatalf("allowlisted cross-host item = %#v", result.Items[1])
+	}
+}
+
+func TestFetchHTMLListingFailsWhenNoEligibleLinksExist(t *testing.T) {
+	service := sourceTestService(func(*http.Request) (*http.Response, error) {
+		return sourceResponse(http.StatusOK, `<a href="http://127.0.0.1/private">Private</a><a href="https://other.example/news">Other host</a>`), nil
+	})
+	_, err := service.fetchSource(context.Background(), store.SourceRecord{
+		URL:           "https://example.co/engineering/",
+		AdapterConfig: `{"adapter":"html_listing","path_prefixes":["/engineering/"]}`,
+	})
+	if err == nil || !strings.Contains(err.Error(), "no eligible page links") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestParsePageMetadataUsesJSONLDArticleFields(t *testing.T) {
+	title, summary, publishedAt := parsePageMetadata([]byte(`<html><head>
+		<script type="application/ld+json">{"@type":"TechArticle","headline":"Storage internals","description":"How the engine persists writes.","datePublished":"2026-08-03T09:30:00Z"}</script>
+	</head></html>`))
+	if title != "Storage internals" || summary != "How the engine persists writes." {
+		t.Fatalf("JSON-LD metadata = %q %q", title, summary)
+	}
+	if publishedAt.Format(time.RFC3339) != "2026-08-03T09:30:00Z" {
+		t.Fatalf("published at = %s", publishedAt)
+	}
+}
+
 func TestFetchFeedPreservesConditionalRequestState(t *testing.T) {
 	service := sourceTestService(func(request *http.Request) (*http.Response, error) {
 		if request.Header.Get("If-None-Match") != `"feed-v1"` {

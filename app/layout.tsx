@@ -21,7 +21,7 @@ export const metadata: Metadata = {
     template: "%s · Coreloop",
   },
   description:
-    "A private, Telegram-first system for coherent technical learning and current engineering signals.",
+    "A self-hosted, Telegram-first system for scheduled learning and source-backed news.",
 };
 
 export const viewport: Viewport = {

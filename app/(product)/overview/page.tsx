@@ -20,7 +20,7 @@ export default function OverviewPage() {
   }, []);
 
   if (!overview && !error)
-    return <PageLoading label="Loading your learning rhythm…" />;
+    return <PageLoading label="Loading your learning loop…" />;
   if (error) return <PageError message={error} />;
   if (!overview) return null;
 
@@ -33,10 +33,10 @@ export default function OverviewPage() {
     <div className="page-stack">
       <PageHeader
         title="Overview"
-        description="Your learning rhythm, delivery state, and current theme in one place."
+        description="Your lessons, delivery schedule, and current theme in one place."
         action={
           <Link className="button button-secondary" href="/settings">
-            Adjust learning
+            Edit your loop
           </Link>
         }
       />
@@ -63,7 +63,7 @@ export default function OverviewPage() {
           </h2>
           <p>
             {overview.active_topic
-              ? `Current topic: ${overview.active_topic}. Lessons continue from foundations through production decisions before the planner moves on.`
+              ? `Current topic: ${overview.active_topic}. Lessons continue from the basics through practical decisions before the planner moves on.`
               : "Your selected topics, level, duration, and recent coverage determine the first theme. The choice is saved before generation so topics do not repeat needlessly."}
           </p>
           <div className="button-row">
@@ -77,7 +77,7 @@ export default function OverviewPage() {
         </div>
         <div className="schedule-preview">
           <div className="section-heading compact-heading">
-            <h3>Next curriculum delivery</h3>
+            <h3>Next lesson</h3>
             <span>Asia/Kolkata</span>
           </div>
           <p className="next-delivery">{nextDelivery}</p>
@@ -92,7 +92,7 @@ export default function OverviewPage() {
             </div>
           </dl>
           <p className="schedule-caption">
-            Radar signals are ranked separately and may arrive outside this
+            News Radar runs separately and may deliver updates outside this
             window.
           </p>
         </div>
@@ -139,7 +139,7 @@ export default function OverviewPage() {
               </dd>
             </div>
             <div>
-              <dt>Curriculum queue</dt>
+              <dt>Lesson queue</dt>
               <dd>
                 <StatusPill tone={quotaBlocked ? "error" : "ready"}>
                   {quotaBlocked ? "Waiting for quota" : "Healthy"}

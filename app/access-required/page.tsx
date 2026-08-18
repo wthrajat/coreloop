@@ -6,11 +6,11 @@ export default function AccessRequiredPage() {
   return (
     <main className="centered-state">
       <span className="eyebrow">Invite-only</span>
-      <h1>Your learning profile starts from a private link.</h1>
+      <h1>Your Coreloop profile starts from a private link.</h1>
       <p>
         A friend who already owns this Coreloop instance can create a single-use
         link. Telegram confirms your identity and grants the bot permission to
-        deliver private messages; no email account or phone-number form is used.
+        deliver lessons and news; no email account or phone-number form is used.
       </p>
       <a
         className="button button-primary"

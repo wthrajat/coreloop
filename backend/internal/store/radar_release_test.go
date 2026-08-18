@@ -130,7 +130,7 @@ func TestDiverseRadarCandidatesBalancesAFullBatchAcrossSourceFamilies(t *testing
 	}
 	for _, family := range []string{
 		"arxiv", "hacker_news", "stacker_news",
-		"source_openai_news", "source_cloudflare_blog",
+		"source_openai_news", "cloudflare",
 	} {
 		if counts[family] != 4 {
 			t.Fatalf("family %q count = %d, want 4: %#v", family, counts[family], got)
@@ -153,13 +153,23 @@ func TestDiverseRadarCandidatesPrioritizesUnusedFamiliesAcrossTheDay(t *testing.
 
 func TestRadarSourceFamilyCombinesHighVolumeSiblings(t *testing.T) {
 	cases := map[string]string{
-		"source_arxiv_ai":          "arxiv",
-		"source_arxiv_ml":          "arxiv",
-		"source_stacker_tech":      "stacker_news",
-		"source_stacker_lightning": "stacker_news",
-		"source_hacker_news":       "hacker_news",
-		"source_lobsters":          "lobsters",
-		"source_openai_news":       "source_openai_news",
+		"source_arxiv_ai":             "arxiv",
+		"source_arxiv_ml":             "arxiv",
+		"source_stacker_tech":         "stacker_news",
+		"source_stacker_lightning":    "stacker_news",
+		"source_hacker_news":          "hacker_news",
+		"source_lobsters":             "lobsters",
+		"source_huggingface_blog":     "huggingface",
+		"source_huggingface_tgi":      "huggingface",
+		"source_cloudflare_blog":      "cloudflare",
+		"source_cloudflare_research":  "cloudflare",
+		"source_google_security_blog": "google",
+		"source_deepmind_blog":        "google",
+		"source_github_engineering":   "github",
+		"source_meta_ai":              "meta",
+		"source_typescript_blog":      "microsoft",
+		"source_msrc_blog":            "microsoft",
+		"source_openai_news":          "source_openai_news",
 	}
 	for sourceID, want := range cases {
 		if got := radarSourceFamily(sourceID); got != want {

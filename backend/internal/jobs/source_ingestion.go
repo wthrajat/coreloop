@@ -34,6 +34,7 @@ type sourceAdapterConfig struct {
 	Adapter      string   `json:"adapter"`
 	ItemLimit    int      `json:"item_limit"`
 	PathPrefixes []string `json:"path_prefixes"`
+	AllowedHosts []string `json:"allowed_hosts"`
 }
 
 type sourceFetchResult struct {
@@ -76,6 +77,8 @@ func (service *Service) fetchSource(ctx context.Context, source store.SourceReco
 		result, err = service.fetchBlueskyAuthor(ctx, source, configuration.ItemLimit)
 	case "sitemap":
 		result, err = service.fetchSitemap(ctx, source, configuration)
+	case "html_listing":
+		result, err = service.fetchHTMLListing(ctx, source, configuration)
 	default:
 		return sourceFetchResult{}, fmt.Errorf("unsupported source adapter %q", configuration.Adapter)
 	}
@@ -395,9 +398,8 @@ type sitemapDocument struct {
 }
 
 type sitemapPage struct {
-	URL      string
-	LastMod  time.Time
-	Position int
+	URL     string
+	LastMod time.Time
 }
 
 func (service *Service) fetchSitemap(ctx context.Context, source store.SourceRecord, configuration sourceAdapterConfig) (sourceFetchResult, error) {
@@ -430,6 +432,99 @@ func (service *Service) fetchSitemap(ctx context.Context, source store.SourceRec
 	if len(pages) > configuration.ItemLimit {
 		pages = pages[:configuration.ItemLimit]
 	}
+	items, failedItems, err := service.fetchMetadataPages(ctx, pages, false)
+	if err != nil {
+		return sourceFetchResult{}, err
+	}
+	return sourceFetchResult{
+		Items: items, ETag: document.ETag, LastModified: document.LastModified,
+		AttemptedItems: len(pages), FailedItems: failedItems,
+	}, nil
+}
+
+func (service *Service) fetchHTMLListing(ctx context.Context, source store.SourceRecord, configuration sourceAdapterConfig) (sourceFetchResult, error) {
+	document, err := service.fetchDocument(ctx, source.URL, source.ETag, source.LastModified)
+	if err != nil || document.NotModified {
+		return sourceFetchResult{
+			ETag: document.ETag, LastModified: document.LastModified,
+			NotModified: document.NotModified,
+		}, err
+	}
+	pages := listingPages(source.URL, document.Body, configuration)
+	if len(pages) == 0 {
+		return sourceFetchResult{}, errors.New("HTML listing contains no eligible page links")
+	}
+	if len(pages) > configuration.ItemLimit {
+		pages = pages[:configuration.ItemLimit]
+	}
+	items, failedItems, err := service.fetchMetadataPages(ctx, pages, true)
+	if err != nil {
+		return sourceFetchResult{}, err
+	}
+	return sourceFetchResult{
+		Items: items, ETag: document.ETag, LastModified: document.LastModified,
+		AttemptedItems: len(pages), FailedItems: failedItems,
+	}, nil
+}
+
+func listingPages(rawSourceURL string, body []byte, configuration sourceAdapterConfig) []sitemapPage {
+	sourceURL, err := url.Parse(rawSourceURL)
+	if err != nil {
+		return nil
+	}
+	allowedHosts := map[string]struct{}{strings.ToLower(sourceURL.Hostname()): {}}
+	for _, host := range configuration.AllowedHosts {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host != "" {
+			allowedHosts[host] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{})
+	pages := make([]sitemapPage, 0, configuration.ItemLimit)
+	for _, tag := range anchorTagPattern.FindAllString(string(body), -1) {
+		attributes := parseHTMLAttributes(tag)
+		reference, parseErr := url.Parse(strings.TrimSpace(attributes["href"]))
+		if parseErr != nil || reference.String() == "" {
+			continue
+		}
+		pageURL := sourceURL.ResolveReference(reference)
+		if pageURL.Scheme != "https" {
+			continue
+		}
+		if _, allowed := allowedHosts[strings.ToLower(pageURL.Hostname())]; !allowed {
+			continue
+		}
+		if !hasPathPrefix(pageURL.Path, configuration.PathPrefixes) {
+			continue
+		}
+		pageURL.Fragment = ""
+		resolved := pageURL.String()
+		if sameWebPage(rawSourceURL, resolved) {
+			continue
+		}
+		if _, duplicate := seen[resolved]; duplicate {
+			continue
+		}
+		seen[resolved] = struct{}{}
+		pages = append(pages, sitemapPage{URL: resolved})
+		if len(pages) == maximumSourceItems {
+			break
+		}
+	}
+	return pages
+}
+
+func sameWebPage(leftRawURL, rightRawURL string) bool {
+	left, leftErr := url.Parse(leftRawURL)
+	right, rightErr := url.Parse(rightRawURL)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	return strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		strings.TrimRight(left.Path, "/") == strings.TrimRight(right.Path, "/")
+}
+
+func (service *Service) fetchMetadataPages(ctx context.Context, pages []sitemapPage, requirePublishedTime bool) ([]radar.Item, int, error) {
 	items := make([]radar.Item, len(pages))
 	valid := make([]bool, len(pages))
 	semaphore := make(chan struct{}, sourceFetchConcurrency)
@@ -457,7 +552,7 @@ func (service *Service) fetchSitemap(ctx context.Context, source store.SourceRec
 			if publishedAt.IsZero() {
 				publishedAt = page.LastMod
 			}
-			if title == "" {
+			if title == "" || (requirePublishedTime && publishedAt.IsZero()) {
 				return
 			}
 			items[index] = radar.Item{Title: title, URL: page.URL, Summary: summary, PublishedAt: publishedAt}
@@ -466,7 +561,7 @@ func (service *Service) fetchSitemap(ctx context.Context, source store.SourceRec
 	}
 	wait.Wait()
 	if err := ctx.Err(); err != nil {
-		return sourceFetchResult{}, err
+		return nil, 0, err
 	}
 	output := make([]radar.Item, 0, len(items))
 	for index := range items {
@@ -475,12 +570,9 @@ func (service *Service) fetchSitemap(ctx context.Context, source store.SourceRec
 		}
 	}
 	if len(pages) > 0 && len(output) == 0 {
-		return sourceFetchResult{}, errors.New("sitemap pages returned no usable metadata")
+		return nil, len(pages), errors.New("source pages returned no usable metadata")
 	}
-	return sourceFetchResult{
-		Items: output, ETag: document.ETag, LastModified: document.LastModified,
-		AttemptedItems: len(pages), FailedItems: len(pages) - len(output),
-	}, nil
+	return output, len(pages) - len(output), nil
 }
 
 type sourceHTTPError struct {
@@ -560,7 +652,7 @@ func sourcePollDiagnostic(err error) (string, string) {
 		return "source_configuration_invalid", "The source adapter configuration is invalid."
 	case strings.Contains(message, "parse"):
 		return "source_parse_failed", "The source response could not be parsed in its configured format."
-	case strings.Contains(message, "no usable"):
+	case strings.Contains(message, "no usable") || strings.Contains(message, "no eligible"):
 		return "source_items_unavailable", "The source index loaded, but its item requests returned no usable stories."
 	case strings.Contains(message, "exceeds 8 mib"):
 		return "source_response_too_large", "The source response exceeded the safe size limit."
@@ -582,18 +674,25 @@ func hasPathPrefix(path string, prefixes []string) bool {
 }
 
 var (
-	metaTagPattern  = regexp.MustCompile(`(?is)<meta\s+[^>]*>`)
-	metaAttrPattern = regexp.MustCompile(`(?i)([a-z_:.-]+)\s*=\s*["']([^"']*)["']`)
-	titleTagPattern = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	metaTagPattern   = regexp.MustCompile(`(?is)<meta\s+[^>]*>`)
+	anchorTagPattern = regexp.MustCompile(`(?is)<a\s+[^>]*>`)
+	metaAttrPattern  = regexp.MustCompile(`(?i)([a-z_:.-]+)\s*=\s*["']([^"']*)["']`)
+	titleTagPattern  = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	jsonLDPattern    = regexp.MustCompile(`(?is)<script[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>(.*?)</script>`)
 )
+
+func parseHTMLAttributes(tag string) map[string]string {
+	attributes := map[string]string{}
+	for _, match := range metaAttrPattern.FindAllStringSubmatch(tag, -1) {
+		attributes[strings.ToLower(match[1])] = html.UnescapeString(strings.TrimSpace(match[2]))
+	}
+	return attributes
+}
 
 func parsePageMetadata(body []byte) (string, string, time.Time) {
 	metadata := map[string]string{}
 	for _, tag := range metaTagPattern.FindAllString(string(body), -1) {
-		attributes := map[string]string{}
-		for _, match := range metaAttrPattern.FindAllStringSubmatch(tag, -1) {
-			attributes[strings.ToLower(match[1])] = html.UnescapeString(strings.TrimSpace(match[2]))
-		}
+		attributes := parseHTMLAttributes(tag)
 		key := strings.ToLower(attributes["property"])
 		if key == "" {
 			key = strings.ToLower(attributes["name"])
@@ -602,15 +701,59 @@ func parsePageMetadata(body []byte) (string, string, time.Time) {
 			metadata[key] = attributes["content"]
 		}
 	}
-	title := firstNonEmpty(metadata["og:title"], metadata["twitter:title"])
+	structuredTitle, structuredSummary, structuredDate := parseJSONLDMetadata(body)
+	title := firstNonEmpty(metadata["og:title"], metadata["twitter:title"], structuredTitle)
 	if title == "" {
 		if match := titleTagPattern.FindStringSubmatch(string(body)); len(match) == 2 {
 			title = radar.NeutralText(match[1])
 		}
 	}
-	summary := firstNonEmpty(metadata["og:description"], metadata["twitter:description"], metadata["description"])
-	published := parseSourceTime(firstNonEmpty(metadata["article:published_time"], metadata["date"], metadata["datepublished"]))
+	summary := firstNonEmpty(metadata["og:description"], metadata["twitter:description"], metadata["description"], structuredSummary)
+	published := parseSourceTime(firstNonEmpty(metadata["article:published_time"], metadata["date"], metadata["datepublished"], structuredDate))
 	return radar.NeutralText(title), radar.NeutralText(summary), published
+}
+
+func parseJSONLDMetadata(body []byte) (string, string, string) {
+	for _, match := range jsonLDPattern.FindAllSubmatch(body, -1) {
+		if len(match) != 2 {
+			continue
+		}
+		var value any
+		if json.Unmarshal(match[1], &value) != nil {
+			continue
+		}
+		title := findJSONLDString(value, "headline", 0)
+		summary := findJSONLDString(value, "description", 0)
+		published := findJSONLDString(value, "datePublished", 0)
+		if title != "" || summary != "" || published != "" {
+			return title, summary, published
+		}
+	}
+	return "", "", ""
+}
+
+func findJSONLDString(value any, key string, depth int) string {
+	if depth > 32 {
+		return ""
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if direct, ok := typed[key].(string); ok {
+			return strings.TrimSpace(direct)
+		}
+		for _, nested := range typed {
+			if found := findJSONLDString(nested, key, depth+1); found != "" {
+				return found
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if found := findJSONLDString(nested, key, depth+1); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
 }
 
 func parseSourceTime(value string) time.Time {

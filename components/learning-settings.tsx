@@ -186,7 +186,7 @@ export function LearningSettings({
         },
       );
       setSaveState("saved");
-      setSaveMessage("Your profile, topics, and delivery rhythm are saved.");
+      setSaveMessage("Your topics and delivery loop are saved.");
       if (onboarding) window.location.assign("/overview");
     } catch (reason) {
       setSaveState("error");
@@ -209,7 +209,7 @@ export function LearningSettings({
         description={
           onboarding
             ? "Start with useful defaults. Every choice can be changed later without losing queued lessons."
-            : "Control lesson depth, topic selection, delivery rhythm, and Radar."
+            : "Choose lesson depth, topics, delivery rhythm, and News Radar."
         }
         action={
           <button
@@ -284,7 +284,8 @@ export function LearningSettings({
                 <option value="detailed">Very detailed</option>
               </select>
               <small>
-                Plain technical English, usefulness first, mostly theoretical.
+                Plain English, with unfamiliar subject terms explained when they
+                first appear.
               </small>
             </label>
             <label className="field">
@@ -332,8 +333,8 @@ export function LearningSettings({
             <span className="section-number">02</span>
             <h2>Delivery rhythm</h2>
             <p>
-              Times use India Standard Time. Full lessons arrive as ordered
-              Telegram messages.
+              Times use this instance&apos;s configured time zone. Full lessons
+              arrive as ordered Telegram messages.
             </p>
           </div>
           <div className="form-grid">
@@ -389,10 +390,9 @@ export function LearningSettings({
             </label>
             <label className="toggle-row">
               <span>
-                <strong>Current-tech radar</strong>
+                <strong>News Radar</strong>
                 <small>
-                  Receive source-backed technology updates independently of
-                  lessons.
+                  Receive source-backed updates independently of lessons.
                 </small>
               </span>
               <input
@@ -404,7 +404,7 @@ export function LearningSettings({
               />
             </label>
             <label className="field">
-              <span>Radar updates per day</span>
+              <span>News updates per day</span>
               <input
                 max={50}
                 min={0}
@@ -419,10 +419,10 @@ export function LearningSettings({
             </label>
             <label className="toggle-row">
               <span>
-                <strong>Send Radar updates on weekends</strong>
+                <strong>Send news on weekends</strong>
                 <small>
-                  Keep technology news active on Saturday and Sunday,
-                  independent of lesson delivery.
+                  Keep source-backed news active on Saturday and Sunday,
+                  independently of lesson delivery.
                 </small>
               </span>
               <input

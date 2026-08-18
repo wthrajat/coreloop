@@ -141,6 +141,80 @@ func TestSourceHealthMigrationAddsSafeOperationalDiagnostics(t *testing.T) {
 	}
 }
 
+func TestRadarSourceExpansionAddsEveryReviewedSource(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", ".."))
+	migrationPath := filepath.Join(projectRoot, "migrations", "0012_expand_radar_sources.sql")
+	migration, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrationText := strings.ToLower(string(migration))
+	requiredSourceIDs := []string{
+		"source_uber_engineering", "source_spotify_engineering", "source_discord_blog",
+		"source_nvidia_technical_blog", "source_mistral_news", "source_google_project_zero",
+		"source_google_security_blog", "source_chrome_developers", "source_docker_blog",
+		"source_gitlab_releases", "source_stripe_engineering", "source_cloudflare_research",
+		"source_arxiv_distributed", "source_usenix_publications", "source_acm_cacm",
+		"source_trail_of_bits", "source_ncc_research", "source_msrc_blog",
+		"source_duckdb_blog", "source_clickhouse_blog", "source_cockroach_blog",
+		"source_sqlite_releases", "source_typescript_blog", "source_dotnet_blog",
+		"source_inside_java", "source_kotlin_blog", "source_deno_blog", "source_bun_blog",
+		"source_hashicorp_blog", "source_grafana_blog", "source_datadog_blog",
+		"source_fly_blog", "source_tailscale_blog", "source_meta_ai",
+		"source_google_developers_blog", "source_huggingface_transformers",
+		"source_huggingface_hub", "source_huggingface_tgi", "source_airbnb_engineering",
+		"source_doordash_engineering", "source_shopify_engineering", "source_figma_engineering",
+		"source_ietf_blog", "source_whatwg_blog", "source_w3c_news",
+	}
+	for _, sourceID := range requiredSourceIDs {
+		if !strings.Contains(migrationText, "'"+sourceID+"'") {
+			t.Errorf("Radar source expansion is missing %q", sourceID)
+		}
+	}
+	for _, required := range []string{
+		`"adapter":"html_listing"`,
+		`"adapter":"github_releases"`,
+		`"allowed_hosts":["blog.cloudflare.com"]`,
+		"values (12, 'expand_radar_sources')",
+	} {
+		if !strings.Contains(migrationText, required) {
+			t.Errorf("Radar source expansion is missing %q", required)
+		}
+	}
+
+	var script strings.Builder
+	for version := 1; version <= 12; version++ {
+		matches, globErr := filepath.Glob(filepath.Join(
+			projectRoot,
+			"migrations",
+			fmt.Sprintf("%04d_*.sql", version),
+		))
+		if globErr != nil || len(matches) != 1 {
+			t.Fatalf("resolve migration %d: %v, matches=%v", version, globErr, matches)
+		}
+		script.WriteString(".read " + matches[0] + "\n")
+	}
+	script.WriteString(`SELECT COUNT(*) || ',' ||
+		SUM(json_extract(adapter_config_json,'$.adapter')='html_listing') || ',' ||
+		SUM(enabled=1) || ',' ||
+		SUM(canonical_url NOT LIKE 'https://%') || ',' ||
+		(SELECT MAX(version) FROM schema_migrations)
+		FROM sources;` + "\n")
+	command := exec.Command("sqlite3", ":memory:")
+	command.Stdin = strings.NewReader(script.String())
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run Radar source expansion migration: %v: %s", err, output)
+	}
+	if strings.TrimSpace(string(output)) != "86,10,86,0,12" {
+		t.Fatalf("expanded Radar catalogue = %s", output)
+	}
+}
+
 func TestSourceHealthMigrationQueuesBoundedFreshRadarReindex(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {

@@ -22,9 +22,9 @@ export default async function InvitePage({
       <span className="eyebrow">Private invitation</span>
       <h1>Create your Coreloop profile.</h1>
       <p>
-        Telegram will confirm your identity and connect private lesson delivery.
-        The invitation is single-use and expires; Coreloop never asks for your
-        phone number.
+        Telegram will confirm your identity and connect private lesson and news
+        delivery. The invitation is single-use and expires; Coreloop never asks
+        for your phone number.
       </p>
       <a className="button button-primary" href={start}>
         Continue with Telegram
